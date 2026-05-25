@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Polymarket Watchlist</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">DT</div>
+          <div>
+            <div class="brand-title">DataTube</div>
+            <div class="brand-subtitle">Polymarket Watchlist</div>
+          </div>
+        </div>
+        <nav class="nav">
+          <a class="nav-link" href="/" target="_blank" rel="noopener noreferrer">Dashboard</a>
+          <a class="nav-link active" href="/watchlist" target="_blank" rel="noopener noreferrer">Watchlist</a>
+          <a class="nav-link" href="/settings" target="_blank" rel="noopener noreferrer">Settings</a>
+        </nav>
+        <div class="sidebar-note">
+          自选市场保存在当前浏览器本地，可从首页查询结果或工作台搜索结果直接加入。
+        </div>
+      </aside>
+
+      <main class="page">
+        <header class="hero hero-gradient">
+          <div>
+            <span class="eyebrow">Polymarket Watchlist</span>
+            <h1>自选市场</h1>
+            <p>集中查看你标记的市场，自选数据保存在当前浏览器本地，并可从多个页面同步更新。</p>
+          </div>
+          <div class="hero-actions">
+            <a class="button-link secondary-link" href="/" target="_blank" rel="noopener noreferrer">首页</a>
+            <button id="watchlistRefreshBtn" class="secondary">刷新列表</button>
+          </div>
+        </header>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>已收藏市场</h2>
+              <p id="watchlistMeta" class="muted">本地浏览器存储。</p>
+            </div>
+          </div>
+          <div id="watchlistTable"></div>
+        </section>
+      </main>
+    </div>
+    <script src="{{ url_for('static', filename='polymarket_links.js') }}"></script>
+    <script src="{{ url_for('static', filename='watchlist.js') }}"></script>
+  </body>
+</html>

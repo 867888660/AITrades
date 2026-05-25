@@ -1,0 +1,54 @@
+{
+  "filters": {
+    "high_prob": {
+      "min_yes_prob": 0.45,
+      "max_yes_prob": 0.85
+    },
+    "low_prob": {
+      "min_yes_prob": -1.0,
+      "max_yes_prob": -1.0
+    },
+    "max_spread_cents": 4,
+    "min_depth_1c_usd": 100
+  },
+  "database": {
+    "deltas_table_suffix": "_Deltas",
+    "mongodb": {
+      "enabled": false,
+      "uri": "mongodb://localhost:27017",
+      "db_name": "PolymarketWS"
+    },
+    "sqlite": {
+      "enabled": true,
+      "path": "Data/polymarket_realtime.db"
+    }
+  },
+  "holdings": {
+    "wallet_addresses": [],
+    "data_api": "https://data-api.polymarket.com"
+  },
+  "strategy_monitoring": {
+    "condition_ids": [],
+    "monitoring_db": {
+      "enabled": true,
+      "path": "Data/PolyMarketMonitoring.db",
+      "table": "strategy_registry",
+      "poll_interval_sec": 60
+    }
+  },
+  "api": {
+    "gamma_base": "https://gamma-api.polymarket.com",
+    "clob_base": "https://clob.polymarket.com"
+  },
+  "websocket": {
+    "url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+    "reconnect_delay_sec": 5,
+    "max_reconnect_delay_sec": 60,
+    "ping_interval_sec": 30,
+    "stats_interval_sec": 60,
+    "max_tokens_per_ws": 500,
+    "worker_count": 4,
+    "queue_max_size": 50000,
+    "watchdog_interval_sec": 1800
+  }
+}

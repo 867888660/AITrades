@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DataTube Settings</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">DT</div>
+          <div>
+            <div class="brand-title">DataTube</div>
+            <div class="brand-subtitle">Realtime Market Hub</div>
+          </div>
+        </div>
+        <nav class="nav">
+          <a class="nav-link" href="/" target="_blank" rel="noopener noreferrer">Dashboard</a>
+          <a class="nav-link active" href="/settings" target="_blank" rel="noopener noreferrer">Settings</a>
+        </nav>
+        <div class="sidebar-note">
+          这里统一管理 API Key、钱包、采集频率和 SQLite 路径。路径支持相对项目根目录，例如 `Data/PolyMarketDictionary.db`。
+        </div>
+      </aside>
+
+      <main class="page settings-page">
+        <header class="hero hero-gradient">
+          <div>
+            <span class="eyebrow">Configuration Center</span>
+            <h1>Settings</h1>
+            <p>保存后会直接驱动后端实时采集器。</p>
+          </div>
+        </header>
+
+        <section class="panel glass-tabs-shell settings-panel">
+          <div class="glass-tabs">
+            <button type="button" class="tab-btn active" data-tab="api">API & 数据源</button>
+            <button type="button" class="tab-btn" data-tab="wallet">钱包 & 策略</button>
+            <button type="button" class="tab-btn" data-tab="refresh">刷新 & 采集</button>
+          </div>
+          <form id="settingsForm" class="form">
+            <div class="tab-pane active" data-tab-content="api">
+              <div class="grid two">
+              <label>
+                Finnhub API Keys
+                <textarea id="finnhubKeys" rows="6" placeholder="每行一个 API Key"></textarea>
+              </label>
+              <label>
+                活动 Finnhub API Key
+                <input id="activeFinnhubKey" placeholder="默认取上面列表中的第一个">
+              </label>
+              </div>
+
+              <div class="grid two">
+                <label>
+                  CoinGecko API Key
+                  <input id="coingeckoApiKey" placeholder="可留空">
+                </label>
+                <label>
+                  CoinGecko API Header
+                  <input id="coingeckoApiHeader" placeholder="默认 x-cg-demo-api-key">
+                </label>
+              </div>
+            </div>
+
+            <div class="tab-pane" data-tab-content="wallet">
+              <div class="grid two">
+                <label>
+                钱包地址
+                <textarea id="walletAddresses" rows="6" placeholder="每行一个钱包地址"></textarea>
+              </label>
+              <label>
+                行情 SQLite 数据库路径
+                <input id="sqliteDbPath" placeholder="例如 G:/linkO/TempFiles/polymarket_datatube/market_data.db">
+              </label>
+              </div>
+
+              <div class="grid two">
+                <label>
+                  本地订单数据库路径
+                  <input id="orderListDbPath" placeholder="例如 G:/linkO/TempFiles/polymarket_datatube/PolyMarketOrderList.db">
+                </label>
+                <label>
+                策略监控数据库路径
+                <input id="strategyMonitoringDbPath" placeholder="例如 G:/linkO/TempFiles/polymarket_datatube/PolyMarketMonitoring.db">
+              </label>
+              <label>
+                实时市场 SQLite 路径（`markets_state` / `market_deltas`）
+                <input id="marketRealtimeDbPath" placeholder="例如 G:/linkO/TempFiles/polymarket_datatube/polymarket_realtime.db">
+              </label>
+              <label>
+                Polymarket Dictionary 数据库路径
+                <input id="polymarketDictionaryDbPath" placeholder="例如 Data/PolyMarketDictionary.db">
+              </label>
+              </div>
+
+              <div class="grid two">
+              <label>
+                策略统计 SQLite 目录（每行一条策略一个 .db，按 Translation 命名）
+                <input id="strategyMetricsDbDir" placeholder="例如 G:/linkO/TempFiles/polymarket_datatube/strategy_metrics_dbs">
+              </label>
+              </div>
+            </div>
+
+            <div class="tab-pane" data-tab-content="refresh">
+              <div class="grid two">
+                <label>
+                Crypto Symbols
+                <textarea id="cryptoSymbols" rows="5" placeholder="每行一个，例如 BTCUSDT"></textarea>
+              </label>
+              <label>
+                Finance Symbols
+                <textarea id="financeSymbols" rows="5" placeholder="每行一个，例如 AAPL"></textarea>
+              </label>
+              </div>
+
+              <div class="grid three">
+                <label>
+                Crypto 刷新秒数
+                <input id="cryptoRefreshSec" type="number" min="2">
+              </label>
+              <label>
+                Finance 刷新秒数
+                <input id="financeRefreshSec" type="number" min="2">
+              </label>
+              <label>
+                前端刷新秒数
+                <input id="uiRefreshSec" type="number" min="2">
+              </label>
+            </div>
+
+            <label class="switch">
+              <input id="includeCryptoFundamentals" type="checkbox">
+              <span>启用 Crypto Fundamentals（市值/FDV/供给）</span>
+            </label>
+            </div>
+
+            <div class="actions">
+              <button type="submit">保存设置</button>
+              <a class="button-link secondary-link" href="/">返回 Dashboard</a>
+            </div>
+          </form>
+          <div id="settingsMessage" class="status">加载中...</div>
+        </section>
+      </main>
+    </div>
+    <script src="{{ url_for('static', filename='settings.js') }}"></script>
+  </body>
+</html>

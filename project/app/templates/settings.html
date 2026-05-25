@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+
+{% block title %}Settings - Trading Dashboard{% endblock %}
+
+{% block content %}
+<header class="topbar">
+    <div class="topbar-section">
+        <div class="topbar-brand">POLYTRADE SETTINGS</div>
+    </div>
+    <div class="topbar-section">
+        <a href="/" class="btn btn-secondary" style="text-decoration: none;">← Back to Workstation</a>
+    </div>
+</header>
+
+<div style="flex: 1; overflow-y: auto; padding: var(--space-5); background: var(--bg-app);">
+    <div style="max-width: 1000px; margin: 0 auto; background: var(--bg-panel); border: 1px solid var(--border-subtle); border-radius: var(--radius-lg); padding: var(--space-5);">
+        <h2 style="margin-bottom: var(--space-2); color: var(--text-primary); font-size: 20px;">Data Sources</h2>
+        <p style="color: var(--text-secondary); margin-bottom: var(--space-5);">Register and manage your local SQLite databases.</p>
+        
+        <div style="display: flex; gap: var(--space-5); flex-wrap: wrap;">
+            <!-- Left: Form to add DB -->
+            <div style="flex: 1; min-width: 300px; background: var(--bg-panel-alt); padding: var(--space-4); border-radius: var(--radius-md); border: 1px solid var(--border-subtle);">
+                <h3 style="margin-bottom: var(--space-4); color: var(--text-primary); font-size: 16px;">Add New Database</h3>
+                <form id="add-db-form">
+                    <div class="form-group">
+                        <label>Name</label>
+                        <input type="text" id="db-name" required placeholder="e.g. Options DB">
+                    </div>
+                    <div class="form-group">
+                        <label>File Path (Absolute path to .sqlite/.db file)</label>
+                        <input type="text" id="db-path" required placeholder="C:/data/options.db">
+                    </div>
+                    <div class="form-group">
+                        <label>Role</label>
+                        <select id="db-role">
+                            <option value="general">General</option>
+                            <option value="info">Info</option>
+                            <option value="options">Options</option>
+                        </select>
+                    </div>
+                    <button type="submit" class="btn btn-primary" style="width: 100%; margin-top: var(--space-2);">Add Database</button>
+                </form>
+
+                <div style="height: 1px; background: var(--border-subtle); margin: var(--space-5) 0;"></div>
+
+                <h3 style="margin-bottom: var(--space-3); color: var(--text-primary); font-size: 16px;">Scan Folder For SQLite Files</h3>
+                <form id="scan-folder-form">
+                    <div class="form-group">
+                        <label>Folder Path</label>
+                        <input type="text" id="db-scan-folder" required placeholder="C:/data/sqlite">
+                    </div>
+                    <div class="form-group">
+                        <label>Default Role</label>
+                        <select id="db-scan-role">
+                            <option value="general">General</option>
+                            <option value="info">Info</option>
+                            <option value="options">Options</option>
+                        </select>
+                    </div>
+                    <label style="display:flex; align-items:center; gap:8px; margin-bottom: var(--space-3); color: var(--text-secondary);">
+                        <input type="checkbox" id="db-scan-recursive" checked>
+                        Scan subfolders recursively
+                    </label>
+                    <label style="display:flex; align-items:center; gap:8px; margin-bottom: var(--space-3); color: var(--text-secondary);">
+                        <input type="checkbox" id="db-scan-auto-schema" checked>
+                        Auto scan schema after import
+                    </label>
+                    <button type="submit" class="btn btn-secondary" style="width: 100%;">Import `.db` Files From Folder</button>
+                    <div id="db-scan-result" style="display:none; margin-top: var(--space-3); padding: var(--space-3); border-radius: var(--radius-sm); font-size: 13px;"></div>
+                </form>
+            </div>
+            
+            <!-- Right: List of DBs -->
+            <div style="flex: 2; min-width: 400px;">
+                <h3 style="margin-bottom: var(--space-4); color: var(--text-primary); font-size: 16px;">Registered Databases</h3>
+                <table style="width: 100%; border-collapse: collapse; text-align: left;">
+                    <thead>
+                        <tr style="border-bottom: 1px solid var(--border-strong); color: var(--text-secondary);">
+                            <th style="padding: var(--space-2) 0; font-weight: 500;">Name</th>
+                            <th style="padding: var(--space-2) 0; font-weight: 500;">Path</th>
+                            <th style="padding: var(--space-2) 0; font-weight: 500;">Status</th>
+                            <th style="padding: var(--space-2) 0; font-weight: 500;">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="db-list">
+                        <!-- Populated by JS -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='js/settings.js') }}"></script>
+<style>
+    /* Table specific dark theme tweaks */
+    #db-list tr {
+        border-bottom: 1px solid var(--border-subtle);
+        color: var(--text-primary);
+    }
+    #db-list td {
+        padding: var(--space-3) 0;
+    }
+    #db-list tr:last-child {
+        border-bottom: none;
+    }
+</style>
+{% endblock %}

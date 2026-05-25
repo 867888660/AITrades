@@ -1,0 +1,41 @@
+# Python runtime
+__pycache__/
+*.py[cod]
+.venv/
+.venv-offline/
+venv/
+env/
+
+# Local secrets and machine-specific config
+.env
+.datatube_secret.key
+config.json
+web_settings.json
+web_settings.secrets.json
+
+# Runtime data
+wheelhouse/
+dist/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+Data/*.db
+Data/*.db-*
+Data/*.sqlite
+Data/*.sqlite3
+Data/*.backup_*.db
+project/instance/*.db
+strategy_metrics_dbs/*.db
+strategy_workspace_*.db
+polymarket_active_markets_cache.json
+*.log
+
+# Local bundles and editor files
+project.zip
+*.zip
+.claude/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

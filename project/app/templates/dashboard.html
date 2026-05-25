@@ -1,0 +1,367 @@
+{% extends "base.html" %}
+
+{% block title %}Workstation - Trading Terminal{% endblock %}
+
+{% block extra_css %}
+<style>
+    /* Terminal Specific Styling */
+    
+    /* Topbar specifics */
+    .topbar-section {
+        display: flex;
+        align-items: center;
+        gap: var(--space-3);
+    }
+    
+    .topbar-brand {
+        font-weight: bold;
+        color: var(--text-primary);
+        font-size: 14px;
+        margin-right: var(--space-4);
+    }
+    
+    /* Sidebar specifics */
+    .sidebar-header {
+        padding: var(--space-3) var(--space-4);
+        border-bottom: 1px solid var(--border-subtle);
+        font-weight: 600;
+        color: var(--text-secondary);
+        font-size: 12px;
+        text-transform: uppercase;
+    }
+    
+    .sidebar-list {
+        list-style: none;
+        padding: var(--space-2);
+        flex: 1;
+        overflow-y: auto;
+    }
+    
+    .sidebar-item {
+        padding: var(--space-2) var(--space-3);
+        margin-bottom: var(--space-1);
+        border-radius: var(--radius-sm);
+        cursor: pointer;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        color: var(--text-secondary);
+        transition: background-color 0.2s;
+    }
+    
+    .sidebar-item:hover {
+        background-color: var(--bg-panel-alt);
+        color: var(--text-primary);
+    }
+    
+    .sidebar-item.active {
+        background-color: var(--border-strong);
+        color: var(--text-primary);
+        font-weight: 500;
+        border-left: 2px solid var(--accent);
+    }
+    
+    /* Chart Card */
+    .chart-card {
+        width: 100%;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        background: var(--bg-panel);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-sm);
+        overflow: hidden;
+        transition: border-color 0.2s;
+    }
+    
+    .grid-stack-item.active .chart-card {
+        border-color: var(--accent);
+        box-shadow: 0 0 0 1px var(--accent);
+    }
+    
+    .chart-header {
+        padding: 0 var(--space-3);
+        height: 36px;
+        background: var(--bg-panel);
+        border-bottom: 1px solid var(--border-subtle);
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        cursor: move;
+    }
+    
+    .chart-title-area {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+    }
+    
+    .chart-title {
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text-primary);
+    }
+    
+    .chart-subtitle {
+        font-size: 11px;
+        color: var(--text-muted);
+    }
+    
+    .chart-actions {
+        display: flex;
+        gap: var(--space-1);
+        opacity: 1;
+        transition: opacity 0.2s;
+    }
+    
+    .chart-card:hover .chart-actions, .grid-stack-item.active .chart-actions {
+        opacity: 1;
+    }
+    
+    .chart-body {
+        flex: 1;
+        width: 100%;
+        min-height: 0;
+        background-color: var(--bg-app);
+    }
+    
+    /* Settings Drawer Form specifics */
+    .series-setting-block {
+        background-color: var(--bg-panel-alt);
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-sm);
+        padding: var(--space-3);
+        margin-bottom: var(--space-3);
+    }
+    
+    .series-setting-block h4 {
+        margin-bottom: var(--space-2);
+        font-size: 13px;
+        color: var(--text-primary);
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+    }
+    
+    .series-setting-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: var(--space-2);
+    }
+    
+    .grid-col-full {
+        grid-column: span 2;
+    }
+    
+    .color-picker-wrap {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+    }
+    
+    input[type="color"] {
+        padding: 0;
+        width: 24px;
+        height: 24px;
+        border: 1px solid var(--border-subtle);
+        border-radius: var(--radius-sm);
+        cursor: pointer;
+        background: none;
+    }
+    
+    /* Compact controls */
+    .form-group.compact {
+        margin-bottom: var(--space-2);
+    }
+    
+    .form-group.compact select, .form-group.compact input {
+        padding: 4px 8px;
+        font-size: 12px;
+    }
+    
+    /* Segmented Control */
+    .segmented-control {
+        display: flex;
+        background-color: var(--bg-panel);
+        border-radius: var(--radius-sm);
+        border: 1px solid var(--border-subtle);
+        overflow: hidden;
+    }
+    
+    .segmented-control label {
+        flex: 1;
+        text-align: center;
+        padding: 4px 8px;
+        cursor: pointer;
+        margin: 0;
+        color: var(--text-secondary);
+        border-right: 1px solid var(--border-subtle);
+        font-size: 12px;
+    }
+    
+    .segmented-control label:last-child {
+        border-right: none;
+    }
+    
+    .segmented-control input[type="radio"] {
+        display: none;
+    }
+    
+    .segmented-control input[type="radio"]:checked + span {
+        color: var(--text-primary);
+        font-weight: 600;
+        background-color: var(--border-strong);
+    }
+    
+    .segmented-control span {
+        display: block;
+        width: 100%;
+        height: 100%;
+        transition: background-color 0.2s;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<!-- Topbar -->
+<header class="topbar">
+    <div class="topbar-section">
+        <div class="topbar-brand">POLYTRADE WORKSTATION</div>
+        <select id="dashboard-select" style="width: 180px; padding: 4px 8px; background: var(--bg-panel-alt); color: var(--text-primary); border: 1px solid var(--border-subtle); border-radius: var(--radius-sm);">
+            <option value="">Select Dashboard...</option>
+        </select>
+        <button class="icon-btn" onclick="createNewDashboard()" title="New Dashboard">➕</button>
+    </div>
+    
+    <div class="topbar-section">
+        <!-- Global Time Range could go here -->
+    </div>
+    
+    <div class="topbar-section">
+        <button class="btn btn-primary" onclick="showChartModal()" id="btn-add-chart" style="display: none; padding: 4px 12px; font-size: 12px;">+ Add Chart</button>
+        <button class="btn btn-secondary" onclick="saveLayout()" style="padding: 4px 12px; font-size: 12px;">💾 Save Layout</button>
+        <a href="/settings" class="btn btn-secondary" style="padding: 4px 12px; font-size: 12px; text-decoration: none; display: flex; align-items: center; gap: 4px;">⚙️ DB Settings</a>
+    </div>
+</header>
+
+<!-- Main Layout -->
+<div class="main-layout">
+    <!-- Left Sidebar -->
+    <aside class="left-sidebar">
+        <div class="sidebar-header">
+            Charts
+        </div>
+        <ul class="sidebar-list" id="sidebar-chart-list">
+            <!-- Populated dynamically -->
+            <li style="color: var(--text-muted); padding: var(--space-3); font-size: 12px; text-align: center;">No charts yet</li>
+        </ul>
+    </aside>
+
+    <!-- Workspace (Center) -->
+    <main class="workspace" id="workspace">
+        <div class="grid-stack"></div>
+    </main>
+
+    <!-- Right Settings Drawer -->
+    <aside class="right-drawer closed" id="settings-drawer">
+        <div class="drawer-header">
+            <span>Chart Settings</span>
+            <button class="icon-btn" onclick="closeSettingsDrawer()">✖</button>
+        </div>
+        <div class="drawer-content" id="drawer-content">
+            <div id="drawer-empty-state" style="color: var(--text-muted); text-align: center; margin-top: 40px;">
+                Select a chart to edit settings
+            </div>
+            
+            <form id="settings-form" style="display: none;">
+                <input type="hidden" id="settings-widget-id">
+                <input type="hidden" id="settings-chart-id">
+                
+                <div class="form-group">
+                    <label>Chart Name</label>
+                    <input type="text" id="settings-chart-name" required>
+                </div>
+
+                <div class="form-group compact">
+                    <label>Data Source</label>
+                    <select id="settings-chart-db" required onchange="loadSettingsTables()"></select>
+                </div>
+                <div class="form-group compact">
+                    <label>Table</label>
+                    <select id="settings-chart-table" required onchange="loadSettingsColumns()"></select>
+                </div>
+                <div class="form-group compact">
+                    <label>Time Column (X Axis)</label>
+                    <select id="settings-chart-time-col"></select>
+                </div>
+
+                <div class="form-group compact">
+                    <label>Panes</label>
+                    <div id="settings-pane-list"></div>
+                </div>
+
+                <div class="form-group compact">
+                    <label>Pane Name</label>
+                    <input type="text" id="settings-pane-name">
+                </div>
+
+                <div class="form-group compact">
+                    <label>Pane Height</label>
+                    <input type="number" id="settings-pane-height" min="80" step="10">
+                </div>
+                
+                <div style="display: flex; justify-content: space-between; align-items: center; margin: var(--space-4) 0 var(--space-2); border-bottom: 1px solid var(--border-subtle); padding-bottom: 4px;">
+                    <span style="font-weight: 600; color: var(--text-primary);">Series Settings</span>
+                    <button type="button" class="btn btn-ghost" onclick="addSeriesToSettings()" style="padding: 2px 8px; font-size: 11px;">+ Add Series</button>
+                </div>
+                
+                <div id="settings-series-container">
+                    <!-- Dynamically populated -->
+                </div>
+                
+                <div style="display: flex; gap: var(--space-2); margin-top: var(--space-4);">
+                    <button type="submit" class="btn btn-primary" style="flex: 1;">Save Configuration</button>
+                </div>
+            </form>
+        </div>
+    </aside>
+</div>
+
+<!-- Add Chart Modal -->
+<div id="chart-modal" class="modal">
+    <div class="modal-content">
+        <h2>Add New Chart</h2>
+        <form id="chart-form">
+            <div class="form-group">
+                <label>Chart Name</label>
+                <input type="text" id="chart-name" required>
+            </div>
+            <div class="form-group">
+                <label>Data Source</label>
+                <select id="chart-db" required onchange="loadTables()"></select>
+            </div>
+            <div class="form-group">
+                <label>Table</label>
+                <select id="chart-table" required onchange="loadColumns()"></select>
+            </div>
+            <div class="form-group">
+                <label>Time Column (X Axis)</label>
+                <select id="chart-time-col"></select>
+            </div>
+            <div class="form-group">
+                <label>Value Columns (Y Axis)</label>
+                <select id="chart-val-cols" multiple required></select>
+                <small style="color:var(--text-muted); font-size: 11px;">Hold Ctrl/Cmd to select multiple</small>
+            </div>
+            <div style="display: flex; justify-content: flex-end; gap: var(--space-3); margin-top: var(--space-5);">
+                <button type="button" class="btn btn-ghost" onclick="hideChartModal()">Cancel</button>
+                <button type="submit" class="btn btn-primary">Add to Workspace</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+{% endblock %}

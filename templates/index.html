@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DataTube Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">DT</div>
+          <div>
+            <div class="brand-title">DataTube</div>
+            <div class="brand-subtitle">Realtime Market Hub</div>
+          </div>
+        </div>
+        <nav class="nav">
+          <a class="nav-link active" href="/" target="_blank" rel="noopener noreferrer">Dashboard</a>
+          <a class="nav-link" href="/ledger" target="_blank" rel="noopener noreferrer">Ledger</a>
+          <a class="nav-link" href="/watchlist" target="_blank" rel="noopener noreferrer">Watchlist</a>
+          <a class="nav-link" href="/settings" target="_blank" rel="noopener noreferrer">Settings</a>
+        </nav>
+        <div class="sidebar-note">
+          Crypto 与 Finance 数据由后台采集器持续写入本地 SQLite。
+        </div>
+      </aside>
+
+      <main class="page">
+        <header class="hero hero-gradient">
+          <div>
+            <span class="eyebrow">Market Intelligence Workspace</span>
+            <h1>Polymarket + Crypto + Finance</h1>
+            <p>实时监控、宽表落库、设置驱动的统一数据看板。</p>
+          </div>
+          <div class="hero-actions">
+            <div id="collectorBadge" class="badge">Collector</div>
+            <a class="button-link secondary-link" href="/watchlist" target="_blank" rel="noopener noreferrer">查看自选页</a>
+            <button id="refreshOverviewBtn" class="secondary">立即刷新</button>
+          </div>
+        </header>
+
+        <section class="stats-grid" id="overviewCards"></section>
+
+        <section class="grid two">
+          <article class="panel panel-highlight">
+            <div class="panel-header">
+              <div>
+                <h2>Polymarket 期权字典</h2>
+                <p id="dictionaryMeta" class="muted">显示字典总数、数据库位置和实时更新进度。</p>
+              </div>
+              <div class="table-actions">
+                <button id="refreshDictionaryBtn" class="mini ghost" type="button">刷新状态</button>
+                <button id="updateDictionaryBtn" class="mini" type="button">更新字典</button>
+              </div>
+            </div>
+            <div id="dictionarySummary" class="info-list"></div>
+            <div id="dictionaryProgress" class="status">等待加载...</div>
+            <pre id="dictionaryLog" class="log-shell">等待加载...</pre>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>系统状态</h2>
+                <p class="muted">展示采集器、数据库路径与自动刷新状态。</p>
+              </div>
+            </div>
+            <div id="systemStatus" class="info-list"></div>
+          </article>
+        </section>
+
+        <section class="grid two">
+          <article class="panel panel-highlight">
+            <div class="panel-header">
+              <div>
+                <h2>Crypto Live Feed</h2>
+                <p id="cryptoMeta" class="muted"></p>
+              </div>
+              <button id="refreshCryptoBtn" class="ghost">刷新</button>
+            </div>
+            <div id="cryptoTable"></div>
+          </article>
+
+          <article class="panel panel-highlight">
+            <div class="panel-header">
+              <div>
+                <h2>Finance Live Feed</h2>
+                <p id="financeMeta" class="muted"></p>
+              </div>
+              <button id="refreshFinanceBtn" class="ghost">刷新</button>
+            </div>
+            <div id="financeTable"></div>
+          </article>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>我的仓位</h2>
+              <p class="muted">钱包地址可在设置页统一维护，也可临时手填。</p>
+            </div>
+          </div>
+          <form id="holdingsForm" class="form compact-form">
+            <label>
+              钱包地址
+              <input id="walletInput" name="wallet" placeholder="留空则读取设置中的钱包">
+            </label>
+            <button type="submit">查询仓位</button>
+          </form>
+          <div id="holdingsSummary" class="muted"></div>
+          <div id="holdingsTable"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>策略监控</h2>
+              <p id="strategyMeta" class="muted">读取策略监控库，按策略为主轴展示运行中的监控项；首页仅保留工作台入口。</p>
+            </div>
+            <div class="table-actions">
+              <button id="addStrategyBtn" class="mini" type="button">新增策略</button>
+              <button id="refreshStrategyBtn" class="ghost">刷新</button>
+            </div>
+          </div>
+          <div id="strategyTable"></div>
+        </section>
+
+        <!-- Strategy Modal -->
+        <div id="strategyModal" class="modal-overlay" hidden>
+          <div class="modal-glass">
+            <button class="modal-close" id="strategyModalClose" type="button" aria-label="关闭">&times;</button>
+            <div class="modal-header">
+              <h3 id="strategyModalTitle">新增策略</h3>
+            </div>
+            <form id="strategyModalForm" class="form modal-form">
+              <label>策略名称 <input name="strategy_name" required></label>
+              <label>策略代码文件
+                <select name="strategy_code" id="strategyCodeSelect">
+                  <option value="">-- 选择 --</option>
+                </select>
+              </label>
+              <label>状态
+                <select name="state">
+                  <option value="Stop" selected>Real</option>
+                  <option value="Virtual">Virtual</option>
+                </select>
+              </label>
+              <div class="strategy-legs-editor">
+                <div class="strategy-legs-header">
+                  <span>Condition IDs</span>
+                  <span class="strategy-legs-fixed">Fixed by strategy code</span>
+                </div>
+                <div id="strategyLegRows" class="strategy-leg-rows"></div>
+                <div id="conditionPicker" class="condition-picker" hidden></div>
+                <fieldset hidden disabled>
+              <label style="position:relative">Condition ID
+                <div class="condition-id-group">
+                  <input name="condition_id" id="conditionIdInput" placeholder="手动输入或从自选中选择">
+                  <button type="button" class="mini" id="conditionPickBtn">自选</button>
+                </div>
+                <div id="conditionPickerLegacy" class="condition-picker" hidden></div>
+              </label>
+                </fieldset>
+              </div>
+              <label>策略占用賄金 <input name="strategy_bankroll" type="number" step="any" value="0"></label>
+              <div class="strategy-param-paste">
+                <div class="strategy-param-paste-head">
+                  <span>批量粘贴参数</span>
+                  <button type="button" class="mini ghost" id="strategyParamPasteApply">填入匹配字段</button>
+                </div>
+                <textarea id="strategyParamPasteText" spellcheck="false" placeholder='{"fair_price": 0.40, "entry_edge": 0.05}'></textarea>
+              </div>
+              <div id="strategyDynamicInputs"></div>
+              <div id="strategyModalStateSections" class="strategy-inline-state"></div>
+              <div id="strategyDynamicMessage" class="muted"></div>
+              <input type="hidden" name="strategy_id" value="">
+              <div class="modal-actions">
+                <button type="submit" class="mini">保存</button>
+                <button type="button" class="mini ghost" id="strategyModalCancel">取消</button>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <!-- Strategy State Modal -->
+        <div id="strategyStateModal" class="modal-overlay" hidden>
+          <div class="modal-glass state-modal-glass">
+            <button class="modal-close" id="strategyStateModalClose" type="button" aria-label="Close">&times;</button>
+            <div class="modal-header">
+              <div>
+                <h3 id="strategyStateModalTitle">State Variables</h3>
+                <p id="strategyStateModalSubtitle" class="muted">Edit user-owned state and inspect runtime state.</p>
+              </div>
+            </div>
+            <div class="state-editor-grid">
+              <section class="state-editor-card">
+                <div class="state-editor-head">
+                  <strong>Controls / UserState</strong>
+                  <span class="state-editor-badge editable">Override</span>
+                </div>
+                <div class="state-editor-caption">Override saved in database</div>
+                <textarea id="strategyUserStateJson" class="state-json-editor" spellcheck="false" placeholder='{"risk_scale": 0.5}'></textarea>
+                <div class="state-editor-caption">Effective value: strategy defaults + override</div>
+                <pre id="strategyUserStateEffective" class="state-effective-preview">{}</pre>
+                <div class="state-editor-actions">
+                  <button id="strategyUserStateSave" class="mini" type="button">Save Controls</button>
+                  <button id="strategyUserStateReset" class="mini ghost" type="button">Clear Override</button>
+                </div>
+              </section>
+              <section class="state-editor-card">
+                <div class="state-editor-head">
+                  <strong>RuntimeState</strong>
+                  <span id="strategyRuntimeStateBadge" class="state-editor-badge locked">Strategy-owned</span>
+                </div>
+                <div class="state-editor-caption">Override saved in database</div>
+                <textarea id="strategyRuntimeStateJson" class="state-json-editor" spellcheck="false" placeholder='{"last_signal": "hold"}'></textarea>
+                <div class="state-editor-caption">Effective value: strategy defaults + override</div>
+                <pre id="strategyRuntimeStateEffective" class="state-effective-preview">{}</pre>
+                <div class="state-editor-actions">
+                  <button id="strategyRuntimeStateSave" class="mini ghost" type="button">Save RuntimeState</button>
+                  <button id="strategyRuntimeStateReset" class="mini ghost" type="button">Clear Override</button>
+                </div>
+              </section>
+            </div>
+            <div id="strategyStateMessage" class="state-editor-message muted">Load a strategy state store first.</div>
+          </div>
+        </div>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Polymarket 市场查询</h2>
+              <p class="muted">支持关键字、分类和缓存强刷，点击 Question 可直达 Polymarket，并可加入自选。</p>
+            </div>
+            <a class="table-link-button" href="/watchlist" target="_blank" rel="noopener noreferrer">打开自选页</a>
+          </div>
+          <form id="marketForm" class="form search-form">
+            <label>
+              关键词
+              <input id="marketQuery" name="q" placeholder="例如 Iran / Trump / BTC">
+            </label>
+            <label>
+              类别
+              <input id="marketCategory" name="category" placeholder="例如 Politics / Sports / Crypto">
+            </label>
+            <label>
+              条数
+              <input id="marketLimit" name="limit" type="number" min="1" max="200" value="30">
+            </label>
+            <label class="checkbox">
+              <input id="marketRefresh" name="refresh" type="checkbox">
+              强制刷新缓存
+            </label>
+            <button type="submit">查询市场</button>
+          </form>
+          <div id="marketTable"></div>
+        </section>
+      </main>
+    </div>
+    <script src="{{ url_for('static', filename='polymarket_links.js') }}"></script>
+    <script src="{{ url_for('static', filename='strategy_params_bulk.js') }}?v=20260523_param_bulk"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20260525_schema_state"></script>
+  </body>
+</html>

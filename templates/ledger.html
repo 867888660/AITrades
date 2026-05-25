@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Strategy Ledger</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">DT</div>
+          <div>
+            <div class="brand-title">DataTube</div>
+            <div class="brand-subtitle">Strategy Ledger</div>
+          </div>
+        </div>
+        <nav class="nav">
+          <a class="nav-link" href="/" target="_blank" rel="noopener noreferrer">Dashboard</a>
+          <a class="nav-link active" href="/ledger" target="_blank" rel="noopener noreferrer">Ledger</a>
+          <a class="nav-link" href="/watchlist" target="_blank" rel="noopener noreferrer">Watchlist</a>
+          <a class="nav-link" href="/settings" target="_blank" rel="noopener noreferrer">Settings</a>
+        </nav>
+        <div class="sidebar-note">
+          交易账本聚合虚拟盘、实盘订单映射、策略腿归属与未归属仓位。
+        </div>
+      </aside>
+
+      <main class="page ledger-page">
+        <header class="ledger-header">
+          <div>
+            <h1>交易账本</h1>
+            <p id="ledgerMeta" class="muted">读取策略账本与诊断检查。</p>
+          </div>
+          <div class="table-actions">
+            <select id="ledgerLimitSelect" class="state-select">
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="200">200</option>
+              <option value="500">500</option>
+            </select>
+            <button id="ledgerRefreshBtn" class="mini" type="button">刷新</button>
+          </div>
+        </header>
+
+        <section class="panel ledger-debug-panel">
+          <div class="panel-header">
+            <div>
+              <h2>Debug</h2>
+              <p class="muted">优先看这里：红色表示会阻断实盘强平或删除前强平，黄色表示需要确认。</p>
+            </div>
+            <div id="ledgerDebugBadge" class="badge">Loading</div>
+          </div>
+          <div id="ledgerDebugSummary" class="ledger-debug-summary"></div>
+          <div id="ledgerDebugChecks" class="ledger-debug-checks"></div>
+        </section>
+
+        <section class="grid two">
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>挂单</h2>
+                <p class="muted">Virtual open orders 与 Real active orders。</p>
+              </div>
+            </div>
+            <div id="ledgerOrders"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>当前仓位</h2>
+                <p class="muted">Virtual / Real / Unassigned position 汇总。</p>
+              </div>
+            </div>
+            <div id="ledgerPositions"></div>
+          </article>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Leg 归属</h2>
+              <p class="muted">每条腿的 strategy、leg_uid、condition 和 token 映射。</p>
+            </div>
+          </div>
+          <div id="ledgerLegs"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="{{ url_for('static', filename='ledger.js') }}?v=20260523_multi_asset_positions"></script>
+  </body>
+</html>

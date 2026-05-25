@@ -1,0 +1,24 @@
+{
+  "wallet_addresses": [],
+  "crypto_symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT"
+  ],
+  "finance_symbols": [
+    "AAPL",
+    "MSFT"
+  ],
+  "crypto_refresh_sec": 15,
+  "finance_refresh_sec": 20,
+  "ui_refresh_sec": 5,
+  "sqlite_db_path": "Data/market_data.db",
+  "order_list_db_path": "Data/PolyMarketOrderList.db",
+  "strategy_monitoring_db_path": "Data/PolyMarketMonitoring.db",
+  "market_realtime_db_path": "Data/polymarket_realtime.db",
+  "polymarket_dictionary_db_path": "Data/PolyMarketDictionary.db",
+  "strategy_metrics_db_dir": "strategy_metrics_dbs",
+  "strategy_monitoring_table": "strategy_registry",
+  "include_crypto_fundamentals": true,
+  "coingecko_api_key_header": "x-cg-demo-api-key"
+}

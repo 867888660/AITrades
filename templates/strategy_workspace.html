@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>策略工作台</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='workspace_v3.css') }}?v=20260515_settings_usedata">
+  </head>
+  <body data-row-id="{{ row_id }}">
+    <div class="ws3-shell">
+      <header class="ws3-header">
+        <div class="ws3-header-left">
+          <a class="ws3-logo" href="/" title="Dashboard">DT</a>
+          <div class="ws3-title-block">
+            <h1 id="workspaceTitle">策略工作台</h1>
+            <p class="ws3-subtitle" id="workspaceSubtitle">加载中...</p>
+          </div>
+          <select id="workspaceStateSelect" class="state-select workspace-state-select state-Stop" data-prev="Stop" aria-label="Strategy mode">
+            <option value="Stop">Stop</option>
+            <option value="Virtual">Virtual</option>
+            <option value="Real">Real</option>
+          </select>
+        </div>
+        <div class="ws3-header-right">
+          <span class="ws3-live-dot good" id="workspaceAutoRefreshBadge"></span>
+          <span class="ws3-live-text" id="workspaceAutoRefreshText">自动刷新中</span>
+          <button id="workspaceRefreshBtn" class="ws3-btn ws3-btn-ghost" type="button">刷新</button>
+          <button id="workspaceDrawerToggle" class="ws3-btn ws3-btn-ghost" type="button">面板</button>
+        </div>
+      </header>
+
+      <div class="ws3-body">
+        <main class="ws3-main">
+          <section class="ws3-legs-bar" id="workspaceLegsBar"></section>
+
+          <div class="ws3-chart-toolbar">
+            <div class="ws3-range-group" id="chartQuickRanges">
+              <button type="button" class="range-chip" data-range-value="15m">15m</button>
+              <button type="button" class="range-chip" data-range-value="1h">1H</button>
+              <button type="button" class="range-chip active" data-range-value="6h">6H</button>
+              <button type="button" class="range-chip" data-range-value="1d">1D</button>
+              <button type="button" class="range-chip" data-range-value="3d">3D</button>
+              <button type="button" class="range-chip" data-range-value="1w">1W</button>
+              <button id="chartCustomToggle" type="button" class="range-chip" data-custom-range="1">Custom</button>
+            </div>
+            <span class="timeline-pill" id="chartToSummary">To: Latest</span>
+            <button id="chartReturnLatestBtn" class="ws3-btn ws3-btn-ghost timeline-return" type="button" hidden>回到最新</button>
+            <label class="timeline-resolution-label">粒度
+              <select id="chartResolutionMode" class="ws3-select" title="Auto 会按当前窗口自动选择实际粒度">
+                <option value="auto">Auto</option>
+                <option value="5s">5s</option>
+                <option value="30s">30s</option>
+                <option value="1m">1m</option>
+                <option value="5m">5m</option>
+                <option value="15m">15m</option>
+              </select>
+            </label>
+            <input id="chartInterval" type="hidden" value="5s">
+            <label>主图
+              <select id="chartMainSide" class="ws3-select">
+                <option value="all">Yes + No</option>
+                <option value="yes">Yes</option>
+                <option value="no">No</option>
+              </select>
+            </label>
+            <button id="chartReloadBtn" class="ws3-btn ws3-btn-ghost chart-sync-action" type="button">同步</button>
+            <div id="chartCustomPanel" class="timeline-custom-panel" hidden>
+              <div class="timeline-custom-title">Custom Range</div>
+              <label>From <input id="chartFrom" type="datetime-local"></label>
+              <label>To
+                <select id="chartToMode" class="ws3-select">
+                  <option value="latest">Latest</option>
+                  <option value="specific">Specific time</option>
+                </select>
+              </label>
+              <label id="chartToFixedWrap" hidden>Specific time <input id="chartTo" type="datetime-local"></label>
+            </div>
+          </div>
+
+          <p id="workspaceChartMeta" class="ws3-chart-meta"></p>
+          <div id="chartMetricPicker" class="metric-picker"></div>
+          <div id="chartOverlayPicker" class="metric-picker"></div>
+          <div class="ws3-chart-area" id="workspaceCharts"></div>
+
+          <section class="ws3-events-section">
+            <div class="ws3-events-header">
+              <h2>事件流</h2>
+              <div class="ws3-event-filters" id="eventFilterTabs">
+                <button type="button" class="ws3-filter-chip active" data-event-filter="all">All</button>
+                <button type="button" class="ws3-filter-chip" data-event-filter="print">Print</button>
+                <button type="button" class="ws3-filter-chip" data-event-filter="action">Actions</button>
+                <button type="button" class="ws3-filter-chip" data-event-filter="trade">Trades</button>
+                <button type="button" class="ws3-filter-chip" data-event-filter="error">Errors</button>
+                <button type="button" class="ws3-filter-chip" data-event-filter="settings">Settings</button>
+              </div>
+            </div>
+            <div id="workspaceEvents" class="ws3-events-list"></div>
+          </section>
+
+          <details class="ws3-collapsible">
+            <summary>市场选择器 &amp; 预设</summary>
+            <div class="ws3-adv-row" style="flex-wrap:wrap;gap:8px;padding:8px 0;">
+              <p id="workspaceMarketStatus" class="ws3-status"></p>
+              <a class="ws3-btn ws3-btn-ghost" href="/watchlist">打开自选页</a>
+              <button id="workspaceUseStrategyMarketBtn" class="ws3-btn ws3-btn-ghost" type="button">回到策略期权</button>
+              <button id="workspaceSearchRefreshBtn" class="ws3-btn ws3-btn-ghost" type="button">刷新市场索引</button>
+            </div>
+            <div id="workspaceTrackedMarkets" class="ws3-tracked-markets"></div>
+            <div class="ws3-adv-row" style="flex-wrap:wrap;gap:8px;padding:6px 0;">
+              <label>Condition ID <input id="marketConditionInput" type="text" placeholder="直接粘贴 conditionId"></label>
+              <label>Token ID <input id="marketTokenInput" type="text" placeholder="直接粘贴 clob token"></label>
+              <label>搜索关键词 <input id="marketKeywordInput" type="text" placeholder="关键词搜索任意期权"></label>
+              <button id="marketSearchBtn" type="button" class="ws3-btn">搜索并添加</button>
+            </div>
+            <div id="workspaceMarketResults" class="ws3-market-results"></div>
+            <div class="ws3-preset-shell" style="padding:8px 0;">
+              <label>预设名称 <input id="workspacePresetName" type="text" placeholder="例如: BTC 对冲观察"></label>
+              <label>已保存预设 <select id="workspacePresetSelect"></select></label>
+              <label>保存范围
+                <select id="workspacePresetScope">
+                  <option value="strategy">仅当前策略</option>
+                  <option value="global">全局通用</option>
+                </select>
+              </label>
+              <button id="workspacePresetLoadBtn" class="ws3-btn ws3-btn-ghost" type="button">加载</button>
+              <button id="workspacePresetSaveBtn" class="ws3-btn" type="button">保存</button>
+              <button id="workspacePresetDeleteBtn" class="ws3-btn ws3-btn-ghost" type="button">删除</button>
+            </div>
+            <div id="workspacePresetStatus" class="ws3-status">尚未加载预设。</div>
+          </details>
+
+          <details class="ws3-collapsible">
+            <summary>数据源 &amp; Debug</summary>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:8px 0;">
+              <div>
+                <div class="ws3-sources-list" id="workspaceSources"></div>
+                <div id="workspaceBacktest"></div>
+              </div>
+              <div>
+                <div class="ws3-debug-header">
+                  <span style="font-size:12px;font-weight:600;">Debug</span>
+                  <button id="workspaceDebugClearBtn" class="ws3-btn ws3-btn-ghost" type="button">清空</button>
+                </div>
+                <div id="workspaceDebugMeta" class="ws3-status">尚无调试信息。</div>
+                <pre id="workspaceDebugLog" class="ws3-debug-log"></pre>
+              </div>
+            </div>
+          </details>
+        </main>
+
+        <aside class="ws3-drawer" id="workspaceDrawer">
+          <div class="ws3-drawer-tabs">
+            <button class="ws3-drawer-tab active" data-drawer-tab="settings" type="button">设置</button>
+            <button class="ws3-drawer-tab" data-drawer-tab="chart-style" type="button">图表</button>
+          </div>
+          <div class="ws3-drawer-content">
+            <div class="ws3-drawer-pane active" data-drawer-pane="settings">
+              <p class="ws3-status" style="margin-bottom:8px;">直接保存到监控库中的可编辑字段。</p>
+              <form id="workspaceSettingsForm" class="ws3-settings-form"></form>
+              <div id="workspaceSettingsMessage" class="ws3-status">加载中...</div>
+            </div>
+            <div class="ws3-drawer-pane" data-drawer-pane="chart-style">
+              <div id="workspaceSeriesControls"></div>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </div>
+
+    <div id="workspaceSummary" hidden></div>
+
+    <script src="{{ url_for('static', filename='echarts.min.js') }}" onerror="this.src='https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js'"></script>
+    <script src="{{ url_for('static', filename='polymarket_links.js') }}"></script>
+    <script src="{{ url_for('static', filename='strategy_params_bulk.js') }}?v=20260523_param_bulk"></script>
+    <script src="{{ url_for('static', filename='strategy_workspace_v2.js') }}?v=20260525_schema_state"></script>
+    <script src="{{ url_for('static', filename='workspace_v3_patch.js') }}?v=20260514_events_stable"></script>
+  </body>
+</html>
