@@ -5,10 +5,12 @@ description: >
   workflow for Polymarket prediction markets plus Binance crypto market data.
   Use when the user asks to install DataTube, start DataTube, fix DataTube,
   research Polymarket/Binance market opportunities, analyze news or event risk,
-  generate a strategy draft, run risk checks or simulation, submit a draft for
-  human approval, review pending approvals, inspect strategy status, or audit
-  agent runs. Trigger examples include "install DataTube", "start DataTube",
-  "research BTC Polymarket markets", "create a strategy draft",
+  inspect EventGraph data, validate EventGraph patches, submit EventGraph change
+  requests, generate a strategy draft, run risk checks or simulation, submit a
+  draft for human approval, review pending approvals, inspect strategy status,
+  or audit agent runs. Trigger examples include "install DataTube",
+  "start DataTube", "research BTC Polymarket markets",
+  "test EventGraph capability", "create a strategy draft",
   "review pending approvals", "DataTube status", "Polymarket research",
   and "Binance market research".
 ---
@@ -70,6 +72,9 @@ Choose one workflow family from the user's request:
 - **Research**: news/event research, Polymarket market discovery, Binance crypto
   context, BTC/ETH/SOL market scans, or event-to-market analysis. Use
   [references/research.md](references/research.md).
+- **EventGraph**: inspect graph/news/event data, run news search, validate graph
+  patches, create change requests, or review pending graph changes. Use
+  [references/eventgraph.md](references/eventgraph.md).
 - **Strategy**: create or revise a strategy draft, run risk checks, simulate,
   submit for human confirmation. Use [references/strategy.md](references/strategy.md).
 - **Review**: pending approvals, strategy health, run/step/audit review, failure
@@ -119,6 +124,8 @@ Examples:
 python scripts/datatube_client.py health
 python scripts/datatube_client.py market-search --q bitcoin --limit 10
 python scripts/datatube_client.py binance-search --q BTC --category crypto_spot --limit 10
+python scripts/datatube_client.py event-graph --q BTC --limit 5
+python scripts/datatube_client.py event-change-requests --status PENDING
 python scripts/datatube_client.py approvals --status WAITING_HUMAN_CONFIRM
 ```
 

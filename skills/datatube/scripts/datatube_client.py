@@ -57,6 +57,13 @@ def parse_json_arg(raw: str) -> Dict[str, Any]:
     return value
 
 
+def with_agent(payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = dict(payload)
+    data.setdefault("actor_type", "agent")
+    data.setdefault("actor_id", "agent_strategy_assistant")
+    return data
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
@@ -83,7 +90,44 @@ def main() -> None:
     ns.add_argument("--q", required=True)
     ns.add_argument("--limit-per-source", type=int, default=20)
 
-    sub.add_parser("event-graph")
+    eg = sub.add_parser("event-graph")
+    eg.add_argument("--q", default="")
+    eg.add_argument("--limit", type=int, default=10)
+
+    sub.add_parser("event-status")
+
+    ee = sub.add_parser("event-events")
+    ee.add_argument("--q", default="")
+    ee.add_argument("--limit", type=int, default=20)
+    ee.add_argument("--include-observations", action="store_true")
+
+    eo = sub.add_parser("event-observations")
+    eo.add_argument("--q", default="")
+    eo.add_argument("--event-id", default="")
+    eo.add_argument("--limit", type=int, default=20)
+
+    ec = sub.add_parser("event-core")
+    ec.add_argument("--kind", choices=["events", "finance", "edges", "expressions"], default="events")
+    ec.add_argument("--q", default="")
+    ec.add_argument("--limit", type=int, default=20)
+
+    ev = sub.add_parser("event-core-versions")
+    ev.add_argument("--object-type", required=True)
+    ev.add_argument("--object-id", required=True)
+    ev.add_argument("--limit", type=int, default=20)
+
+    ep = sub.add_parser("event-patch-validate")
+    ep.add_argument("--data", required=True)
+
+    ecr = sub.add_parser("event-change-request")
+    ecr.add_argument("--data", required=True)
+
+    ecrs = sub.add_parser("event-change-requests")
+    ecrs.add_argument("--status", default="")
+    ecrs.add_argument("--limit", type=int, default=50)
+
+    ecrd = sub.add_parser("event-change-request-detail")
+    ecrd.add_argument("request_id")
 
     act = sub.add_parser("activity")
     act.add_argument("--state", default="AI_DRAFTING")
@@ -132,23 +176,58 @@ def main() -> None:
             "limit": args.limit,
         }), base_url=base_url)
     elif cmd == "news-search":
-        data = request("POST", "/api/agent/event-graph/news/search", base_url=base_url, payload={
-            "actor_type": "agent",
-            "actor_id": "agent_strategy_assistant",
+        data = request("POST", "/api/agent/event-graph/news/search", base_url=base_url, payload=with_agent({
             "q": args.q,
             "limit_per_source": args.limit_per_source,
-        })
+        }))
     elif cmd == "event-graph":
-        data = request("GET", "/api/agent/event-graph", base_url=base_url)
+        data = request("GET", query_path("/api/agent/event-graph", {
+            "q": args.q,
+            "limit": args.limit,
+        }), base_url=base_url)
+    elif cmd == "event-status":
+        data = request("GET", "/api/agent/event-graph/news/status", base_url=base_url)
+    elif cmd == "event-events":
+        data = request("GET", query_path("/api/agent/event-graph/events", {
+            "q": args.q,
+            "limit": args.limit,
+            "include_observations": "1" if args.include_observations else "0",
+        }), base_url=base_url)
+    elif cmd == "event-observations":
+        data = request("GET", query_path("/api/agent/event-graph/observations", {
+            "q": args.q,
+            "event_id": args.event_id,
+            "limit": args.limit,
+        }), base_url=base_url)
+    elif cmd == "event-core":
+        data = request("GET", query_path(f"/api/agent/event-graph/core/{args.kind}", {
+            "q": args.q,
+            "limit": args.limit,
+        }), base_url=base_url)
+    elif cmd == "event-core-versions":
+        data = request("GET", query_path("/api/agent/event-graph/core/versions", {
+            "object_type": args.object_type,
+            "object_id": args.object_id,
+            "limit": args.limit,
+        }), base_url=base_url)
+    elif cmd == "event-patch-validate":
+        data = request("POST", "/api/agent/event-graph/patches/validate", base_url=base_url, payload=with_agent(parse_json_arg(args.data)))
+    elif cmd == "event-change-request":
+        data = request("POST", "/api/agent/event-graph/change-requests", base_url=base_url, payload=with_agent(parse_json_arg(args.data)))
+    elif cmd == "event-change-requests":
+        data = request("GET", query_path("/api/agent/event-graph/change-requests", {
+            "status": args.status,
+            "limit": args.limit,
+        }), base_url=base_url)
+    elif cmd == "event-change-request-detail":
+        data = request("GET", f"/api/agent/event-graph/change-requests/{urllib.parse.quote(args.request_id)}", base_url=base_url)
     elif cmd == "activity":
-        payload = {
-            "actor_type": "agent",
-            "actor_id": "agent_strategy_assistant",
+        payload = with_agent({
             "state": args.state,
             "message": args.message,
             "ref_type": args.ref_type,
             "ref_id": args.ref_id or args.workflow_id,
-        }
+        })
         if args.workflow_id:
             payload["workflow_id"] = args.workflow_id
         if args.run_id:
