@@ -98,7 +98,8 @@ html, body {
 .ws3-state-badge.virtual { background: rgba(86, 167, 255, 0.15); color: #56a7ff; border-color: rgba(86, 167, 255, 0.3); }
 .ws3-state-badge.real { background: rgba(49, 208, 170, 0.15); color: #31d0aa; border-color: rgba(49, 208, 170, 0.3); }
 
-.workspace-state-select {
+.workspace-state-select,
+.workspace-machine-state-select {
   width: auto;
   min-width: 86px;
   height: 28px;
@@ -1325,6 +1326,24 @@ body.chart-resizing {
 .series-control-fields.macd-grid,
 .series-control-fields.basic-grid {
   grid-template-columns: 64px minmax(104px, 1fr) 86px;
+}
+
+.series-control-fields.state-lane-color-grid {
+  grid-template-columns: repeat(auto-fit, minmax(112px, 1fr));
+}
+
+.state-lane-color-grid label {
+  min-width: 0;
+}
+
+.state-lane-color-grid label span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.state-lane-control-chip .series-control-subtitle {
+  max-width: 260px;
 }
 
 .macd-block {

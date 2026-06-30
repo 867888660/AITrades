@@ -2,6 +2,32 @@ const overviewCards = document.getElementById("overviewCards");
 const holdingsSummary = document.getElementById("holdingsSummary");
 const holdingsTable = document.getElementById("holdingsTable");
 const marketTable = document.getElementById("marketTable");
+const marketMeta = document.getElementById("marketMeta");
+const marketCategoryInput = document.getElementById("marketCategory");
+const marketCategoryChips = document.getElementById("marketCategoryChips");
+const marketSortSelect = document.getElementById("marketSort");
+const marketSortDirSelect = document.getElementById("marketSortDir");
+const binanceMarketTabs = Array.from(document.querySelectorAll("[data-binance-tab]"));
+const binanceMarketPanes = Array.from(document.querySelectorAll("[data-binance-pane]"));
+const binanceMarketForms = Array.from(document.querySelectorAll("[data-binance-form]"));
+const binanceMarketViews = {
+  crypto_spot: {
+    table: document.getElementById("binanceSpotTable"),
+    meta: document.getElementById("binanceSpotMeta"),
+  },
+  crypto_derivatives: {
+    table: document.getElementById("binanceDerivativesTable"),
+    meta: document.getElementById("binanceDerivativesMeta"),
+  },
+  rwa_stock_token: {
+    table: document.getElementById("binanceStockTokensTable"),
+    meta: document.getElementById("binanceStockTokensMeta"),
+  },
+  equity: {
+    table: document.getElementById("binanceEquityTable"),
+    meta: document.getElementById("binanceEquityMeta"),
+  },
+};
 const cryptoTable = document.getElementById("cryptoTable");
 const financeTable = document.getElementById("financeTable");
 const collectorBadge = document.getElementById("collectorBadge");
@@ -16,6 +42,23 @@ const dictionaryProgress = document.getElementById("dictionaryProgress");
 const dictionaryLog = document.getElementById("dictionaryLog");
 const refreshDictionaryBtn = document.getElementById("refreshDictionaryBtn");
 const updateDictionaryBtn = document.getElementById("updateDictionaryBtn");
+const agentMeta = document.getElementById("agentMeta");
+const agentPendingApprovals = document.getElementById("agentPendingApprovals");
+const agentPendingCount = document.getElementById("agentPendingCount");
+const agentActivityList = document.getElementById("agentActivityList");
+const agentActivityCount = document.getElementById("agentActivityCount");
+const agentDraftList = document.getElementById("agentDraftList");
+const agentDraftCount = document.getElementById("agentDraftCount");
+const refreshAgentBtn = document.getElementById("refreshAgentBtn");
+const agentApprovalModal = document.getElementById("agentApprovalModal");
+const agentApprovalModalClose = document.getElementById("agentApprovalModalClose");
+const agentApprovalCloseBtn = document.getElementById("agentApprovalCloseBtn");
+const agentApprovalTitleEl = document.getElementById("agentApprovalTitle");
+const agentApprovalSubtitleEl = document.getElementById("agentApprovalSubtitle");
+const agentApprovalBody = document.getElementById("agentApprovalBody");
+const agentApprovalApproveBtn = document.getElementById("agentApprovalApproveBtn");
+const agentApprovalChangeBtn = document.getElementById("agentApprovalChangeBtn");
+const agentApprovalRejectBtn = document.getElementById("agentApprovalRejectBtn");
 const marketUi = window.PolyMarketUi;
 const HOMEPAGE_STRATEGY_LIMIT = 30;
 
@@ -25,9 +68,19 @@ let hasLoadedCrypto = false;
 let hasLoadedFinance = false;
 let hasLoadedHoldings = false;
 let hasLoadedMarkets = false;
+let hasLoadedBinanceMarkets = false;
 let hasLoadedStrategies = false;
 let hasLoadedDictionary = false;
+let hasLoadedAgentDashboard = false;
 let currentMarketRows = [];
+let marketCategoryOptions = [];
+let activeBinanceCategory = "crypto_spot";
+const currentBinanceRows = {
+  crypto_spot: [],
+  crypto_derivatives: [],
+  rwa_stock_token: [],
+  equity: [],
+};
 const strategyRowCache = new Map();
 const expandedStrategyRows = new Set();
 const previousValues = new Map();
@@ -36,6 +89,18 @@ let latestSystemLatency = null;
 let lastLatencyFetchAt = 0;
 let strategyLiveSource = null;
 let dictionaryLiveSource = null;
+let activeAgentApproval = null;
+const MARKET_SORT_LABELS = {
+  volume24h: "24小时热门",
+  volume: "总交易量",
+  liquidity: "流动性",
+  spread: "价差",
+  end_date: "到期时间",
+  updated_at: "最新更新",
+  price_change_24h: "24小时变化",
+  last_trade_price: "最近成交价",
+};
+const MARKET_SORT_ASC_DEFAULTS = new Set(["spread", "end_date"]);
 
 function setStatus(container, text) {
   container.innerHTML = `<div class="status">${escapeHtml(text)}</div>`;
@@ -88,6 +153,99 @@ function formatPercent(value) {
   return `<span class="${cls}">${num.toFixed(2)}%</span>`;
 }
 
+function firstPresent(...values) {
+  for (const value of values) {
+    if (value !== null && value !== undefined && value !== "") {
+      return value;
+    }
+  }
+  return null;
+}
+
+function parseJsonish(value) {
+  if (typeof value !== "string") {
+    return value;
+  }
+  const text = value.trim();
+  if (!text || !["[", "{"].includes(text[0])) {
+    return value;
+  }
+  try {
+    return JSON.parse(text);
+  } catch (_error) {
+    return value;
+  }
+}
+
+function compactParams(value) {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => compactParams(item))
+      .filter((item) => item !== undefined);
+  }
+  if (!value || typeof value !== "object") {
+    return value === "" || value === undefined ? undefined : value;
+  }
+  const out = {};
+  Object.entries(value).forEach(([key, child]) => {
+    const compacted = compactParams(child);
+    if (compacted === undefined) {
+      return;
+    }
+    if (Array.isArray(compacted) && !compacted.length) {
+      return;
+    }
+    if (
+      compacted &&
+      typeof compacted === "object" &&
+      !Array.isArray(compacted) &&
+      !Object.keys(compacted).length
+    ) {
+      return;
+    }
+    out[key] = compacted;
+  });
+  return out;
+}
+
+function copyButton(label, attrs = {}) {
+  const attrText = Object.entries(attrs)
+    .map(([key, value]) => `${key}="${escapeHtml(value)}"`)
+    .join(" ");
+  return `<button class="mini ghost copy-params-btn" type="button" ${attrText}>${escapeHtml(label)}</button>`;
+}
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  document.body.appendChild(textarea);
+  textarea.select();
+  document.execCommand("copy");
+  textarea.remove();
+}
+
+async function copyJsonParams(payload, button) {
+  const text = JSON.stringify(compactParams(payload), null, 2);
+  await copyTextToClipboard(text);
+  if (!button) {
+    return;
+  }
+  const oldText = button.textContent;
+  button.textContent = "已复制";
+  button.classList.add("copied");
+  window.setTimeout(() => {
+    button.textContent = oldText || "复制参数";
+    button.classList.remove("copied");
+  }, 1200);
+}
+
 function formatRatioPercent(value) {
   if (value === null || value === undefined || value === "") {
     return "-";
@@ -100,7 +258,13 @@ function formatRatioPercent(value) {
 }
 
 function formatPnL(value) {
-  const num = Number(value ?? 0);
+  if (value === null || value === undefined || value === "") {
+    return "-";
+  }
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return String(value);
+  }
   const cls = num > 0 ? "positive" : num < 0 ? "negative" : "";
   return `<span class="${cls}">${formatSignedFixed(num, 2)}</span>`;
 }
@@ -114,6 +278,102 @@ function formatDateTime(value) {
     return String(value);
   }
   return date.toLocaleString();
+}
+
+function formatDateShort(value) {
+  if (!value) {
+    return "-";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return String(value);
+  }
+  return date.toLocaleDateString();
+}
+
+function parseMarketCategories(value) {
+  return String(value || "")
+    .split(/[/,;]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function uniqueMarketCategories(categories) {
+  const seen = new Set();
+  return categories.filter((category) => {
+    const key = category.toLowerCase();
+    if (!category || seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function setMarketCategories(categories) {
+  if (!marketCategoryInput) {
+    return;
+  }
+  marketCategoryInput.value = uniqueMarketCategories(categories).join(", ");
+  syncMarketCategoryChips();
+}
+
+function syncMarketCategoryChips() {
+  if (!marketCategoryChips) {
+    return;
+  }
+  const selected = new Set(parseMarketCategories(marketCategoryInput?.value || "").map((item) => item.toLowerCase()));
+  marketCategoryChips.querySelectorAll("[data-market-category-chip]").forEach((chip) => {
+    const category = String(chip.dataset.marketCategoryChip || "").toLowerCase();
+    chip.classList.toggle("active", selected.has(category));
+  });
+}
+
+function renderMarketCategoryChips(categories) {
+  if (!marketCategoryChips) {
+    return;
+  }
+  if (!categories.length) {
+    marketCategoryChips.innerHTML = `<span class="category-chip-empty">暂无类别</span>`;
+    return;
+  }
+  marketCategoryChips.innerHTML = categories
+    .map((item) => {
+      const name = String(item.name || "").trim();
+      if (!name) {
+        return "";
+      }
+      const count = Number(item.count || 0);
+      return `<button class="category-chip" type="button" data-market-category-chip="${escapeHtml(name)}">${escapeHtml(name)}${count ? ` <span>${formatNumber(count, 0)}</span>` : ""}</button>`;
+    })
+    .join("");
+  syncMarketCategoryChips();
+}
+
+async function loadMarketCategories() {
+  if (!marketCategoryChips) {
+    return;
+  }
+  marketCategoryChips.innerHTML = `<span class="category-chip-empty">加载类别...</span>`;
+  const payload = await fetchJson("/api/polymarket/market-categories?limit=80");
+  marketCategoryOptions = payload.data || [];
+  renderMarketCategoryChips(marketCategoryOptions);
+}
+
+function marketSortLabel(sort) {
+  return MARKET_SORT_LABELS[sort] || sort || "默认";
+}
+
+function renderMarketMeta(payload, formData) {
+  if (!marketMeta) {
+    return;
+  }
+  const categories = parseMarketCategories(formData.get("category"));
+  const sort = payload?.sort || formData.get("sort") || "relevance";
+  const order = payload?.order || formData.get("order") || "desc";
+  const orderLabel = order === "asc" ? "小到大" : "大到小";
+  const categoryText = categories.length ? categories.join(" / ") : "全部类别";
+  marketMeta.innerHTML = `类别: ${escapeHtml(categoryText)} | 排序: ${escapeHtml(marketSortLabel(sort))} ${escapeHtml(orderLabel)} | 返回: ${escapeHtml(payload?.count ?? 0)} 条`;
 }
 
 function formatShortTime(value) {
@@ -284,11 +544,16 @@ function renderLatencyWindow(latency) {
 
 function renderCards(data) {
   const collector = data.collector || {};
+  const totalStrategyProfit = Number(data.total_strategy_profit ?? 0);
+  const totalStrategyBankroll = Number(data.total_strategy_bankroll ?? 0);
+  const strategyReturnPct = Number.isFinite(totalStrategyBankroll) && totalStrategyBankroll > 0
+    ? totalStrategyProfit / totalStrategyBankroll
+    : data.total_strategy_return_pct;
   const cards = [
     { label: "活跃市场", value: data.market_count ?? 0, subvalue: `分类 ${data.category_count ?? 0}` },
     { label: "默认钱包", value: (data.wallets || []).length, subvalue: `${data.position_count ?? 0} 条持仓` },
     { label: "运行策略", value: data.running_strategy_count ?? 0, subvalue: "当前有仓位策略数" },
-    { label: "总策略盈利", value: formatNumber(data.total_strategy_profit ?? 0, 2), subvalue: data.total_strategy_return_pct != null ? `收益率 ${(data.total_strategy_return_pct * 100).toFixed(2)}%` : "基于远端仓位+本地订单估算" },
+    { label: "总策略盈利", value: formatNumber(data.total_strategy_profit ?? 0, 2), subvalue: strategyReturnPct != null ? `收益率 ${(strategyReturnPct * 100).toFixed(2)}%` : "基于远端仓位+本地订单估算" },
     { label: "Crypto 最新", value: (collector.crypto?.count ?? 0), subvalue: feedMetaText(collector.crypto) || "未启动" },
     { label: "Finance 最新", value: (collector.finance?.count ?? 0), subvalue: feedMetaText(collector.finance) || "未启动" },
   ];
@@ -313,7 +578,7 @@ function renderTable(container, columns, rows) {
   const head = columns.map((col) => `<th>${escapeHtml(col.label)}</th>`).join("");
   const body = rows
     .map((row) => {
-      const rowKey = String((row && (row.id || row.symbol || row.condition_id || row.token_id || row.wallet || row.strategy || row.question)) ?? Math.random());
+      const rowKey = String((row && (row.id || row.instrument_id || row.symbol || row.condition_id || row.token_id || row.wallet || row.strategy || row.question)) ?? Math.random());
       const tds = columns
         .map((col) => {
           const rawValue = col.value ? col.value(row) : row[col.key];
@@ -345,6 +610,444 @@ async function fetchJson(url, options = undefined) {
     console.error(`[FE][error] ${url} cost=${dt}ms`, error);
     throw error;
   }
+}
+
+function agentStateLabel(state) {
+  return {
+    AI_DRAFTING: "AI 编写中",
+    AI_PROPOSED: "AI 已提案",
+    WAITING_HUMAN_CONFIRM: "待人工确认",
+    HUMAN_REVISION_REQUESTED: "要求修改",
+    HUMAN_APPROVED: "已批准",
+    HUMAN_REJECTED: "已拒绝",
+    RISK_BLOCKED: "风控阻断",
+    ACTIVE: "运行中",
+    PAUSED: "已暂停",
+    CANCELLED: "已取消",
+    ARCHIVED: "已归档",
+    EXPIRED: "已过期",
+  }[state] || state || "-";
+}
+
+function agentStateTone(state) {
+  if (["HUMAN_APPROVED", "ACTIVE"].includes(state)) return "good";
+  if (["WAITING_HUMAN_CONFIRM", "AI_DRAFTING", "AI_PROPOSED", "HUMAN_REVISION_REQUESTED"].includes(state)) return "pending";
+  if (["RISK_BLOCKED", "HUMAN_REJECTED", "EXPIRED"].includes(state)) return "error";
+  return "neutral";
+}
+
+function agentStateChip(state) {
+  return `<span class="state-chip ${agentStateTone(state)}">${escapeHtml(agentStateLabel(state))}</span>`;
+}
+
+function agentDraftTitle(draft) {
+  return draft?.draft?.name || draft?.name || "未命名策略";
+}
+
+function agentApprovalTitle(approval) {
+  return approval?.snapshot?.snapshot?.name || approval?.draft?.draft?.name || approval?.draft?.name || approval?.approval_id || "-";
+}
+
+function agentApprovalBudget(approval) {
+  const budget = approval?.snapshot?.snapshot?.budget || approval?.draft?.draft?.budget || {};
+  const total = budget.max_total_usdc ?? 0;
+  const single = budget.max_single_order_usdc ?? 0;
+  return `预算 ${formatFixed(total, 2)} / 单笔 ${formatFixed(single, 2)}`;
+}
+
+function agentRiskText(report = {}) {
+  if (!report || !Object.keys(report).length) {
+    return "未检查";
+  }
+  const passed = report.passed ? "通过" : "未通过";
+  const level = report.risk_level || "-";
+  const violations = Array.isArray(report.violations) ? report.violations.length : 0;
+  return `${passed} · ${level} · ${violations} 项`;
+}
+
+function agentRiskViolationText(report = {}) {
+  const violations = Array.isArray(report?.violations) ? report.violations : [];
+  if (!violations.length) return "";
+  return violations.map((item) => {
+    const field = item.field ? `${item.field}: ` : "";
+    const current = item.current !== undefined ? `当前 ${agentFormatValue(item.current)}` : "";
+    const allowed = item.allowed !== undefined ? `上限 ${agentFormatValue(item.allowed)}` : "";
+    const detail = [current, allowed].filter(Boolean).join(" / ");
+    return `${field}${item.message || item.code || "风控未通过"}${detail ? `（${detail}）` : ""}`;
+  }).join("；");
+}
+
+function agentHumanOverride(snapshot = {}) {
+  const override = snapshot?.human_override;
+  return override && typeof override === "object" && override.allows_risk_approval ? override : null;
+}
+
+function agentApprovalBlockedByRisk(report = {}, snapshot = {}) {
+  return Boolean(report && Object.keys(report).length && report.passed === false && !agentHumanOverride(snapshot));
+}
+
+function agentRiskOverrideText(snapshot = {}) {
+  const override = agentHumanOverride(snapshot);
+  if (!override) return "";
+  const actor = override.actor_id || "human";
+  const reason = override.reason || "human edited pending approval parameters";
+  return `人工已超控风控：${actor} 手动修改参数（${reason}）`;
+}
+
+function agentObjectEntries(value = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.entries(value).filter(([, child]) => child !== undefined && child !== null && child !== "");
+}
+
+function agentFormatValue(value) {
+  if (value === null || value === undefined || value === "") return "-";
+  if (typeof value === "number") return Number.isFinite(value) ? formatNumber(value, 6) : "-";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (Array.isArray(value)) return value.length ? value.map((item) => agentFormatValue(item)).join(", ") : "[]";
+  if (typeof value === "object") return JSON.stringify(value, null, 2);
+  return String(value);
+}
+
+function renderAgentKvGrid(title, obj = {}, options = {}) {
+  const entries = agentObjectEntries(obj);
+  if (!entries.length && !options.showEmpty) return "";
+  const body = entries.length
+    ? entries.map(([key, value]) => `
+      <div class="agent-kv">
+        <div class="agent-kv-key">${escapeHtml(key)}</div>
+        <div class="agent-kv-value">${escapeHtml(agentFormatValue(value))}</div>
+      </div>
+    `).join("")
+    : `<div class="status">暂无数据</div>`;
+  return `
+    <section class="agent-detail-section">
+      <h4>${escapeHtml(title)}</h4>
+      <div class="agent-kv-grid">${body}</div>
+    </section>
+  `;
+}
+
+function agentReportFromDraft(source = {}) {
+  const report = source?.agent_report && typeof source.agent_report === "object" ? source.agent_report : {};
+  const thesis = source?.thesis || "";
+  return {
+    strategy_reason: report.strategy_reason || thesis || "",
+    market_observation: report.market_observation || "",
+    parameter_rationale: report.parameter_rationale || "",
+    risk_control: report.risk_control || "",
+    human_review_focus: report.human_review_focus || "",
+  };
+}
+
+function agentReportRows(report = {}, options = {}) {
+  const rows = [
+    ["选择原因", report.strategy_reason],
+    ["参数思考", report.parameter_rationale],
+    ["风险边界", report.risk_control],
+    ["人工确认", report.human_review_focus],
+  ];
+  const limit = options.limit || rows.length;
+  return rows
+    .filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== "")
+    .slice(0, limit);
+}
+
+function renderAgentReportSnippet(report = {}, options = {}) {
+  const rows = agentReportRows(report, options);
+  if (!rows.length) return "";
+  const title = options.title || "Agent 提交说明";
+  return `
+    <div class="agent-report-snippet">
+      <div class="agent-report-title">${escapeHtml(title)}</div>
+      ${rows.map(([label, value]) => `
+        <div class="agent-report-row">
+          <span>${escapeHtml(label)}</span>
+          <p>${escapeHtml(String(value))}</p>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderAgentMarkets(markets = []) {
+  if (!Array.isArray(markets) || !markets.length) {
+    return `
+      <section class="agent-detail-section">
+        <h4>Markets / Legs</h4>
+        <div class="status">暂无市场</div>
+      </section>
+    `;
+  }
+  const rows = markets.map((market, index) => `
+    <tr>
+      <td>${index + 1}</td>
+      <td>${marketExternalLink(market, market.question || market.title || market.condition_id || "-")}</td>
+      <td>${escapeHtml(market.outcome || "YES")}</td>
+      <td>${escapeHtml(market.action || "buy")}</td>
+      <td class="num">${formatFixed(market.max_entry_price ?? market.best_ask, 4)}</td>
+      <td class="num">${formatFixed(market.max_exposure_usdc, 2)}</td>
+      <td><span class="mono truncate" title="${escapeHtml(market.condition_id || "")}">${escapeHtml(market.condition_id || "-")}</span></td>
+    </tr>
+  `).join("");
+  return `
+    <section class="agent-detail-section">
+      <h4>Markets / Legs</h4>
+      <div class="agent-detail-table-wrap">
+        <table class="agent-detail-table">
+          <thead><tr><th>#</th><th>Question</th><th>Outcome</th><th>Action</th><th>Max Entry</th><th>Exposure</th><th>Condition</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderAgentRiskReport(report = {}) {
+  const violations = Array.isArray(report.violations) ? report.violations : [];
+  const violationRows = violations.length
+    ? violations.map((item) => `
+      <tr>
+        <td>${escapeHtml(item.code || "-")}</td>
+        <td>${escapeHtml(item.message || "-")}</td>
+        <td>${escapeHtml(item.field || "-")}</td>
+        <td>${escapeHtml(agentFormatValue(item.current))}</td>
+        <td>${escapeHtml(agentFormatValue(item.allowed))}</td>
+      </tr>
+    `).join("")
+    : `<tr><td colspan="5" class="empty-cell">无风控违规</td></tr>`;
+  return `
+    <section class="agent-detail-section">
+      <h4>Risk Check</h4>
+      <div class="agent-detail-summary">
+        ${agentStateChip(report.passed ? "HUMAN_APPROVED" : "RISK_BLOCKED")}
+        <span>level: ${escapeHtml(report.risk_level || "-")}</span>
+        <span>violations: ${escapeHtml(violations.length)}</span>
+      </div>
+      <div class="agent-detail-table-wrap">
+        <table class="agent-detail-table">
+          <thead><tr><th>Code</th><th>Message</th><th>Field</th><th>Current</th><th>Allowed</th></tr></thead>
+          <tbody>${violationRows}</tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderAgentSimulation(sim = {}) {
+  const scenarios = Array.isArray(sim.scenarios) ? sim.scenarios : [];
+  const scenarioRows = scenarios.length
+    ? scenarios.map((item) => `
+      <tr>
+        <td>${escapeHtml(item.name || "-")}</td>
+        <td class="num">${formatPnL(item.estimated_pnl_usdc)}</td>
+      </tr>
+    `).join("")
+    : `<tr><td colspan="2" class="empty-cell">暂无模拟场景</td></tr>`;
+  return `
+    <section class="agent-detail-section">
+      <h4>Simulation</h4>
+      <div class="agent-detail-summary">
+        <span>max loss: ${formatFixed(sim.max_loss_usdc, 2)} USDC</span>
+        <span>max exposure: ${formatFixed(sim.max_exposure_usdc, 2)} USDC</span>
+        <span>orders: ${escapeHtml(sim.estimated_orders ?? "-")}</span>
+      </div>
+      <div class="agent-detail-table-wrap">
+        <table class="agent-detail-table">
+          <thead><tr><th>Scenario</th><th>Estimated PnL</th></tr></thead>
+          <tbody>${scenarioRows}</tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function openAgentApprovalModal(approval) {
+  if (!agentApprovalModal || !agentApprovalBody) return;
+  activeAgentApproval = approval;
+  const snapshot = approval?.snapshot?.snapshot || approval?.draft?.draft || {};
+  const draft = approval?.draft || {};
+  const title = agentApprovalTitle(approval);
+  const params = snapshot.params || {};
+  const budget = snapshot.budget || {};
+  const executionRules = snapshot.execution_rules || {};
+  const exitRules = snapshot.exit_rules || {};
+  const markets = snapshot.markets || [];
+  const risk = approval.risk_report || approval?.snapshot?.risk || draft.last_risk_report || {};
+  const simulation = draft.last_simulation || {};
+  const agentReport = agentReportFromDraft(snapshot);
+  if (agentApprovalTitleEl) agentApprovalTitleEl.textContent = title;
+  if (agentApprovalSubtitleEl) {
+    agentApprovalSubtitleEl.textContent = `审批单 ${approval.approval_id || "-"} · ${agentStateLabel(approval.status)} · 策略代码 ${snapshot.strategy_code || "-"}`;
+  }
+  agentApprovalBody.innerHTML = `
+    <section class="agent-detail-section">
+      <h4>Strategy Summary</h4>
+      <div class="agent-detail-summary">
+        ${agentStateChip(approval.status)}
+        <span>strategy_code: ${escapeHtml(snapshot.strategy_code || "-")}</span>
+        <span>version: ${escapeHtml(approval.draft_version || draft.current_version || "-")}</span>
+        <span>expires: ${formatShortTime(approval.expires_at)}</span>
+      </div>
+      <div class="agent-thesis">${escapeHtml(snapshot.thesis || "-")}</div>
+    </section>
+    <section class="agent-detail-section">
+      <h4>Agent 提交说明</h4>
+      ${renderAgentReportSnippet(agentReport, { title: "提交模板" }) || '<div class="status">暂无提交说明</div>'}
+    </section>
+    ${renderAgentMarkets(markets)}
+    ${renderAgentKvGrid("Params / Strategy Inputs", params, { showEmpty: true })}
+    ${renderAgentKvGrid("Budget", budget, { showEmpty: true })}
+    ${renderAgentKvGrid("Execution Rules", executionRules, { showEmpty: true })}
+    ${renderAgentKvGrid("Exit Rules", exitRules, { showEmpty: true })}
+    ${renderAgentRiskReport(risk)}
+    ${renderAgentSimulation(simulation)}
+    ${renderAgentKvGrid("Risk Notes", { notes: snapshot.risk_notes || [] })}
+  `;
+  const isPending = approval.status === "WAITING_HUMAN_CONFIRM";
+  if (agentApprovalApproveBtn) agentApprovalApproveBtn.disabled = !isPending;
+  if (agentApprovalChangeBtn) agentApprovalChangeBtn.disabled = !isPending;
+  if (agentApprovalRejectBtn) agentApprovalRejectBtn.disabled = !isPending;
+  agentApprovalModal.hidden = false;
+}
+
+function closeAgentApprovalModal() {
+  if (agentApprovalModal) agentApprovalModal.hidden = true;
+  activeAgentApproval = null;
+}
+
+function renderAgentPendingApprovals(rows = []) {
+  if (!agentPendingApprovals) return;
+  if (agentPendingCount) agentPendingCount.textContent = String(rows.length);
+  if (!rows.length) {
+    setStatus(agentPendingApprovals, "暂无待人工确认策略");
+    return;
+  }
+  agentPendingApprovals.innerHTML = rows.map((approval) => {
+    const title = agentApprovalTitle(approval);
+    const report = approval.risk_report || approval.snapshot?.risk || {};
+    const snapshot = approval.snapshot?.snapshot || approval.draft?.draft || {};
+    const thesis = snapshot.thesis || "";
+    const agentReport = agentReportFromDraft(snapshot);
+    const reportHtml = renderAgentReportSnippet(agentReport, { limit: 3 });
+    const riskViolation = agentRiskViolationText(report);
+    const riskOverride = agentRiskOverrideText(snapshot);
+    const approvalBlocked = agentApprovalBlockedByRisk(report, snapshot);
+    return `
+      <div class="agent-item">
+        <div class="agent-item-main">
+          <div class="agent-item-title">${escapeHtml(title)}</div>
+          <div class="agent-item-meta">
+            ${agentStateChip(approval.status)}
+            <span>${escapeHtml(agentApprovalBudget(approval))}</span>
+            <span>风控 ${escapeHtml(agentRiskText(report))}</span>
+            <span>提交 ${formatShortTime(approval.created_at)}</span>
+          </div>
+          ${riskViolation ? `<div class="agent-risk-warning">${escapeHtml(riskViolation)}</div>` : ""}
+          ${riskOverride ? `<div class="agent-risk-override">${escapeHtml(riskOverride)}</div>` : ""}
+          ${reportHtml || (thesis ? `<div class="agent-item-note">${escapeHtml(thesis)}</div>` : "")}
+        </div>
+        <div class="agent-actions">
+          <button class="mini ghost" type="button" data-agent-view-approval="${escapeHtml(approval.approval_id)}">参数</button>
+          <button class="mini" type="button" data-agent-approve="${escapeHtml(approval.approval_id)}" ${approvalBlocked ? `disabled title="${escapeHtml(riskViolation || "风控未通过，不能批准")}"` : ""}>批准</button>
+          <button class="mini ghost" type="button" data-agent-change="${escapeHtml(approval.approval_id)}">要求修改</button>
+          <button class="mini danger" type="button" data-agent-reject="${escapeHtml(approval.approval_id)}">拒绝</button>
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+function renderAgentActivity(rows = []) {
+  if (!agentActivityList) return;
+  if (agentActivityCount) agentActivityCount.textContent = String(rows.length);
+  if (!rows.length) {
+    setStatus(agentActivityList, "暂无 Agent 活动");
+    return;
+  }
+  agentActivityList.innerHTML = rows.map((event) => `
+    <div class="agent-activity-row">
+      <span>${formatShortTime(event.created_at)}</span>
+      ${agentStateChip(event.state)}
+      <strong>${escapeHtml(event.agent_id || "agent")}</strong>
+      <span class="truncate">${escapeHtml(event.message || "-")}</span>
+    </div>
+  `).join("");
+}
+
+function renderAgentDrafts(rows = []) {
+  if (!agentDraftList) return;
+  if (agentDraftCount) agentDraftCount.textContent = String(rows.length);
+  if (!rows.length) {
+    setStatus(agentDraftList, "暂无策略草案");
+    return;
+  }
+  agentDraftList.innerHTML = rows.map((draft) => {
+    const d = draft.draft || {};
+    const markets = Array.isArray(d.markets) ? d.markets : [];
+    const budget = d.budget || {};
+    const canDelete = !["WAITING_HUMAN_CONFIRM", "HUMAN_APPROVED"].includes(draft.lifecycle_state);
+    const canSubmit = !["WAITING_HUMAN_CONFIRM", "HUMAN_APPROVED", "CANCELLED", "ARCHIVED"].includes(draft.lifecycle_state);
+    const reportHtml = renderAgentReportSnippet(agentReportFromDraft(d), { limit: 2 });
+    return `
+      <div class="agent-item agent-draft-item">
+        <div class="agent-item-main">
+          <div class="agent-item-title">${escapeHtml(agentDraftTitle(draft))}</div>
+          <div class="agent-item-meta">
+            ${agentStateChip(draft.lifecycle_state)}
+            <span>版本 ${escapeHtml(draft.current_version || 1)}</span>
+            <span>${escapeHtml(markets.length)} markets</span>
+            <span>预算 ${formatFixed(budget.max_total_usdc, 2)}</span>
+            <span>风控 ${escapeHtml(agentRiskText(draft.last_risk_report))}</span>
+            <span>更新 ${formatShortTime(draft.updated_at)}</span>
+          </div>
+          ${reportHtml || (d.thesis ? `<div class="agent-item-note">${escapeHtml(d.thesis)}</div>` : "")}
+        </div>
+        <div class="agent-actions">
+          <button class="mini ghost" type="button" data-agent-view-draft="${escapeHtml(draft.draft_id)}">查看</button>
+          <button class="mini ghost" type="button" data-agent-risk="${escapeHtml(draft.draft_id)}">风控</button>
+          <button class="mini ghost" type="button" data-agent-simulate="${escapeHtml(draft.draft_id)}">模拟</button>
+          ${canSubmit ? `<button class="mini" type="button" data-agent-submit="${escapeHtml(draft.draft_id)}">提交确认</button>` : ""}
+          ${canDelete ? `<button class="mini danger" type="button" data-agent-delete-draft="${escapeHtml(draft.draft_id)}">删除</button>` : ""}
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+function renderAgentDashboard(data = {}) {
+  const pending = data.pending_approvals || [];
+  const activity = data.activity || [];
+  const drafts = data.drafts || [];
+  if (agentMeta) {
+    const limits = data.policy?.limits || {};
+    agentMeta.innerHTML = `待确认: ${escapeHtml(pending.length)} | 草案: ${escapeHtml(drafts.length)} | 单策略上限: ${formatFixed(limits.max_strategy_budget_usdc, 2)} USDC | 单笔上限: ${formatFixed(limits.max_single_order_usdc, 2)} USDC`;
+  }
+  renderAgentPendingApprovals(pending);
+  renderAgentActivity(activity);
+  renderAgentDrafts(drafts);
+}
+
+async function loadAgentDashboard(options = {}) {
+  const { silent = false } = options;
+  if (!agentPendingApprovals || !agentActivityList || !agentDraftList) {
+    return;
+  }
+  if (!silent && !hasLoadedAgentDashboard) {
+    setStatus(agentPendingApprovals, "加载中...");
+    setStatus(agentActivityList, "加载中...");
+    setStatus(agentDraftList, "加载中...");
+  }
+  const payload = await fetchJson("/api/agent/dashboard?limit=20");
+  renderAgentDashboard(payload.data || {});
+  hasLoadedAgentDashboard = true;
+}
+
+async function postAgentAction(url, body = {}) {
+  return fetchJson(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 
 async function refreshSystemLatency(options = {}) {
@@ -640,6 +1343,7 @@ async function loadMarkets(formData, options = {}) {
   }
   const data = await fetchJson(`/api/polymarket/markets?${qs.toString()}`);
   currentMarketRows = data.data || [];
+  renderMarketMeta(data, formData);
   renderMarketSearchTable(currentMarketRows);
   hasLoadedMarkets = true;
 }
@@ -685,16 +1389,103 @@ function internalMarketLink(row) {
   return `/watchlist?${params.toString()}`;
 }
 
+function marketOutcomes(row) {
+  const raw = row.raw || {};
+  const outcomes = parseJsonish(firstPresent(row.outcomes, raw.outcomes));
+  if (Array.isArray(outcomes) && outcomes.length) {
+    return outcomes.map((item) => {
+      if (item && typeof item === "object") {
+        return String(firstPresent(item.name, item.title, item.label, item.outcome, "") || "");
+      }
+      return String(item || "");
+    }).filter(Boolean);
+  }
+  return ["Yes", "No"];
+}
+
+function buildPolymarketStrategyParams(row) {
+  const raw = row.raw || {};
+  const rawRules = firstPresent(
+    row.rules,
+    raw.rules,
+    raw.description,
+    raw.resolutionCriteria,
+    raw.resolution_criteria,
+    raw.resolutionDetails,
+    raw.longDescription
+  );
+  const resolutionSource = firstPresent(
+    row.resolution_source,
+    raw.resolutionSource,
+    raw.resolution_source,
+    raw.resolutionSourceName,
+    raw.oracle,
+    raw.source
+  );
+  return {
+    source: "polymarket",
+    type: "prediction_market_binary",
+    question: firstPresent(row.question, raw.question, raw.title),
+    slug: firstPresent(row.slug, raw.slug),
+    event_slug: firstPresent(row.event_slug, raw.eventSlug, raw.event_slug),
+    url: marketUi.buildPolymarketUrl(row),
+    category: firstPresent(row.category, raw.category),
+    rules: {
+      raw: rawRules,
+      rules_available: Boolean(rawRules),
+      note: rawRules ? undefined : "当前搜索结果未返回 Polymarket rules/description，需要打开市场详情补全。",
+      resolution_source: resolutionSource,
+      end_date: firstPresent(row.end_date, raw.endDate, raw.umaEndDate),
+      resolution_timezone: firstPresent(raw.resolutionTimezone, raw.timezone, "UTC"),
+      outcomes: marketOutcomes(row),
+    },
+    market: {
+      yes_price: row.yes_price,
+      no_price: row.no_price,
+      last_trade_price: row.last_trade_price,
+      best_bid: firstPresent(row.best_bid, raw.bestBid),
+      best_ask: firstPresent(row.best_ask, raw.bestAsk),
+      spread: row.spread,
+      liquidity: row.liquidity,
+      volume: row.volume,
+      active: row.active,
+      closed: row.closed,
+      resolved: firstPresent(row.resolved, raw.resolved),
+      accepting_orders: firstPresent(row.accepting_orders, raw.acceptingOrders, row.active && !row.closed),
+    },
+    identifiers: {
+      condition_id: firstPresent(row.condition_id, raw.conditionId, raw.condition_id),
+      market_id: firstPresent(row.market_id, raw.id, raw.marketId),
+      clob_token_ids: {
+        yes: row.yes_token,
+        no: row.no_token,
+      },
+    },
+    snapshot: {
+      copied_at: new Date().toISOString(),
+      price_source: "polymarket_market_search",
+    },
+  };
+}
+
 function renderMarketSearchTable(rows) {
   renderTable(
     marketTable,
     [
       { key: "question", label: "Question", render: (row) => marketQuestionLink(row) },
       { key: "category", label: "Category", render: (row) => escapeHtml(row.category || "-") },
+      { key: "volume_24h", label: "24h Vol", render: (row) => formatNumber(firstPresent(row.volume_24h, row.raw?.volume24hr, row.raw?.volume24hrClob), 0) },
+      { key: "volume", label: "Volume", render: (row) => formatNumber(firstPresent(row.volume, row.raw?.volumeNum, row.raw?.volume), 0) },
+      { key: "liquidity", label: "Liquidity", render: (row) => formatNumber(firstPresent(row.liquidity, row.raw?.liquidityNum, row.raw?.liquidity), 0) },
       { key: "yes_price", label: "Yes", render: (row) => formatNumber(row.yes_price, 4) },
       { key: "no_price", label: "No", render: (row) => formatNumber(row.no_price, 4) },
+      { key: "yes_bid", label: "Yes Bid", render: (row) => formatNumber(firstPresent(row.yes_bid, row.best_bid, row.raw?.bestBid, row.raw?.bid), 4) },
+      { key: "yes_ask", label: "Yes Ask", render: (row) => formatNumber(firstPresent(row.yes_ask, row.best_ask, row.raw?.bestAsk, row.raw?.ask), 4) },
+      { key: "no_bid", label: "No Bid", render: (row) => formatNumber(firstPresent(row.no_bid, row.raw?.noBid, row.raw?.opp_bid_price, row.raw?.opp_bids_price), 4) },
+      { key: "no_ask", label: "No Ask", render: (row) => formatNumber(firstPresent(row.no_ask, row.raw?.noAsk, row.raw?.opp_ask_price), 4) },
       { key: "spread", label: "Spread", render: (row) => formatNumber(row.spread, 4) },
       { key: "last_trade_price", label: "Last Trade", render: (row) => formatNumber(row.last_trade_price, 4) },
+      { key: "end_date", label: "Ends", render: (row) => escapeHtml(formatDateShort(firstPresent(row.end_date, row.raw?.endDate, row.raw?.umaEndDate))) },
       { key: "slug", label: "Slug", render: (row) => escapeHtml(row.slug || "-") },
       {
         key: "actions",
@@ -703,6 +1494,7 @@ function renderMarketSearchTable(rows) {
           <div class="table-actions">
             <a class="table-link-button" href="${escapeHtml(marketUi.buildPolymarketUrl(row))}" target="_blank" rel="noopener noreferrer">打开</a>
             <a class="table-link-button" href="${escapeHtml(internalMarketLink(row))}" target="_blank" rel="noopener noreferrer">系统内打开</a>
+            ${copyButton("复制参数", { "data-copy-market": marketUi.marketIdentityKey(row) })}
             <button class="mini ghost" type="button" data-watch-market="${escapeHtml(marketUi.marketIdentityKey(row))}">${watchlistButtonLabel(row)}</button>
           </div>
         `,
@@ -710,6 +1502,313 @@ function renderMarketSearchTable(rows) {
     ],
     rows
   );
+}
+
+function binanceView(category) {
+  return binanceMarketViews[category] || binanceMarketViews.crypto_spot;
+}
+
+function binanceForm(category) {
+  return binanceMarketForms.find((form) => form.dataset.binanceForm === category);
+}
+
+function capabilityTags(row) {
+  const caps = row.capabilities || {};
+  const tags = [];
+  if (caps.spot) tags.push("Spot");
+  if (caps.margin) tags.push("Margin");
+  if (caps.derivatives) tags.push(row.subtype_label || "Derivatives");
+  if (caps.tokenized_stock) tags.push("Tokenized");
+  if (caps.equity) tags.push("Equity");
+  if (!tags.length && row.market_kind) tags.push(row.market_kind);
+  return `<div class="capability-tags">${tags.map((tag) => `<span class="capability-tag">${escapeHtml(tag)}</span>`).join("")}</div>`;
+}
+
+function statusChip(value) {
+  const text = value || "-";
+  const normalized = String(text).toUpperCase();
+  const tone = ["TRADING", "ACTIVE", "QUOTE_READY", "OK"].includes(normalized)
+    ? "good"
+    : ["CONFIGURED", "LOOKUP_ONLY", "PENDING_TRADING", "DEGRADED"].includes(normalized)
+      ? "pending"
+      : normalized.includes("ERROR")
+        ? "error"
+        : "pending";
+  return `<span class="state-chip ${tone}">${escapeHtml(text)}</span>`;
+}
+
+function sourceMetaLine(payload) {
+  const meta = payload.meta || {};
+  const status = meta.source_status || "ok";
+  const errors = meta.errors || [];
+  const sourceText = meta.source || meta.sources?.map((item) => item.subtype).join(", ") || "-";
+  const total = meta.total_source_symbols ?? meta.total_source_rows ?? "";
+  const totalText = total === "" ? "" : ` | 源条数: ${escapeHtml(total)}`;
+  const cacheText = meta.cache_status ? ` | 缓存: ${escapeHtml(meta.cache_status)}` : "";
+  const fallbackText = meta.fallback ? ` | fallback: ${escapeHtml(meta.fallback_reason || "local")}` : "";
+  const errorText = errors.length ? ` | 诊断: ${escapeHtml(errors.slice(0, 2).join(" ; "))}` : "";
+  return `状态: ${statusChip(status === "ok" ? "OK" : "DEGRADED")} | 来源: ${escapeHtml(sourceText)} | 返回: ${escapeHtml(payload.count ?? 0)}${totalText}${cacheText}${fallbackText}${errorText}`;
+}
+
+function shortContract(value) {
+  const text = String(value || "");
+  if (!text) return "-";
+  if (text.length <= 22) return escapeHtml(text);
+  return `<span class="contract-code" title="${escapeHtml(text)}">${escapeHtml(text.slice(0, 10))}...${escapeHtml(text.slice(-8))}</span>`;
+}
+
+function instrumentCode(row) {
+  return `<span class="instrument-code">${escapeHtml(row.instrument_id || "-")}</span>`;
+}
+
+function binanceCopyAction(category, row) {
+  const rowKey = row.instrument_id || row.symbol || row.ticker || row.contract_address || "";
+  return copyButton("复制参数", {
+    "data-copy-binance-category": category,
+    "data-copy-binance-row": rowKey,
+  });
+}
+
+function buildBinanceStrategyParams(row, category) {
+  const base = {
+    source: "binance",
+    type: row.asset_class || category,
+    leg_kind: row.leg_kind || row.kind || "",
+    instrument: row.instrument_id,
+    symbol: row.symbol,
+    display_name: row.display_name,
+    status: row.status,
+    snapshot: {
+      copied_at: new Date().toISOString(),
+      price_source: row.source || "binance_market_search",
+      data_quality: row.data_quality,
+      note: row.fallback_reason,
+    },
+  };
+
+  if (category === "crypto_spot") {
+    return {
+      ...base,
+      type: "crypto_spot",
+      base_asset: row.base_asset,
+      quote_asset: row.quote_asset,
+      market: {
+        last_price: row.price,
+        price_change_24h_pct: row.change_percent_24h,
+        quote_volume_24h: row.volume_24h_quote,
+        base_volume_24h: row.volume_24h_base,
+        bid_price: row.bid_price,
+        ask_price: row.ask_price,
+        spread: row.spread,
+      },
+      trading_rules: {
+        ...(row.trading_rules || {}),
+        price_precision: row.price_precision,
+        quantity_precision: row.quantity_precision,
+        base_asset_precision: row.base_asset_precision,
+        quote_asset_precision: row.quote_asset_precision,
+        margin_enabled: row.is_margin_trading_allowed,
+      },
+      capabilities: row.capabilities,
+    };
+  }
+
+  if (category === "crypto_derivatives") {
+    return {
+      ...base,
+      type: row.asset_class === "crypto_option" ? "crypto_option" : "crypto_derivatives",
+      contract_type: row.contract_type,
+      subtype: row.subtype,
+      subtype_label: row.subtype_label,
+      base_asset: row.base_asset,
+      quote_asset: row.quote_asset,
+      settlement_asset: row.settlement_asset,
+      market: {
+        last_price: row.price,
+        mark_price: row.mark_price,
+        index_price: row.index_price,
+        price_change_24h_pct: row.change_percent_24h,
+        quote_volume_24h: row.volume_24h_quote,
+        open_interest: row.open_interest,
+        funding_rate: row.funding_rate,
+        next_funding_time: row.next_funding_time,
+        spread: row.spread,
+      },
+      trading_rules: {
+        ...(row.trading_rules || {}),
+        price_precision: row.price_precision,
+        quantity_precision: row.quantity_precision,
+        max_leverage: row.max_leverage,
+      },
+      lifecycle: {
+        onboard_date: row.onboard_date,
+        delivery_date: row.delivery_date,
+      },
+      capabilities: row.capabilities,
+    };
+  }
+
+  if (category === "rwa_stock_token") {
+    return {
+      ...base,
+      type: "stock_token",
+      ticker: row.ticker || row.underlying_symbol,
+      token_symbol: row.symbol,
+      chain_id: row.chain_id,
+      chain_label: row.chain_label,
+      asset_info: {
+        underlying: row.underlying_symbol || row.ticker,
+        is_tokenized: true,
+        multiplier: row.multiplier,
+        contract_address: row.contract_address,
+        tradability: row.tradability || "query_only",
+      },
+      capabilities: row.capabilities,
+    };
+  }
+
+  return {
+    ...base,
+    type: "stock_equity",
+    ticker: row.symbol,
+    quote_asset: row.currency,
+    exchange: row.exchange,
+    market: {
+      last_price: row.price,
+      change: row.change,
+      change_percent: row.change_percent,
+      market_cap_usd: row.market_cap_usd,
+    },
+    asset_info: {
+      underlying: row.symbol,
+      is_tokenized: false,
+      tradability: row.status === "QUOTE_READY" ? "quote_ready" : "lookup_only",
+    },
+    capabilities: row.capabilities,
+  };
+}
+
+function renderBinanceSpotTable(rows) {
+  renderTable(
+    binanceView("crypto_spot").table,
+    [
+      { key: "symbol", label: "Symbol", render: (row) => `<strong>${escapeHtml(row.display_symbol || row.symbol || "-")}</strong>` },
+      { key: "base_asset", label: "Base", render: (row) => escapeHtml(row.base_asset || "-") },
+      { key: "quote_asset", label: "Quote", render: (row) => escapeHtml(row.quote_asset || "-") },
+      { key: "price", label: "Price", render: (row) => formatNumber(row.price, 8) },
+      { key: "change_percent_24h", label: "24h", render: (row) => formatPercent(row.change_percent_24h) },
+      { key: "volume_24h_quote", label: "Quote Vol", render: (row) => formatNumber(row.volume_24h_quote, 0) },
+      { key: "status", label: "Status", render: (row) => statusChip(row.status) },
+      { key: "capabilities", label: "Caps", render: (row) => capabilityTags(row) },
+      { key: "instrument_id", label: "Instrument", render: (row) => instrumentCode(row) },
+      { key: "actions", label: "操作", render: (row) => binanceCopyAction("crypto_spot", row) },
+    ],
+    rows
+  );
+}
+
+function renderBinanceDerivativesTable(rows) {
+  renderTable(
+    binanceView("crypto_derivatives").table,
+    [
+      { key: "symbol", label: "Symbol", render: (row) => `<strong>${escapeHtml(row.symbol || "-")}</strong>` },
+      { key: "subtype_label", label: "Type", render: (row) => escapeHtml(row.subtype_label || row.subtype || "-") },
+      { key: "base_asset", label: "Base", render: (row) => escapeHtml(row.base_asset || "-") },
+      { key: "settlement_asset", label: "Settle", render: (row) => escapeHtml(row.settlement_asset || "-") },
+      { key: "contract_type", label: "Contract", render: (row) => escapeHtml(row.contract_type || "-") },
+      { key: "status", label: "Status", render: (row) => statusChip(row.status) },
+      { key: "instrument_id", label: "Instrument", render: (row) => instrumentCode(row) },
+      { key: "actions", label: "操作", render: (row) => binanceCopyAction("crypto_derivatives", row) },
+    ],
+    rows
+  );
+}
+
+function renderBinanceStockTokensTable(rows) {
+  renderTable(
+    binanceView("rwa_stock_token").table,
+    [
+      { key: "ticker", label: "Ticker", render: (row) => `<strong>${escapeHtml(row.ticker || row.underlying_symbol || "-")}</strong>` },
+      { key: "symbol", label: "Token", render: (row) => escapeHtml(row.symbol || "-") },
+      { key: "chain_label", label: "Chain", render: (row) => escapeHtml(row.chain_label || row.chain_id || "-") },
+      { key: "multiplier", label: "Multiplier", render: (row) => formatNumber(row.multiplier, 8) },
+      { key: "status", label: "Status", render: (row) => statusChip(row.status) },
+      { key: "contract_address", label: "Contract", render: (row) => shortContract(row.contract_address) },
+      { key: "instrument_id", label: "Instrument", render: (row) => instrumentCode(row) },
+      { key: "actions", label: "操作", render: (row) => binanceCopyAction("rwa_stock_token", row) },
+    ],
+    rows
+  );
+}
+
+function renderBinanceEquityTable(rows) {
+  renderTable(
+    binanceView("equity").table,
+    [
+      { key: "symbol", label: "Symbol", render: (row) => `<strong>${escapeHtml(row.symbol || "-")}</strong>` },
+      { key: "display_name", label: "Name", render: (row) => escapeHtml(row.display_name || "-") },
+      { key: "venue", label: "Venue", render: (row) => escapeHtml(row.venue || "-") },
+      { key: "price", label: "Price", render: (row) => formatNumber(row.price, 4) },
+      { key: "change_percent", label: "Change", render: (row) => formatPercent(row.change_percent) },
+      { key: "exchange", label: "Exchange", render: (row) => escapeHtml(row.exchange || "-") },
+      { key: "status", label: "Status", render: (row) => statusChip(row.status) },
+      { key: "instrument_id", label: "Instrument", render: (row) => instrumentCode(row) },
+      { key: "actions", label: "操作", render: (row) => binanceCopyAction("equity", row) },
+    ],
+    rows
+  );
+}
+
+function renderBinanceMarkets(category, payload) {
+  const rows = payload.data || [];
+  currentBinanceRows[category] = rows;
+  binanceView(category).meta.innerHTML = sourceMetaLine(payload);
+  if (category === "crypto_spot") {
+    renderBinanceSpotTable(rows);
+  } else if (category === "crypto_derivatives") {
+    renderBinanceDerivativesTable(rows);
+  } else if (category === "rwa_stock_token") {
+    renderBinanceStockTokensTable(rows);
+  } else {
+    renderBinanceEquityTable(rows);
+  }
+}
+
+async function loadBinanceMarkets(category, formData, options = {}) {
+  const { silent = false } = options;
+  const view = binanceView(category);
+  if (!silent && view.table) {
+    setStatus(view.table, "加载中...");
+  }
+  const qs = new URLSearchParams(formData);
+  qs.set("category", category);
+  if (!qs.get("refresh")) {
+    qs.delete("refresh");
+  } else {
+    qs.set("refresh", "1");
+  }
+  const payload = await fetchJson(`/api/binance/markets/search?${qs.toString()}`);
+  renderBinanceMarkets(category, payload);
+  hasLoadedBinanceMarkets = true;
+}
+
+function switchBinanceTab(category) {
+  activeBinanceCategory = category;
+  binanceMarketTabs.forEach((tab) => {
+    tab.classList.toggle("active", tab.dataset.binanceTab === category);
+  });
+  binanceMarketPanes.forEach((pane) => {
+    pane.classList.toggle("active", pane.dataset.binancePane === category);
+  });
+  if (!currentBinanceRows[category]?.length) {
+    const form = binanceForm(category);
+    if (form) {
+      loadBinanceMarkets(category, new FormData(form)).catch((error) => {
+        setStatus(binanceView(category).table, error.message);
+        binanceView(category).meta.innerHTML = `状态: ${statusChip("ERROR")} | 诊断: ${escapeHtml(error.message)}`;
+      });
+    }
+  }
 }
 
 async function loadStrategies(options = {}) {
@@ -740,12 +1839,16 @@ async function loadStrategies(options = {}) {
 }
 
 function summarizeStrategyRows(rows) {
+  const totalStrategyProfit = rows.reduce((sum, row) => sum + Number(resolveStrategyProfit(row) || 0), 0);
+  const totalStrategyBankroll = rows.reduce((sum, row) => sum + Number(row.strategy_bankroll || 0), 0);
   return {
     ok: true,
     status: rows.length ? "good" : "pending",
     count: rows.length,
     running_strategy_count: rows.filter((row) => Number(row.yes_qty || 0) > 0 || Number(row.no_qty || 0) > 0).length,
-    total_strategy_profit: rows.reduce((sum, row) => sum + Number(resolveStrategyProfit(row) || 0), 0),
+    total_strategy_profit: totalStrategyProfit,
+    total_strategy_bankroll: totalStrategyBankroll,
+    total_strategy_return_pct: totalStrategyBankroll > 0 ? totalStrategyProfit / totalStrategyBankroll : null,
   };
 }
 
@@ -821,16 +1924,16 @@ function renderStrategyRowsLegacy(rows) {
       { key: "strategy_bankroll", label: "Strategy_Bankroll", render: (row) => formatNumber(row.strategy_bankroll, 2) },
       { key: "yes_position", label: "Yes_CurrentPct", render: (row) => formatRatioPercent(row.yes_position) },
       { key: "no_position", label: "No_CurrentPct", render: (row) => formatRatioPercent(row.no_position) },
-      { key: "state", label: "State", render: (row) => {
+      { key: "mode", label: "Mode", render: (row) => {
         const sid = row.strategy_id ?? row.row_id;
-        const _isVirtual = String(row.is_virtual ?? row.editable?.IsVirtual ?? "").trim().toLowerCase() === "true";
-        const cur = row.state || (_isVirtual ? "Virtual" : "Stop");
-        return `<select class="state-select state-${cur}" data-sid="${sid}" data-prev="${escapeHtml(cur)}">${
+        const cur = strategyMode(row);
+        return `<select class="state-select mode-select state-${cur}" data-mode-sid="${sid}" data-sid="${sid}" data-prev="${escapeHtml(cur)}">${
           ["Stop", "Virtual", "Real"].map(s =>
             `<option value="${s}"${s === cur ? " selected" : ""}>${s}</option>`
           ).join("")
         }</select>`;
       }},
+      { key: "machine_state", label: "State", render: (row) => renderMachineStateSelect(row, row.strategy_id ?? row.row_id) },
       {
         key: "profit",
         label: "profit",
@@ -859,8 +1962,44 @@ function renderStrategyRowsLegacy(rows) {
 }
 
 function strategyMode(row) {
+  const validModes = ["Stop", "Virtual", "Real"];
   const isVirtual = String(row.is_virtual ?? row.editable?.IsVirtual ?? "").trim().toLowerCase() === "true";
-  return row.state || (isVirtual ? "Virtual" : "Stop");
+  const legacyState = validModes.includes(row.state) ? row.state : "";
+  const mode = row.mode || legacyState || (isVirtual ? "Virtual" : "Stop");
+  return validModes.includes(mode) ? mode : "Stop";
+}
+
+function defaultStrategyStateOptions() {
+  return [
+    { value: "auto", label: "Auto" },
+    { value: "idle", label: "Idle" },
+    { value: "holding", label: "Holding" },
+    { value: "cooldown", label: "Cooldown" },
+    { value: "manual_review", label: "Manual Review" },
+    { value: "stop_loss_locked", label: "Stop Loss Locked" },
+  ];
+}
+
+function strategyMachineState(row) {
+  const validModes = ["Stop", "Virtual", "Real"];
+  const value = row.machine_state || (!validModes.includes(row.state) ? row.state : "") || "auto";
+  return String(value || "auto");
+}
+
+function renderMachineStateSelect(row, sid) {
+  const current = strategyMachineState(row);
+  const options = Array.isArray(row.state_options) && row.state_options.length
+    ? row.state_options
+    : defaultStrategyStateOptions();
+  const hasCurrent = options.some((item) => String(item.value ?? item) === current);
+  const normalized = hasCurrent ? options : [{ value: current, label: current }, ...options];
+  return `<select class="state-select strategy-machine-state-select" data-machine-state-sid="${escapeHtml(sid)}" data-prev="${escapeHtml(current)}">${
+    normalized.map((item) => {
+      const value = String(item.value ?? item);
+      const label = String(item.label ?? value);
+      return `<option value="${escapeHtml(value)}"${value === current ? " selected" : ""}>${escapeHtml(label)}</option>`;
+    }).join("")
+  }</select>`;
 }
 
 function strategyName(row) {
@@ -964,13 +2103,13 @@ function renderStrategyExpanded(row) {
     : `<tr><td colspan="3" class="empty-cell">No recent action / print</td></tr>`;
   return `
     <tr class="strategy-detail-row">
-      <td colspan="11">
+      <td colspan="12">
         <div class="strategy-detail-card">
           <div class="strategy-detail-section">
             <h3>Legs Snapshot</h3>
             <div class="strategy-subtable-wrap">
               <table class="strategy-subtable">
-                <thead><tr><th>Leg</th><th>Question</th><th>Params</th><th>Side</th><th>YES Qty</th><th>YES Avg</th><th>YES Mark</th><th>NO Qty</th><th>NO Avg</th><th>NO Mark</th><th>Exposure</th><th>PnL</th><th>Updated</th></tr></thead>
+                <thead><tr><th>Leg</th><th>Question</th><th>Params</th><th>Side</th><th>YES Qty</th><th>YES Avg</th><th>YES Mark</th><th>NO Qty</th><th>NO Avg</th><th>NO Mark</th><th>Exposure</th><th>Net PnL</th><th>Updated</th></tr></thead>
                 <tbody>${legRows}</tbody>
               </table>
             </div>
@@ -1011,10 +2150,11 @@ function renderStrategyRows(rows) {
         </td>
         <td><span class="strategy-code-chip" title="${escapeHtml(strategyCode(row))}">${escapeHtml(strategyCode(row))}</span></td>
         <td>
-          <select class="state-select state-${escapeHtml(mode)}" data-sid="${escapeHtml(rid)}" data-prev="${escapeHtml(mode)}">
+          <select class="state-select mode-select state-${escapeHtml(mode)}" data-mode-sid="${escapeHtml(rid)}" data-sid="${escapeHtml(rid)}" data-prev="${escapeHtml(mode)}">
             ${["Stop", "Virtual", "Real"].map(s => `<option value="${s}"${s === mode ? " selected" : ""}>${s}</option>`).join("")}
           </select>
         </td>
+        <td>${renderMachineStateSelect(row, rid)}</td>
         <td>${escapeHtml(strategyLegsLabel(row))}</td>
         <td class="num">${formatFixed(row.strategy_bankroll, 2)}</td>
         <td class="num">${formatFixed(exposure, 2)}</td>
@@ -1040,7 +2180,7 @@ function renderStrategyRows(rows) {
       <table class="strategy-monitor-table">
         <thead>
           <tr>
-            <th>Name</th><th>Strategy_Code</th><th>Mode</th><th>Legs</th><th>Bankroll</th><th>Exposure</th><th>PnL</th><th>ROI</th><th>Last Action</th><th>Updated</th><th>Action</th>
+            <th>Name</th><th>Strategy_Code</th><th>Mode</th><th>State</th><th>Legs</th><th>Bankroll</th><th>Exposure</th><th>PnL</th><th>ROI</th><th>Last Action</th><th>Updated</th><th>Action</th>
           </tr>
         </thead>
         <tbody>${body}</tbody>
@@ -1102,6 +2242,9 @@ function startUiPolling(seconds) {
     clearInterval(uiRefreshTimer);
   }
   uiRefreshTimer = setInterval(() => {
+    loadAgentDashboard({ silent: true }).catch((error) => {
+      if (agentMeta) agentMeta.textContent = error.message;
+    });
     loadOverview({ silent: true }).catch((error) => setStatus(systemStatus, error.message));
     loadRealtimeCrypto({ silent: true }).catch((error) => setStatus(cryptoTable, error.message));
     loadRealtimeFinance({ silent: true }).catch((error) => setStatus(financeTable, error.message));
@@ -1109,9 +2252,18 @@ function startUiPolling(seconds) {
 }
 
 document.getElementById("refreshOverviewBtn").addEventListener("click", () => {
+  loadAgentDashboard().catch((error) => {
+    if (agentMeta) agentMeta.textContent = error.message;
+  });
   loadOverview().catch((error) => setStatus(overviewCards, error.message));
   loadRealtimeCrypto().catch((error) => setStatus(cryptoTable, error.message));
   loadRealtimeFinance().catch((error) => setStatus(financeTable, error.message));
+});
+
+refreshAgentBtn?.addEventListener("click", () => {
+  loadAgentDashboard().catch((error) => {
+    if (agentMeta) agentMeta.textContent = error.message;
+  });
 });
 
 document.getElementById("refreshCryptoBtn").addEventListener("click", () => {
@@ -1150,6 +2302,249 @@ document.getElementById("holdingsForm").addEventListener("submit", (event) => {
 document.getElementById("marketForm").addEventListener("submit", (event) => {
   event.preventDefault();
   loadMarkets(new FormData(event.currentTarget)).catch((error) => setStatus(marketTable, error.message));
+});
+
+marketCategoryInput?.addEventListener("input", () => {
+  syncMarketCategoryChips();
+});
+
+marketCategoryChips?.addEventListener("click", (event) => {
+  const chip = event.target.closest("[data-market-category-chip]");
+  if (!chip) {
+    return;
+  }
+  const category = chip.dataset.marketCategoryChip || "";
+  const current = parseMarketCategories(marketCategoryInput?.value || "");
+  const exists = current.some((item) => item.toLowerCase() === category.toLowerCase());
+  setMarketCategories(exists
+    ? current.filter((item) => item.toLowerCase() !== category.toLowerCase())
+    : [...current, category]);
+});
+
+marketSortSelect?.addEventListener("change", () => {
+  if (!marketSortDirSelect) {
+    return;
+  }
+  marketSortDirSelect.value = MARKET_SORT_ASC_DEFAULTS.has(marketSortSelect.value) ? "asc" : "desc";
+});
+
+binanceMarketTabs.forEach((tab) => {
+  tab.addEventListener("click", () => switchBinanceTab(tab.dataset.binanceTab));
+});
+
+binanceMarketForms.forEach((form) => {
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const category = event.currentTarget.dataset.binanceForm;
+    loadBinanceMarkets(category, new FormData(event.currentTarget)).catch((error) => {
+      setStatus(binanceView(category).table, error.message);
+      binanceView(category).meta.innerHTML = `状态: ${statusChip("ERROR")} | 诊断: ${escapeHtml(error.message)}`;
+    });
+  });
+});
+
+document.addEventListener("click", (event) => {
+  const marketButton = event.target.closest("[data-copy-market]");
+  if (marketButton) {
+    const row = currentMarketRows.find((item) => marketUi.marketIdentityKey(item) === marketButton.dataset.copyMarket);
+    if (!row) {
+      return;
+    }
+    copyJsonParams(buildPolymarketStrategyParams(row), marketButton).catch((error) => {
+      console.error("[copy params] polymarket failed", error);
+      marketButton.textContent = "复制失败";
+    });
+    return;
+  }
+
+  const binanceButton = event.target.closest("[data-copy-binance-row]");
+  if (binanceButton) {
+    const category = binanceButton.dataset.copyBinanceCategory || activeBinanceCategory;
+    const rowKey = binanceButton.dataset.copyBinanceRow || "";
+    const row = (currentBinanceRows[category] || []).find((item) => {
+      return [item.instrument_id, item.symbol, item.ticker, item.contract_address].some((value) => String(value || "") === rowKey);
+    });
+    if (!row) {
+      return;
+    }
+    copyJsonParams(buildBinanceStrategyParams(row, category), binanceButton).catch((error) => {
+      console.error("[copy params] binance failed", error);
+      binanceButton.textContent = "复制失败";
+    });
+  }
+});
+
+document.querySelector(".agent-workbench")?.addEventListener("click", async (event) => {
+  const button = event.target.closest("button");
+  if (!button) return;
+  const approvalToApprove = button.dataset.agentApprove;
+  const approvalToReject = button.dataset.agentReject;
+  const approvalToChange = button.dataset.agentChange;
+  const approvalToView = button.dataset.agentViewApproval;
+  const draftToRisk = button.dataset.agentRisk;
+  const draftToSimulate = button.dataset.agentSimulate;
+  const draftToSubmit = button.dataset.agentSubmit;
+  const draftToDelete = button.dataset.agentDeleteDraft;
+  const draftToView = button.dataset.agentViewDraft;
+  try {
+    if (approvalToView) {
+      button.disabled = true;
+      const payload = await fetchJson(`/api/agent/approvals/${encodeURIComponent(approvalToView)}`);
+      await openAgentApprovalStrategyModal(payload.data || {});
+      return;
+    }
+    if (approvalToApprove) {
+      if (!confirm("确认批准这个 Agent 策略？批准后会创建正式策略，默认 Stop 模式。")) return;
+      button.disabled = true;
+      await postAgentAction(`/api/approvals/${encodeURIComponent(approvalToApprove)}/approve`, {
+        actor_type: "human",
+        actor_id: "local_user",
+      });
+      await Promise.allSettled([loadAgentDashboard({ silent: true }), loadStrategies({ silent: true })]);
+      return;
+    }
+    if (approvalToReject) {
+      const reason = prompt("拒绝原因", "风险或参数不合适");
+      if (reason === null) return;
+      button.disabled = true;
+      await postAgentAction(`/api/approvals/${encodeURIComponent(approvalToReject)}/reject`, {
+        actor_type: "human",
+        actor_id: "local_user",
+        reason,
+      });
+      await loadAgentDashboard({ silent: true });
+      return;
+    }
+    if (approvalToChange) {
+      const reason = prompt("希望 Agent 如何修改？", "请降低预算或收紧入场价格");
+      if (reason === null) return;
+      button.disabled = true;
+      await postAgentAction(`/api/approvals/${encodeURIComponent(approvalToChange)}/request-changes`, {
+        actor_type: "human",
+        actor_id: "local_user",
+        reason,
+      });
+      await loadAgentDashboard({ silent: true });
+      return;
+    }
+    if (draftToRisk) {
+      button.disabled = true;
+      await postAgentAction(`/api/agent/strategy-drafts/${encodeURIComponent(draftToRisk)}/risk-check`, {
+        actor_type: "agent",
+        actor_id: "agent_strategy_assistant",
+      });
+      await loadAgentDashboard({ silent: true });
+      return;
+    }
+    if (draftToSimulate) {
+      button.disabled = true;
+      const payload = await postAgentAction(`/api/agent/strategy-drafts/${encodeURIComponent(draftToSimulate)}/simulate`, {
+        actor_type: "agent",
+        actor_id: "agent_strategy_assistant",
+      });
+      const sim = payload.data || {};
+      alert(`模拟完成\n最大亏损: ${formatFixed(sim.max_loss_usdc, 2)} USDC\n最大敞口: ${formatFixed(sim.max_exposure_usdc, 2)} USDC`);
+      await loadAgentDashboard({ silent: true });
+      return;
+    }
+    if (draftToSubmit) {
+      if (!confirm("提交后会进入 WAITING_HUMAN_CONFIRM，等待人工确认。继续？")) return;
+      button.disabled = true;
+      await postAgentAction(`/api/agent/strategy-drafts/${encodeURIComponent(draftToSubmit)}/submit`, {
+        actor_type: "agent",
+        actor_id: "agent_strategy_assistant",
+      });
+      await loadAgentDashboard({ silent: true });
+      return;
+    }
+    if (draftToDelete) {
+      if (!confirm("删除这个未提交草案？")) return;
+      button.disabled = true;
+      await fetchJson(`/api/agent/strategy-drafts/${encodeURIComponent(draftToDelete)}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          actor_type: "agent",
+          actor_id: "agent_strategy_assistant",
+        }),
+      });
+      await loadAgentDashboard({ silent: true });
+      return;
+    }
+    if (draftToView) {
+      const payload = await fetchJson(`/api/agent/strategy-drafts/${encodeURIComponent(draftToView)}`);
+      alert(JSON.stringify(payload.data?.draft || payload.data || {}, null, 2));
+    }
+  } catch (error) {
+    alert(error.message || String(error));
+    await loadAgentDashboard({ silent: true }).catch(() => {});
+  } finally {
+    button.disabled = false;
+  }
+});
+
+agentApprovalModalClose?.addEventListener("click", closeAgentApprovalModal);
+agentApprovalCloseBtn?.addEventListener("click", closeAgentApprovalModal);
+agentApprovalModal?.addEventListener("click", (event) => {
+  if (event.target === agentApprovalModal) closeAgentApprovalModal();
+});
+
+agentApprovalApproveBtn?.addEventListener("click", async () => {
+  if (!activeAgentApproval?.approval_id) return;
+  if (!confirm("确认批准这个 Agent 策略？批准后会创建正式策略，默认 Stop 模式。")) return;
+  agentApprovalApproveBtn.disabled = true;
+  try {
+    await postAgentAction(`/api/approvals/${encodeURIComponent(activeAgentApproval.approval_id)}/approve`, {
+      actor_type: "human",
+      actor_id: "local_user",
+    });
+    closeAgentApprovalModal();
+    await Promise.allSettled([loadAgentDashboard({ silent: true }), loadStrategies({ silent: true })]);
+  } catch (error) {
+    alert(error.message || String(error));
+  } finally {
+    agentApprovalApproveBtn.disabled = false;
+  }
+});
+
+agentApprovalRejectBtn?.addEventListener("click", async () => {
+  if (!activeAgentApproval?.approval_id) return;
+  const reason = prompt("拒绝原因", "风险或参数不合适");
+  if (reason === null) return;
+  agentApprovalRejectBtn.disabled = true;
+  try {
+    await postAgentAction(`/api/approvals/${encodeURIComponent(activeAgentApproval.approval_id)}/reject`, {
+      actor_type: "human",
+      actor_id: "local_user",
+      reason,
+    });
+    closeAgentApprovalModal();
+    await loadAgentDashboard({ silent: true });
+  } catch (error) {
+    alert(error.message || String(error));
+  } finally {
+    agentApprovalRejectBtn.disabled = false;
+  }
+});
+
+agentApprovalChangeBtn?.addEventListener("click", async () => {
+  if (!activeAgentApproval?.approval_id) return;
+  const reason = prompt("希望 Agent 如何修改？", "请调整参数后重新提交");
+  if (reason === null) return;
+  agentApprovalChangeBtn.disabled = true;
+  try {
+    await postAgentAction(`/api/approvals/${encodeURIComponent(activeAgentApproval.approval_id)}/request-changes`, {
+      actor_type: "human",
+      actor_id: "local_user",
+      reason,
+    });
+    closeAgentApprovalModal();
+    await loadAgentDashboard({ silent: true });
+  } catch (error) {
+    alert(error.message || String(error));
+  } finally {
+    agentApprovalChangeBtn.disabled = false;
+  }
 });
 
 marketTable.addEventListener("click", (event) => {
@@ -1211,6 +2606,7 @@ let strategyLegDraft = [];
 let activeConditionLegIndex = 0;
 let strategyLegSchemas = [];
 let strategyModalDirty = false;
+let activeAgentStrategyEditContext = null;
 
 function stateEditorJson(value) {
   const obj = value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -1311,6 +2707,42 @@ function buildInlineStateField(key, meta, values, namespace, options = {}) {
   `;
 }
 
+function inlineMachineState(stateStore) {
+  return String(stateStore?.machine_state || stateStore?.state || stateStore?.machine?.state || "auto");
+}
+
+function inlineStateOptions(stateStore) {
+  const raw = stateStore?.state_options || stateStore?.state_machine_schema?.states || [];
+  const options = Array.isArray(raw) && raw.length ? raw : defaultStrategyStateOptions();
+  const current = inlineMachineState(stateStore);
+  const hasCurrent = options.some((item) => String(item.value ?? item) === current);
+  return hasCurrent ? options : [{ value: current, label: current }, ...options];
+}
+
+function buildInlineMachineStateSection(stateStore) {
+  const schema = stateStore?.state_machine_schema || {};
+  const current = inlineMachineState(stateStore);
+  const options = inlineStateOptions(stateStore);
+  return `
+    <div class="workspace-settings-group">
+      <h3>Strategy State</h3>
+      <div class="grid two">
+        <label class="strategy-param-field">
+          <span class="strategy-param-label">${escapeHtml(schema.label || "State")}</span>
+          <select data-inline-machine-state-key="state">
+            ${options.map((item) => {
+              const value = String(item.value ?? item);
+              const label = String(item.label ?? value);
+              return `<option value="${escapeHtml(value)}"${value === current ? " selected" : ""}>${escapeHtml(label)}</option>`;
+            }).join("")}
+          </select>
+          <span class="state-field-comment">${escapeHtml(schema.description || "Independent from Stop / Virtual / Real mode.")}</span>
+        </label>
+      </div>
+    </div>
+  `;
+}
+
 function renderInlineStrategyStateStore(stateStore) {
   if (!strategyModalStateSections) return;
   activeModalStateStore = stateStore || null;
@@ -1338,6 +2770,7 @@ function renderInlineStrategyStateStore(stateStore) {
     }))
     .join("");
   strategyModalStateSections.innerHTML = `
+    ${buildInlineMachineStateSection(stateStore)}
     <div class="workspace-settings-group">
       <h3>Controls / UserState</h3>
       ${controlFields ? `<div class="grid two">${controlFields}</div>` : '<div class="muted">当前策略没有声明 ControlsSchema。</div>'}
@@ -1377,6 +2810,11 @@ function collectInlineUserState() {
   return values;
 }
 
+function collectInlineMachineState() {
+  const value = strategyModalStateSections?.querySelector("[data-inline-machine-state-key='state']")?.value || "auto";
+  return { state: value };
+}
+
 function parseInlineRuntimeState() {
   const values = {};
   strategyModalStateSections?.querySelectorAll("[data-inline-runtime-state-key]").forEach((field) => {
@@ -1397,6 +2835,15 @@ async function loadInlineStrategyStateStore(sid) {
 
 async function saveInlineStrategyStateStore(sid) {
   if (!sid || !activeModalStateStore) return;
+  await fetchJson(`/api/registry/strategies/${encodeURIComponent(sid)}/state-store/machine`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      values: collectInlineMachineState(),
+      replace: false,
+      reason: "strategy settings edit",
+    }),
+  });
   await fetchJson(`/api/registry/strategies/${encodeURIComponent(sid)}/state-store/user`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
@@ -1501,6 +2948,7 @@ function normalizeStrategyLegs(legs) {
     condition_id: String(leg?.condition_id || "").trim(),
     yes_token: leg?.yes_token || "",
     no_token: leg?.no_token || "",
+    leg_kind: leg?.leg_kind || leg?.kind || "",
     asset_class: leg?.asset_class || "polymarket_binary",
     venue: leg?.venue || "polymarket",
     symbol: leg?.symbol || "",
@@ -1523,6 +2971,7 @@ function defaultStrategyLegSchemas() {
     name: "Primary Polymarket",
     label: "Leg 1",
     purpose: "Primary trading market",
+    leg_kind: "binary_market",
     asset_class: "polymarket_binary",
     venue: "polymarket",
     required: true,
@@ -1537,6 +2986,7 @@ function normalizeStrategyLegSchemas(raw) {
     name: String(schema?.name || schema?.label || `Leg ${index + 1}`),
     label: String(schema?.label || schema?.name || `Leg ${index + 1}`),
     purpose: String(schema?.purpose || schema?.description || ""),
+    leg_kind: String(schema?.leg_kind || schema?.kind || ""),
     asset_class: String(schema?.asset_class || "polymarket_binary"),
     venue: String(schema?.venue || (schema?.asset_class === "polymarket_binary" ? "polymarket" : "")),
     symbol: String(schema?.symbol || "").toUpperCase(),
@@ -1554,10 +3004,12 @@ function legSchemaForIndex(index) {
 function mergeLegWithSchema(leg, schema, index) {
   const defaults = schema?.default || {};
   const assetClass = leg?.asset_class || defaults.asset_class || schema?.asset_class || "polymarket_binary";
+  const legKind = leg?.leg_kind || leg?.kind || defaults.leg_kind || schema?.leg_kind || "";
   return {
     ...defaults,
     ...(leg || {}),
     leg_index: index,
+    leg_kind: legKind,
     asset_class: assetClass,
     venue: leg?.venue || defaults.venue || schema?.venue || (assetClass === "polymarket_binary" ? "polymarket" : ""),
     symbol: String(leg?.symbol || defaults.symbol || schema?.symbol || "").trim().toUpperCase(),
@@ -1594,7 +3046,7 @@ function renderStrategyLegRows(legs = strategyLegDraft) {
   strategyLegRows.innerHTML = strategyLegDraft.map((leg, index) => {
     const schema = legSchemaForIndex(index);
     const isPoly = leg.asset_class === "polymarket_binary";
-    const title = `${schema.label || `Leg ${index + 1}`} · ${leg.asset_class}`;
+    const title = `${schema.label || `Leg ${index + 1}`} · ${leg.leg_kind || leg.asset_class}`;
     const purpose = schema.purpose ? `<div class="strategy-leg-purpose">${escapeHtml(schema.purpose)}</div>` : "";
     const budget = `<input data-leg-budget-cap data-leg-index="${index}" type="number" step="any" placeholder="Budget cap" value="${escapeHtml(leg.budget_cap ?? "")}">`;
     const body = isPoly
@@ -1629,9 +3081,13 @@ function primaryStrategyConditionId() {
 }
 
 function openStrategyModal() {
+  activeAgentStrategyEditContext = null;
   strategyModalTitle.textContent = "\u65b0\u589e\u7b56\u7565";
+  setStrategyModalSubmitText("保存");
   strategyModalForm.reset();
   strategyModalForm.querySelector('[name="strategy_id"]').value = "";
+  _setField("mode", "Stop");
+  activeStateMode = "Stop";
   strategyModalDirty = false;
   activeConditionLegIndex = 0;
   strategyLegSchemas = defaultStrategyLegSchemas();
@@ -1675,7 +3131,9 @@ function applyDashboardParamPaste() {
 
 // 编辑已有策略：预填所有字段（含动态 input_json）
 async function openEditModal(monitorRow) {
+  activeAgentStrategyEditContext = null;
   strategyModalTitle.textContent = "\u8bbe\u7f6e\u53c2\u6570";
+  setStrategyModalSubmitText("保存");
   strategyModalForm.reset();
   const pasteText = document.getElementById("strategyParamPasteText");
   if (pasteText) pasteText.value = "";
@@ -1712,8 +3170,8 @@ async function openEditModal(monitorRow) {
   }]);
   _setField("condition_id", legCid || r.condition_id || monitorRow.condition_id || "");
   _setField("strategy_bankroll", r.strategy_bankroll ?? monitorRow.strategy_bankroll ?? "");
-  _setField("state", r.state || monitorRow.state || "Stop");
-  activeStateMode = r.state || monitorRow.state || "Stop";
+  _setField("mode", strategyMode(r || monitorRow || {}));
+  activeStateMode = strategyMode(r || monitorRow || {});
   renderInlineStrategyStateStore(stateStore);
 
   const codeVal = r.strategy_code || "";
@@ -1728,9 +3186,150 @@ async function openEditModal(monitorRow) {
   strategyModal.hidden = false;
 }
 
+function setStrategyModalSubmitText(text) {
+  const submit = strategyModalForm?.querySelector('[type="submit"]');
+  if (submit) submit.textContent = text || "保存";
+}
+
+function agentSnapshotToStrategyLegs(snapshot = {}) {
+  const markets = Array.isArray(snapshot.markets) ? snapshot.markets : [];
+  return markets.length ? markets.map((market, index) => ({
+    leg_index: index,
+    condition_id: market.condition_id || "",
+    yes_token: market.yes_token || "",
+    no_token: market.no_token || "",
+    leg_kind: "binary_market",
+    asset_class: "polymarket_binary",
+    venue: market.venue || "polymarket",
+    symbol: market.symbol || "",
+    instrument_id: market.instrument_id || market.condition_id || "",
+    instrument_json: {
+      question: market.question || market.title || "",
+      outcome: market.outcome || "YES",
+      url: market.url || "",
+    },
+    budget_cap: market.max_exposure_usdc ?? "",
+    params_json: {
+      outcome: market.outcome || "YES",
+      action: market.action || "buy",
+      max_entry_price: market.max_entry_price ?? market.best_ask ?? "",
+      max_exposure_usdc: market.max_exposure_usdc ?? "",
+    },
+  })) : [{
+    leg_index: 0,
+    condition_id: "",
+    asset_class: "polymarket_binary",
+    venue: "polymarket",
+  }];
+}
+
+async function openAgentApprovalStrategyModal(approval) {
+  const snapshot = approval?.snapshot?.snapshot || approval?.draft?.draft || {};
+  activeAgentStrategyEditContext = {
+    type: "approval",
+    approvalId: approval?.approval_id || "",
+    approval,
+    snapshot,
+  };
+  strategyModalTitle.textContent = "设置参数";
+  setStrategyModalSubmitText("保存草案");
+  strategyModalForm.reset();
+  const pasteText = document.getElementById("strategyParamPasteText");
+  if (pasteText) pasteText.value = "";
+  strategyModalDirty = false;
+  activeConditionLegIndex = 0;
+
+  const codesResp = await fetchJson("/api/strategy-codes");
+  const codes = codesResp.data || [];
+  strategyCodeSelect.innerHTML = '<option value="">-- 选择 --</option>' +
+    codes.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("");
+
+  strategyModalForm.querySelector('[name="strategy_id"]').value = "";
+  _setField("strategy_name", snapshot.name || agentApprovalTitle(approval));
+  _setField("strategy_code", snapshot.strategy_code || "");
+  _setField("mode", "Stop");
+  _setField("strategy_bankroll", snapshot.budget?.max_total_usdc ?? "");
+  const legs = agentSnapshotToStrategyLegs(snapshot);
+  renderStrategyLegRows(legs);
+  _setField("condition_id", legs[0]?.condition_id || "");
+  renderInlineStrategyStateStore(null);
+  if (snapshot.strategy_code) {
+    strategyCodeSelect.value = snapshot.strategy_code;
+    await _loadDynamicInputs(snapshot.strategy_code, snapshot.params || {}, legs);
+  } else {
+    const dyn = document.getElementById("strategyDynamicInputs");
+    if (dyn) dyn.innerHTML = "";
+  }
+  if (strategyDynamicMessage) {
+    strategyDynamicMessage.textContent = "正在编辑 Agent 待确认草案；保存后会重新风控和模拟，仍需人工批准。";
+  }
+  strategyModal.hidden = false;
+}
+
+function buildAgentApprovalDraftPayloadFromStrategyModal() {
+  const body = buildStrategyDraftPayload();
+  return {
+    actor_type: "human",
+    actor_id: "local_user",
+    reason: "human edited pending approval parameters",
+    strategy_name: body.strategy_name,
+    strategy_code: body.strategy_code,
+    mode: body.mode,
+    strategy_bankroll: body.strategy_bankroll,
+    input_json: body.input_json,
+    legs: body.legs,
+    condition_id: body.condition_id,
+  };
+}
+
 function _setField(name, value) {
   const el = strategyModalForm.querySelector(`[name="${name}"]`);
   if (el) el.value = value ?? "";
+}
+
+const STRATEGY_DEADLINE_PARAM = {
+  name: "Enddate",
+  kind: "String",
+  required: false,
+  default: "",
+  description: "Strategy deadline. Auto-filled from the selected market end date; edit it if the market date is wrong.",
+};
+const STRATEGY_DEADLINE_ALIASES = new Set(["enddate", "endtime", "l0endtime"]);
+
+function ensureStrategyDeadlineInput(inputs) {
+  const list = Array.isArray(inputs) ? inputs : [];
+  const hasDeadline = list.some((inp) => STRATEGY_DEADLINE_ALIASES.has(normalizeStrategyParamKey(inp?.name)));
+  return hasDeadline ? list : [...list, STRATEGY_DEADLINE_PARAM];
+}
+
+function findStrategyDeadlineField() {
+  const fields = Array.from(strategyModalForm?.querySelectorAll("[data-strategy-param]") || []);
+  return fields.find((field) => STRATEGY_DEADLINE_ALIASES.has(normalizeStrategyParamKey(field.dataset.strategyParam)));
+}
+
+function readMarketEndDate(market) {
+  return String(
+    market?.end_date
+    || market?.endDate
+    || market?.raw?.endDate
+    || market?.raw?.umaEndDate
+    || ""
+  ).trim();
+}
+
+function fillStrategyDeadlineFromMarket(market, { force = false } = {}) {
+  const field = findStrategyDeadlineField();
+  const endDate = readMarketEndDate(market);
+  if (!field || !endDate) return false;
+  if (!force && String(field.value ?? "").trim()) return false;
+  field.value = endDate;
+  return true;
+}
+
+function selectedMarketFromResolveResponse(resp) {
+  const data = resp?.data;
+  if (Array.isArray(data)) return data[0] || null;
+  return data?.selected || data?.results?.[0] || null;
 }
 
 async function _loadDynamicInputs(code, prefill = {}, legsPrefill = null) {
@@ -1741,15 +3340,12 @@ async function _loadDynamicInputs(code, prefill = {}, legsPrefill = null) {
       fetchJson(`/api/strategy-codes/${encodeURIComponent(code)}/inputs`),
       fetchJson(`/api/strategy-codes/${encodeURIComponent(code)}/schemas`),
     ]);
-    const inputs = inputsResp.data || [];
+    const inputs = ensureStrategyDeadlineInput(inputsResp.data || []);
     strategyLegSchemas = normalizeStrategyLegSchemas(schemasResp.data?.legs || []);
     renderStrategyLegRows(legsPrefill || strategyLegDraft);
     dyn.innerHTML = inputs.map((inp) => {
-      const type = strategyInputType(inp);
       const req = inp.required ? " required" : "";
-      const step = type === "number" ? ' step="any"' : "";
       const rawValue = prefill[inp.name] !== undefined ? prefill[inp.name] : (inp.default ?? "");
-      const val = rawValue !== undefined && rawValue !== null ? ` value="${escapeHtml(String(rawValue))}"` : "";
       const description = buildStrategyParamDescription(inp);
       const help = description
         ? `<span class="strategy-param-help" tabindex="0" title="${escapeHtml(description)}" aria-label="${escapeHtml(description)}">?</span>`
@@ -1758,7 +3354,7 @@ async function _loadDynamicInputs(code, prefill = {}, legsPrefill = null) {
         <label class="strategy-param-field" title="${escapeHtml(description)}">
           <span class="strategy-param-label">${escapeHtml(inp.name)}${inp.required ? '<span class="strategy-param-required">*</span>' : ""}${help}</span>
           <span class="strategy-param-input-row">
-            <input name="_inp_${escapeHtml(inp.name)}" data-strategy-param="${escapeHtml(inp.name)}" type="${type}"${step}${req}${val}>
+            ${renderStrategyParamControl(inp, rawValue, req)}
             <button type="button" class="strategy-param-autofill" data-strategy-param-autofill="${escapeHtml(inp.name)}" title="UseData" aria-label="UseData" hidden>↻</button>
           </span>
         </label>
@@ -1769,7 +3365,9 @@ async function _loadDynamicInputs(code, prefill = {}, legsPrefill = null) {
         ? "默认参数已从策略代码同步；悬停 ? 查看含义，↻ 可从 UseData 填入当前值。"
         : "该策略代码未声明可编辑参数。";
     }
-    await refreshStrategyParamUseData({ fillEmpty: true });
+    refreshStrategyParamUseData({ fillEmpty: true }).catch((error) => {
+      console.log("[strategy-autofill] background refresh failed", { error });
+    });
   } catch {
     dyn.innerHTML = "";
     if (strategyDynamicMessage) strategyDynamicMessage.textContent = "无法读取策略参数。";
@@ -1778,7 +3376,35 @@ async function _loadDynamicInputs(code, prefill = {}, legsPrefill = null) {
 
 function strategyInputType(inp) {
   const kind = String(inp?.kind || "").trim().toLowerCase();
-  return ["num", "number", "float", "int", "integer"].includes(kind) ? "number" : "text";
+  if (["num", "number", "float", "int", "integer"].includes(kind)) return "number";
+  if (["bool", "boolean"].includes(kind)) return "checkbox";
+  if (["select", "enum"].includes(kind)) return "select";
+  return "text";
+}
+
+function strategyBoolValue(value) {
+  return ["1", "true", "yes", "y", "on"].includes(String(value ?? "").trim().toLowerCase());
+}
+
+function renderStrategyParamControl(inp, rawValue, req) {
+  const name = escapeHtml(inp.name);
+  const type = strategyInputType(inp);
+  if (type === "select" && Array.isArray(inp.values) && inp.values.length) {
+    const current = rawValue !== undefined && rawValue !== null ? String(rawValue) : "";
+    return `<select name="_inp_${name}" data-strategy-param="${name}"${req}>
+      ${inp.values.map((value) => {
+        const text = String(value);
+        const selected = text === current ? " selected" : "";
+        return `<option value="${escapeHtml(text)}"${selected}>${escapeHtml(text)}</option>`;
+      }).join("")}
+    </select>`;
+  }
+  if (type === "checkbox") {
+    return `<input name="_inp_${name}" data-strategy-param="${name}" type="checkbox" value="true"${strategyBoolValue(rawValue) ? " checked" : ""}>`;
+  }
+  const step = type === "number" ? ' step="any"' : "";
+  const value = rawValue !== undefined && rawValue !== null ? ` value="${escapeHtml(String(rawValue))}"` : "";
+  return `<input name="_inp_${name}" data-strategy-param="${name}" type="${type}"${step}${req}${value}>`;
 }
 
 function buildStrategyParamDescription(inp) {
@@ -1839,11 +3465,21 @@ function buildStrategyDraftPayload() {
   const inputJson = {};
   for (const [k, v] of fd.entries()) {
     if (k.startsWith("_inp_")) {
-      if (String(v ?? "").trim() !== "") inputJson[k.slice(5)] = v;
+      continue;
     } else if (k !== "strategy_id") {
       body[k] = v;
     }
   }
+  strategyModalForm.querySelectorAll("[data-strategy-param]").forEach((field) => {
+    const key = field.dataset.strategyParam;
+    if (!key) return;
+    if (field.type === "checkbox") {
+      inputJson[key] = field.checked ? "true" : "false";
+      return;
+    }
+    const value = String(field.value ?? "").trim();
+    if (value !== "") inputJson[key] = value;
+  });
   body.input_json = inputJson;
   body.legs = collectStrategyLegsForSave();
   body.condition_id = primaryStrategyConditionId();
@@ -1875,8 +3511,8 @@ async function loadStrategyModalUseData() {
     return null;
   }
   const url = sid
-    ? `/api/polymarket/strategies/${encodeURIComponent(sid)}/usedata`
-    : "/api/polymarket/strategies/usedata/draft";
+    ? `/api/polymarket/strategies/${encodeURIComponent(sid)}/usedata?live_orderbook=0`
+    : "/api/polymarket/strategies/usedata/draft?live_orderbook=0";
   const options = sid
     ? undefined
     : {
@@ -1918,7 +3554,7 @@ async function refreshStrategyParamUseData({ fillEmpty = false } = {}) {
         button.disabled = false;
         button.dataset.strategyUseDataKey = match.key;
       }
-      if (fillEmpty && String(field.value ?? "").trim() === "") {
+      if (fillEmpty && field.type !== "checkbox" && String(field.value ?? "").trim() === "") {
         field.value = String(match.value);
         filledCount += 1;
       }
@@ -1959,7 +3595,11 @@ async function autofillDashboardParam(button) {
       if (strategyDynamicMessage) strategyDynamicMessage.textContent = `UseData 中没有找到 ${paramName} 的可用字段。`;
       return;
     }
-    input.value = match.value == null ? "" : String(match.value);
+    if (input.type === "checkbox") {
+      input.checked = strategyBoolValue(match.value);
+    } else {
+      input.value = match.value == null ? "" : String(match.value);
+    }
     console.log("[strategy-autofill] filled", { paramName, key: match.key, value: match.value, inputValue: input.value });
     if (strategyDynamicMessage) strategyDynamicMessage.textContent = `已从 UseData.${match.key} 填入 ${paramName}，保存后生效。`;
   } catch (error) {
@@ -1977,12 +3617,16 @@ function closeStrategyModal() {
   }
   strategyModal.hidden = true;
   strategyModalDirty = false;
+  activeAgentStrategyEditContext = null;
+  setStrategyModalSubmitText("保存");
   if (conditionPicker) conditionPicker.hidden = true;
 }
 
 function closeStrategyModalAfterSave() {
   strategyModalDirty = false;
   strategyModal.hidden = true;
+  activeAgentStrategyEditContext = null;
+  setStrategyModalSubmitText("保存");
   if (conditionPicker) conditionPicker.hidden = true;
 }
 
@@ -2002,7 +3646,8 @@ conditionPickBtn?.addEventListener("click", () => {
   conditionPicker.innerHTML = watchlist.map(m => {
     const cid = m.condition_id || "";
     const q = m.question || m.label || "";
-    return `<div class="condition-picker-item" data-cid="${escapeHtml(cid)}" data-question="${escapeHtml(q)}">`
+    const endDate = readMarketEndDate(m);
+    return `<div class="condition-picker-item" data-cid="${escapeHtml(cid)}" data-question="${escapeHtml(q)}" data-end-date="${escapeHtml(endDate)}">`
       + `<div>${escapeHtml(q.slice(0, 60) || cid.slice(0, 24) + "...")}</div>`
       + (cid ? `<div class="picker-question">${escapeHtml(cid.slice(0, 30))}...</div>` : "")
       + `</div>`;
@@ -2014,6 +3659,7 @@ conditionPicker?.addEventListener("click", (e) => {
   if (!item) return;
   conditionIdInput.value = item.dataset.cid;
   _fillStrategyNameFromQuestion(item.dataset.question);
+  fillStrategyDeadlineFromMarket({ end_date: item.dataset.endDate });
   conditionPicker.hidden = true;
   refreshStrategyParamUseData({ fillEmpty: true });
 });
@@ -2031,8 +3677,9 @@ conditionIdInput?.addEventListener("blur", async () => {
   if (nameInput?.value.trim()) return; // 已有名称不覆盖
   try {
     const resp = await fetchJson(`/api/polymarket/markets/resolve?condition_id=${encodeURIComponent(cid)}&limit=1`);
-    const item = (resp.data || [])[0];
+    const item = selectedMarketFromResolveResponse(resp);
     if (item?.question) _fillStrategyNameFromQuestion(item.question);
+    fillStrategyDeadlineFromMarket(item);
   } catch {}
   refreshStrategyParamUseData({ fillEmpty: true });
 });
@@ -2070,7 +3717,8 @@ function openLegConditionPicker(index) {
   conditionPicker.innerHTML = watchlist.map((m) => {
     const cid = m.condition_id || "";
     const q = m.question || m.label || "";
-    return `<div class="condition-picker-item" data-cid="${escapeHtml(cid)}" data-question="${escapeHtml(q)}">`
+    const endDate = readMarketEndDate(m);
+    return `<div class="condition-picker-item" data-cid="${escapeHtml(cid)}" data-question="${escapeHtml(q)}" data-end-date="${escapeHtml(endDate)}">`
       + `<div>${escapeHtml(q.slice(0, 60) || cid.slice(0, 24) + "...")}</div>`
       + (cid ? `<div class="picker-question">Leg ${activeConditionLegIndex + 1} · ${escapeHtml(cid.slice(0, 30))}...</div>` : "")
       + `</div>`;
@@ -2112,8 +3760,9 @@ strategyLegRows?.addEventListener("blur", async (e) => {
   }
   try {
     const resp = await fetchJson(`/api/polymarket/markets/resolve?condition_id=${encodeURIComponent(cid)}&limit=1`);
-    const item = (resp.data || [])[0];
+    const item = selectedMarketFromResolveResponse(resp);
     if (item?.question) _fillStrategyNameFromQuestion(item.question);
+    fillStrategyDeadlineFromMarket(item);
   } catch {}
   refreshStrategyParamUseData({ fillEmpty: true });
 }, true);
@@ -2125,6 +3774,7 @@ conditionPicker?.addEventListener("click", (e) => {
   if (input) input.value = item.dataset.cid || "";
   syncStrategyLegDraftFromDom();
   _fillStrategyNameFromQuestion(item.dataset.question);
+  fillStrategyDeadlineFromMarket({ end_date: item.dataset.endDate });
   conditionPicker.hidden = true;
   refreshStrategyParamUseData({ fillEmpty: true });
 });
@@ -2213,25 +3863,21 @@ strategyModalForm?.addEventListener("change", () => {
 
 strategyModalForm?.addEventListener("submit", async (e) => {
   e.preventDefault();
-  const fd = new FormData(strategyModalForm);
-  const body = {};
-  const inputJson = {};
-  for (const [k, v] of fd.entries()) {
-    if (k.startsWith("_inp_")) {
-      inputJson[k.slice(5)] = v;
-    } else {
-      body[k] = v;
-    }
-  }
-  body.input_json = inputJson;
-  body.legs = collectStrategyLegsForSave();
-  body.condition_id = primaryStrategyConditionId();
-  const sid = body.strategy_id;
-  delete body.strategy_id;
+  const sid = strategyModalForm?.querySelector('[name="strategy_id"]')?.value;
+  const body = buildStrategyDraftPayload();
   const submitBtn = strategyModalForm.querySelector('[type="submit"]');
   if (submitBtn) submitBtn.disabled = true;
   try {
-    if (sid) {
+    if (activeAgentStrategyEditContext?.type === "approval") {
+      const approvalId = activeAgentStrategyEditContext.approvalId;
+      await fetchJson(`/api/agent/approvals/${encodeURIComponent(approvalId)}/draft`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildAgentApprovalDraftPayloadFromStrategyModal()),
+      });
+      closeStrategyModalAfterSave();
+      await loadAgentDashboard({ silent: true });
+    } else if (sid) {
       await fetchJson(`/api/registry/strategies/${sid}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -2298,13 +3944,16 @@ strategyTable.addEventListener("click", async (e) => {
       return;
     }
     try {
-      await fetchJson(`/api/registry/strategies/${sid}/state`, {
+      await fetchJson(`/api/registry/strategies/${sid}/mode`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ state: next }),
+        body: JSON.stringify({ mode: next }),
       });
       const row = strategyRowCache.get(sid);
-      if (row) row.state = next;
+      if (row) {
+        row.mode = next;
+        if (["Stop", "Virtual", "Real"].includes(row.state)) row.state = next;
+      }
       loadStrategies();
     } catch (err) {
       alert("状态切换失败: " + err.message);
@@ -2365,9 +4014,41 @@ strategyTable.addEventListener("click", async (e) => {
 });
 
 strategyTable.addEventListener("change", async (e) => {
-  const sel = e.target.closest(".state-select");
+  const machineSel = e.target.closest(".strategy-machine-state-select[data-machine-state-sid]");
+  if (machineSel) {
+    const sid = machineSel.dataset.machineStateSid;
+    const prev = machineSel.dataset.prev || "auto";
+    const next = machineSel.value || "auto";
+    if (!sid || next === prev) return;
+    try {
+      machineSel.disabled = true;
+      await fetchJson(`/api/registry/strategies/${encodeURIComponent(sid)}/state-store/machine`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          values: { state: next },
+          replace: false,
+          reason: "dashboard state switch",
+        }),
+      });
+      machineSel.dataset.prev = next;
+      const row = strategyRowCache.get(String(sid));
+      if (row) {
+        row.state = next;
+        row.machine_state = next;
+      }
+    } catch (err) {
+      machineSel.value = prev;
+      alert("State switch failed: " + err.message);
+    } finally {
+      machineSel.disabled = false;
+    }
+    return;
+  }
+
+  const sel = e.target.closest(".mode-select[data-mode-sid]");
   if (!sel) return;
-  const sid = sel.dataset.sid;
+  const sid = sel.dataset.modeSid || sel.dataset.sid;
   const prev = sel.dataset.prev;
   const next = sel.value;
   if (next === prev) return;
@@ -2386,13 +4067,18 @@ strategyTable.addEventListener("change", async (e) => {
   }
 
   try {
-    await fetchJson(`/api/registry/strategies/${sid}/state`, {
+    await fetchJson(`/api/registry/strategies/${sid}/mode`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ state: next }),
+      body: JSON.stringify({ mode: next }),
     });
     sel.dataset.prev = next;
-    sel.className = `state-select state-${next}`;
+    sel.className = `state-select mode-select state-${next}`;
+    const row = strategyRowCache.get(String(sid));
+    if (row) {
+      row.mode = next;
+      if (["Stop", "Virtual", "Real"].includes(row.state)) row.state = next;
+    }
   } catch (err) {
     sel.value = prev;
     alert("状态切换失败: " + err.message);
@@ -2401,6 +4087,7 @@ strategyTable.addEventListener("change", async (e) => {
 
 Promise.allSettled([
   fetchJson("/api/settings"),
+  loadMarketCategories(),
   loadDictionaryStatus(),
   loadOverview(),
   loadRealtimeCrypto(),
@@ -2408,6 +4095,7 @@ Promise.allSettled([
   loadHoldings(),
   loadStrategies(),
   loadMarkets(new FormData(document.getElementById("marketForm"))),
+  loadAgentDashboard(),
 ]).then((results) => {
   const settingsResp = results[0];
   const settings = settingsResp.status === "fulfilled" ? (settingsResp.value.data || {}) : {};
@@ -2415,27 +4103,40 @@ Promise.allSettled([
   startUiPolling(settings.ui_refresh_sec || 5);
   connectDictionaryLive();
   connectStrategiesLive();
+  const initialBinanceForm = binanceForm(activeBinanceCategory);
+  if (initialBinanceForm) {
+    loadBinanceMarkets(activeBinanceCategory, new FormData(initialBinanceForm)).catch((error) => {
+      setStatus(binanceView(activeBinanceCategory).table, error.message);
+      binanceView(activeBinanceCategory).meta.innerHTML = `状态: ${statusChip("ERROR")} | 诊断: ${escapeHtml(error.message)}`;
+    });
+  }
 
-  if (results[1].status === "rejected" && !hasLoadedDictionary) {
-    setStatus(dictionarySummary, results[1].reason.message);
-    dictionaryProgress.textContent = results[1].reason.message;
+  if (results[1].status === "rejected" && marketCategoryChips) {
+    marketCategoryChips.innerHTML = `<span class="category-chip-empty">${escapeHtml(results[1].reason.message)}</span>`;
   }
-  if (results[2].status === "rejected" && !hasLoadedOverview) {
-    setStatus(systemStatus, results[2].reason.message);
+  if (results[2].status === "rejected" && !hasLoadedDictionary) {
+    setStatus(dictionarySummary, results[2].reason.message);
+    dictionaryProgress.textContent = results[2].reason.message;
   }
-  if (results[3].status === "rejected" && !hasLoadedCrypto) {
-    setStatus(cryptoTable, results[3].reason.message);
+  if (results[3].status === "rejected" && !hasLoadedOverview) {
+    setStatus(systemStatus, results[3].reason.message);
   }
-  if (results[4].status === "rejected" && !hasLoadedFinance) {
-    setStatus(financeTable, results[4].reason.message);
+  if (results[4].status === "rejected" && !hasLoadedCrypto) {
+    setStatus(cryptoTable, results[4].reason.message);
   }
-  if (results[5].status === "rejected" && !hasLoadedHoldings) {
-    setStatus(holdingsTable, results[5].reason.message);
+  if (results[5].status === "rejected" && !hasLoadedFinance) {
+    setStatus(financeTable, results[5].reason.message);
   }
-  if (results[6].status === "rejected" && !hasLoadedStrategies) {
-    setStatus(strategyTable, results[6].reason.message);
+  if (results[6].status === "rejected" && !hasLoadedHoldings) {
+    setStatus(holdingsTable, results[6].reason.message);
   }
-  if (results[7].status === "rejected" && !hasLoadedMarkets) {
-    setStatus(marketTable, results[7].reason.message);
+  if (results[7].status === "rejected" && !hasLoadedStrategies) {
+    setStatus(strategyTable, results[7].reason.message);
+  }
+  if (results[8].status === "rejected" && !hasLoadedMarkets) {
+    setStatus(marketTable, results[8].reason.message);
+  }
+  if (results[9].status === "rejected" && !hasLoadedAgentDashboard && agentMeta) {
+    agentMeta.textContent = results[9].reason.message;
   }
 });

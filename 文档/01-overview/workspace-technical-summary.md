@@ -96,7 +96,7 @@ app.py __main__
 
 `ws_market_sync` 内部调用 `main.py`，拉取全量活跃市场后按概率过滤、持仓过滤、策略监控过滤，建立 WebSocket 订阅，将行情写入 `polymarket_realtime.db`。
 
-`virtual_runner` 每轮读取 `strategy_registry.state = 'Virtual'` 的策略，组装 `UseData`，调用 `参考/SandboxRun.py` 执行策略代码，并将 FunctionJson 动作落到虚拟盘表与审计表。
+`virtual_runner` 每轮读取 `strategy_registry.mode = 'Virtual'` 的策略，组装 `UseData`，调用 `参考/SandboxRun.py` 执行策略代码，并将 FunctionJson 动作落到虚拟盘表与审计表。
 
 ---
 
@@ -129,7 +129,7 @@ app.py __main__
 | POST | `/api/registry/strategies` | 创建策略 |
 | GET | `/api/registry/strategies/<id>` | 获取单个策略 |
 | PUT | `/api/registry/strategies/<id>` | 更新策略基础信息与 input_json |
-| PATCH | `/api/registry/strategies/<id>/state` | 切换 Stop / Virtual / Real |
+| PATCH | `/api/registry/strategies/<id>/mode` | 切换 Stop / Virtual / Real |
 | PUT | `/api/registry/strategies/<id>/legs` | 替换策略腿 |
 | DELETE | `/api/registry/strategies/<id>` | 删除策略，级联删除 legs |
 
@@ -142,7 +142,8 @@ app.py __main__
 | `GET /api/polymarket/strategies/<row_id>/chart-delta` | 增量图表数据（运行态轮询） |
 | `GET /api/polymarket/strategies/<row_id>/events` | 策略事件列表 |
 | `POST /api/polymarket/strategies/<row_id>` | 更新策略参数 |
-| `PATCH /api/registry/strategies/<row_id>/state` | 更新策略三态：`Stop` / `Virtual` / `Real` |
+| `PATCH /api/registry/strategies/<row_id>/mode` | 更新策略运行模式：`Stop` / `Virtual` / `Real` |
+| `PATCH /api/registry/strategies/<row_id>/state-store/machine` | 更新策略状态机 state |
 
 ### 工作台预设
 
@@ -157,7 +158,8 @@ app.py __main__
 
 | 路径 | 说明 |
 |------|------|
-| `GET /api/polymarket/markets` | 搜索市场 |
+| `GET /api/polymarket/market-categories` | 返回 active 市场类别计数，供首页类别多选条使用 |
+| `GET /api/polymarket/markets` | 搜索市场；支持 `category` 多选、`sort/order` 后端全量排序 |
 | `GET /api/polymarket/dictionary` | 字典状态 |
 | `POST /api/polymarket/dictionary/update` | 触发字典刷新 |
 | `GET /api/live/polymarket/dictionary` | SSE：字典刷新进度 |
@@ -255,10 +257,12 @@ app.py __main__
 
 返回：策略详情、settings_schema、chart_defaults、chart_capabilities、market_context、workspace_presets、source_statuses、recent_events（最近 20 条）
 
-状态字段：
+模式与状态字段：
 
-- `strategy.state` 是工作台 header 状态 select 的唯一来源。
-- 工作台切换状态后走 `PATCH /api/registry/strategies/<row_id>/state`，再重新拉取 `/workspace` 同步 summary、source 与事件状态。
+- `strategy.mode` 是工作台 header mode select 的唯一来源。
+- `strategy.machine_state` / `strategy.state` 表示策略状态机当前 state，选项来自 `StateMachineSchema`。
+- 工作台切换 mode 后走 `PATCH /api/registry/strategies/<row_id>/mode`，再重新拉取 `/workspace` 同步 summary、source 与事件状态。
+- 工作台切换 state 后走 `PATCH /api/registry/strategies/<row_id>/state-store/machine`，写入 `strategy_state.namespace = machine`。
 
 事件来源：
 
@@ -273,7 +277,9 @@ app.py __main__
 
 ### polymarket_service.py — 市场与策略数据
 
-主要函数：`fetch_strategy_detail` / `search_markets` / `fetch_wallet_positions` / `get_overview` / `resolve_market_selection`
+主要函数：`fetch_strategy_detail` / `list_market_categories` / `search_markets` / `fetch_wallet_positions` / `get_overview` / `resolve_market_selection`
+
+市场查询：`search_markets()` 先做关键词和类别过滤，再按 `volume24h`、`volume`、`liquidity`、`spread`、`end_date`、`updated_at` 等字段对完整候选集合排序，最后按 `limit` 截断，避免前端只对当前页做局部排序。
 
 缓存：市场列表 60s，CLOB `/book` 盘口 2s，WebSocket 快照 2s（新鲜度阈值 `_WS_FRESHNESS_SECONDS=180`），主动市场快照文件 300s，字典索引 60s，Gamma API 300s，实时仓位 5s（过期后允许使用 60s 内旧值）
 

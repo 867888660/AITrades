@@ -106,6 +106,7 @@ def get_strategy_workspace(row_id: int, include_events: bool = False) -> Dict[st
                 "condition_id": leg.get("condition_id") or "",
                 "yes_token": leg.get("yes_token") or "",
                 "no_token": leg.get("no_token") or "",
+                "leg_kind": leg.get("leg_kind") or "",
                 "asset_class": leg.get("asset_class") or "polymarket_binary",
                 "venue": leg.get("venue") or "",
                 "symbol": leg.get("symbol") or "",
@@ -122,6 +123,7 @@ def get_strategy_workspace(row_id: int, include_events: bool = False) -> Dict[st
             {
                 "leg_index": leg_index,
                 "direction": leg.get("direction") or "Observe",
+                "leg_kind": leg.get("leg_kind") or "",
                 "asset_class": leg.get("asset_class") or "polymarket_binary",
                 "venue": leg.get("venue") or "",
                 "symbol": leg.get("symbol") or "",
@@ -182,13 +184,18 @@ def get_strategy_workspace(row_id: int, include_events: bool = False) -> Dict[st
     }
 
 
-def get_strategy_usedata_snapshot(row_id: int) -> Dict[str, Any]:
+def get_strategy_usedata_snapshot(row_id: int, *, include_live_orderbook: bool = True) -> Dict[str, Any]:
     strategy = strategy_data_source.get_strategy(row_id)
     if not strategy:
         raise ValueError(f"strategy {row_id} not found")
     settings = load_web_settings()
     realtime_db_path = get_market_realtime_db_path(settings)
-    use_data = build_use_data(strategy, realtime_db_path, collector.get_state())
+    use_data = build_use_data(
+        strategy,
+        realtime_db_path,
+        collector.get_state(),
+        include_live_orderbook=include_live_orderbook,
+    )
     return {
         "strategy_id": row_id,
         "generated_at_utc": use_data.get("NowTime"),
@@ -196,7 +203,11 @@ def get_strategy_usedata_snapshot(row_id: int) -> Dict[str, Any]:
     }
 
 
-def get_strategy_usedata_draft(payload: Dict[str, Any]) -> Dict[str, Any]:
+def get_strategy_usedata_draft(
+    payload: Dict[str, Any],
+    *,
+    include_live_orderbook: bool = True,
+) -> Dict[str, Any]:
     input_raw = payload.get("input_json")
     if isinstance(input_raw, str):
         try:
@@ -209,44 +220,86 @@ def get_strategy_usedata_draft(payload: Dict[str, Any]) -> Dict[str, Any]:
         input_params = {}
 
     condition_id = str(payload.get("condition_id") or "").strip()
-    market = {}
-    if condition_id:
-        try:
-            resolved = resolve_market_selection(condition_id=condition_id, limit=1)
-            market = resolved.get("selected") or {}
-        except Exception:
-            market = {}
-    yes_token = payload.get("yes_token") or market.get("yes_token") or ""
-    no_token = payload.get("no_token") or market.get("no_token") or ""
-    end_date = market.get("end_date") or (market.get("raw") or {}).get("endDate") or ""
-    strategy = {
-        "strategy_id": 0,
-        "strategy_name": str(payload.get("strategy_name") or "Draft Strategy").strip(),
-        "strategy_code": str(payload.get("strategy_code") or "").strip(),
-        "state": str(payload.get("state") or "Virtual").strip(),
-        "strategy_bankroll": payload.get("strategy_bankroll") or payload.get("budget_cap") or 0,
-        "input_json": json.dumps(input_params or {}, ensure_ascii=False),
-        "end_date": end_date,
-        "legs": [
+    raw_legs = payload.get("legs") if isinstance(payload.get("legs"), list) else []
+    if not raw_legs:
+        raw_legs = [
             {
                 "leg_index": 0,
                 "condition_id": condition_id,
-                "yes_token": yes_token,
-                "no_token": no_token,
+                "yes_token": payload.get("yes_token") or "",
+                "no_token": payload.get("no_token") or "",
+                "leg_kind": payload.get("leg_kind") or payload.get("kind") or "",
                 "asset_class": payload.get("asset_class") or "polymarket_binary",
                 "venue": payload.get("venue") or "polymarket",
                 "symbol": payload.get("symbol") or "",
                 "instrument_id": payload.get("instrument_id") or "",
                 "instrument_json": payload.get("instrument_json") or {},
-                "end_date": end_date,
                 "budget_cap": payload.get("budget_cap") or payload.get("strategy_bankroll") or 0,
                 "params_json": "{}",
             }
-        ],
+        ]
+
+    draft_legs = []
+    primary_end_date = ""
+    for index, raw_leg in enumerate(raw_legs):
+        if not isinstance(raw_leg, dict):
+            continue
+        leg_condition_id = str(raw_leg.get("condition_id") or (condition_id if index == 0 else "")).strip()
+        market = {}
+        if leg_condition_id:
+            try:
+                resolved = resolve_market_selection(condition_id=leg_condition_id, limit=1)
+                market = resolved.get("selected") or {}
+            except Exception:
+                market = {}
+        end_date = market.get("end_date") or (market.get("raw") or {}).get("endDate") or ""
+        if not primary_end_date and end_date:
+            primary_end_date = end_date
+        asset_class = raw_leg.get("asset_class") or ("polymarket_binary" if leg_condition_id else payload.get("asset_class") or "polymarket_binary")
+        leg_budget = raw_leg.get("budget_cap")
+        if leg_budget in (None, ""):
+            leg_budget = (payload.get("budget_cap") or payload.get("strategy_bankroll") or 0) if index == 0 else 0
+        leg = {
+            "leg_index": index,
+            "condition_id": leg_condition_id,
+            "yes_token": raw_leg.get("yes_token") or market.get("yes_token") or "",
+            "no_token": raw_leg.get("no_token") or market.get("no_token") or "",
+            "leg_kind": raw_leg.get("leg_kind") or raw_leg.get("kind") or payload.get("leg_kind") or "",
+            "asset_class": asset_class,
+            "venue": raw_leg.get("venue") or ("polymarket" if asset_class == "polymarket_binary" else payload.get("venue") or ""),
+            "symbol": raw_leg.get("symbol") or payload.get("symbol") or "",
+            "instrument_id": raw_leg.get("instrument_id") or "",
+            "instrument_json": raw_leg.get("instrument_json") or {},
+            "end_date": end_date,
+            "budget_cap": leg_budget,
+            "params_json": raw_leg.get("params_json") or "{}",
+        }
+        normalized = strategy_data_source.normalize_leg_instrument(leg)
+        leg["leg_kind"] = normalized.get("leg_kind") or leg["leg_kind"]
+        leg["instrument_id"] = normalized.get("instrument_id") or leg["instrument_id"]
+        draft_legs.append(leg)
+
+    mode = str(payload.get("mode") or payload.get("state") or "Virtual").strip()
+    strategy = {
+        "strategy_id": 0,
+        "strategy_name": str(payload.get("strategy_name") or "Draft Strategy").strip(),
+        "strategy_code": str(payload.get("strategy_code") or "").strip(),
+        "mode": mode,
+        "state": "auto",
+        "machine_state": "auto",
+        "strategy_bankroll": payload.get("strategy_bankroll") or payload.get("budget_cap") or 0,
+        "input_json": json.dumps(input_params or {}, ensure_ascii=False),
+        "end_date": primary_end_date,
+        "legs": draft_legs,
     }
     settings = load_web_settings()
     realtime_db_path = get_market_realtime_db_path(settings)
-    use_data = build_use_data(strategy, realtime_db_path, collector.get_state())
+    use_data = build_use_data(
+        strategy,
+        realtime_db_path,
+        collector.get_state(),
+        include_live_orderbook=include_live_orderbook,
+    )
     return {
         "strategy_id": None,
         "generated_at_utc": use_data.get("NowTime"),

@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>DataTube Dashboard</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260623_human_override1">
   </head>
   <body>
     <div class="app-shell">
@@ -18,7 +18,10 @@
         </div>
         <nav class="nav">
           <a class="nav-link active" href="/" target="_blank" rel="noopener noreferrer">Dashboard</a>
+          <a class="nav-link" href="/event-graph" target="_blank" rel="noopener noreferrer">EventGraph</a>
           <a class="nav-link" href="/ledger" target="_blank" rel="noopener noreferrer">Ledger</a>
+          <a class="nav-link" href="/history" target="_blank" rel="noopener noreferrer">History</a>
+          <a class="nav-link" href="/agent-monitor" target="_blank" rel="noopener noreferrer">AgentMonitor</a>
           <a class="nav-link" href="/watchlist" target="_blank" rel="noopener noreferrer">Watchlist</a>
           <a class="nav-link" href="/settings" target="_blank" rel="noopener noreferrer">Settings</a>
         </nav>
@@ -141,10 +144,11 @@
                   <option value="">-- 选择 --</option>
                 </select>
               </label>
-              <label>状态
-                <select name="state">
-                  <option value="Stop" selected>Real</option>
+              <label>Mode
+                <select name="mode">
+                  <option value="Stop" selected>Stop</option>
                   <option value="Virtual">Virtual</option>
+                  <option value="Real">Real</option>
                 </select>
               </label>
               <div class="strategy-legs-editor">
@@ -231,36 +235,282 @@
         <section class="panel">
           <div class="panel-header">
             <div>
+              <h2>Binance市场查询</h2>
+              <p class="muted">按市场类型拆分查询，结果统一生成 instrument，可用于后续绑定策略 leg、图表 overlay 或自选扩展。</p>
+            </div>
+          </div>
+          <div class="market-tabs binance-tabs" role="tablist" aria-label="Binance market categories">
+            <button class="tab-btn active" type="button" data-binance-tab="crypto_spot">Spot</button>
+            <button class="tab-btn" type="button" data-binance-tab="crypto_derivatives">Derivatives</button>
+            <button class="tab-btn" type="button" data-binance-tab="rwa_stock_token">Stock Tokens</button>
+            <button class="tab-btn" type="button" data-binance-tab="equity">Stocks / Equity</button>
+          </div>
+
+          <div class="binance-pane active" data-binance-pane="crypto_spot">
+            <form class="form binance-search-form" data-binance-form="crypto_spot">
+              <label>
+                关键词
+                <input name="q" placeholder="BTC / ETHUSDT / SOL">
+              </label>
+              <label>
+                Quote
+                <select name="quote">
+                  <option value="">全部 Quote</option>
+                  <option value="USDT">USDT</option>
+                  <option value="USDC">USDC</option>
+                  <option value="FDUSD">FDUSD</option>
+                  <option value="BTC">BTC</option>
+                  <option value="ETH">ETH</option>
+                  <option value="BNB">BNB</option>
+                  <option value="EUR">EUR</option>
+                  <option value="TRY">TRY</option>
+                  <option value="JPY">JPY</option>
+                </select>
+              </label>
+              <label>
+                状态
+                <select name="status">
+                  <option value="">全部状态</option>
+                  <option value="TRADING" selected>TRADING</option>
+                  <option value="BREAK">BREAK</option>
+                </select>
+              </label>
+              <label>
+                条数
+                <input name="limit" type="number" min="1" max="200" value="30">
+              </label>
+              <label class="checkbox">
+                <input name="margin" type="checkbox" value="1">
+                Margin
+              </label>
+              <label class="checkbox">
+                <input name="refresh" type="checkbox">
+                强刷
+              </label>
+              <button type="submit">查询 Spot</button>
+            </form>
+            <div id="binanceSpotMeta" class="muted table-meta"></div>
+            <div id="binanceSpotTable"></div>
+          </div>
+
+          <div class="binance-pane" data-binance-pane="crypto_derivatives">
+            <form class="form binance-search-form" data-binance-form="crypto_derivatives">
+              <label>
+                关键词
+                <input name="q" placeholder="BTCUSDT / BTC-... / ETH">
+              </label>
+              <label>
+                类型
+                <select name="subtype">
+                  <option value="all">全部</option>
+                  <option value="usdm_futures">USD-M</option>
+                  <option value="coinm_futures">COIN-M</option>
+                  <option value="options">Options</option>
+                </select>
+              </label>
+              <label>
+                结算资产
+                <select name="settlement">
+                  <option value="">全部结算</option>
+                  <option value="USDT">USDT</option>
+                  <option value="USDC">USDC</option>
+                  <option value="BTC">BTC</option>
+                  <option value="ETH">ETH</option>
+                  <option value="BNB">BNB</option>
+                </select>
+              </label>
+              <label>
+                状态
+                <select name="status">
+                  <option value="">全部状态</option>
+                  <option value="TRADING" selected>TRADING</option>
+                  <option value="PENDING_TRADING">PENDING</option>
+                </select>
+              </label>
+              <label>
+                条数
+                <input name="limit" type="number" min="1" max="200" value="30">
+              </label>
+              <label class="checkbox">
+                <input name="refresh" type="checkbox">
+                强刷
+              </label>
+              <button type="submit">查询 Derivatives</button>
+            </form>
+            <div id="binanceDerivativesMeta" class="muted table-meta"></div>
+            <div id="binanceDerivativesTable"></div>
+          </div>
+
+          <div class="binance-pane" data-binance-pane="rwa_stock_token">
+            <form class="form binance-search-form" data-binance-form="rwa_stock_token">
+              <label>
+                关键词
+                <input name="q" placeholder="AAPL / NVDAon / TSLA">
+              </label>
+              <label>
+                链
+                <select name="chain_id">
+                  <option value="">全部链</option>
+                  <option value="1">Ethereum</option>
+                  <option value="56">BSC</option>
+                  <option value="CT_501">Solana</option>
+                </select>
+              </label>
+              <label>
+                状态
+                <select name="status">
+                  <option value="">全部状态</option>
+                  <option value="ACTIVE" selected>ACTIVE</option>
+                </select>
+              </label>
+              <label>
+                条数
+                <input name="limit" type="number" min="1" max="200" value="30">
+              </label>
+              <label class="checkbox">
+                <input name="refresh" type="checkbox">
+                强刷
+              </label>
+              <button type="submit">查询 Stock Tokens</button>
+            </form>
+            <div id="binanceStockTokensMeta" class="muted table-meta"></div>
+            <div id="binanceStockTokensTable"></div>
+          </div>
+
+          <div class="binance-pane" data-binance-pane="equity">
+            <form class="form binance-search-form" data-binance-form="equity">
+              <label>
+                关键词
+                <input name="q" placeholder="NVDA / AAPL / MSFT">
+              </label>
+              <label>
+                来源
+                <select name="source">
+                  <option value="finnhub">Finnhub</option>
+                </select>
+              </label>
+              <label>
+                状态
+                <select name="status">
+                  <option value="">全部状态</option>
+                  <option value="QUOTE_READY">QUOTE_READY</option>
+                  <option value="CONFIGURED">CONFIGURED</option>
+                </select>
+              </label>
+              <label>
+                条数
+                <input name="limit" type="number" min="1" max="200" value="30">
+              </label>
+              <label class="checkbox">
+                <input name="refresh" type="checkbox">
+                强刷
+              </label>
+              <button type="submit">查询 Equity</button>
+            </form>
+            <div id="binanceEquityMeta" class="muted table-meta"></div>
+            <div id="binanceEquityTable"></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
               <h2>Polymarket 市场查询</h2>
               <p class="muted">支持关键字、分类和缓存强刷，点击 Question 可直达 Polymarket，并可加入自选。</p>
             </div>
             <a class="table-link-button" href="/watchlist" target="_blank" rel="noopener noreferrer">打开自选页</a>
           </div>
           <form id="marketForm" class="form search-form">
-            <label>
-              关键词
-              <input id="marketQuery" name="q" placeholder="例如 Iran / Trump / BTC">
-            </label>
-            <label>
-              类别
-              <input id="marketCategory" name="category" placeholder="例如 Politics / Sports / Crypto">
-            </label>
-            <label>
-              条数
-              <input id="marketLimit" name="limit" type="number" min="1" max="200" value="30">
-            </label>
-            <label class="checkbox">
-              <input id="marketRefresh" name="refresh" type="checkbox">
-              强制刷新缓存
-            </label>
-            <button type="submit">查询市场</button>
+            <div class="market-controls-row">
+              <label>
+                关键词
+                <input id="marketQuery" name="q" placeholder="例如 Iran / Trump / BTC">
+              </label>
+              <label>
+                类别
+                <input id="marketCategory" name="category" placeholder="可点选下方类别，也可手输">
+              </label>
+              <label>
+                排序
+                <select id="marketSort" name="sort">
+                  <option value="volume24h" selected>24小时热门</option>
+                  <option value="volume">总交易量</option>
+                  <option value="liquidity">流动性最高</option>
+                  <option value="spread">价差最小</option>
+                  <option value="end_date">即将到期</option>
+                  <option value="updated_at">最新更新</option>
+                  <option value="price_change_24h">24小时变化</option>
+                  <option value="last_trade_price">最近成交价</option>
+                </select>
+              </label>
+              <label>
+                方向
+                <select id="marketSortDir" name="order">
+                  <option value="desc" selected>大到小</option>
+                  <option value="asc">小到大</option>
+                </select>
+              </label>
+              <label>
+                条数
+                <input id="marketLimit" name="limit" type="number" min="1" max="200" value="30">
+              </label>
+              <label class="checkbox market-refresh-field">
+                <input id="marketRefresh" name="refresh" type="checkbox">
+                强刷
+              </label>
+              <button class="market-submit-btn" type="submit">查询市场</button>
+            </div>
+            <div class="market-price-filter-panel" aria-label="盘口价格范围">
+              <div class="market-price-filter-head">
+                <span>盘口范围</span>
+                <span>空值表示不限，价格按当前缓存/快照</span>
+              </div>
+              <div class="market-price-filter-grid">
+                <label>
+                  Yes Ask
+                  <span class="range-inputs">
+                    <input name="yes_ask_min" type="number" min="0" max="1" step="0.01" placeholder="min">
+                    <input name="yes_ask_max" type="number" min="0" max="1" step="0.01" placeholder="max">
+                  </span>
+                </label>
+                <label>
+                  Yes Bid
+                  <span class="range-inputs">
+                    <input name="yes_bid_min" type="number" min="0" max="1" step="0.01" placeholder="min">
+                    <input name="yes_bid_max" type="number" min="0" max="1" step="0.01" placeholder="max">
+                  </span>
+                </label>
+                <label>
+                  No Ask
+                  <span class="range-inputs">
+                    <input name="no_ask_min" type="number" min="0" max="1" step="0.01" placeholder="min">
+                    <input name="no_ask_max" type="number" min="0" max="1" step="0.01" placeholder="max">
+                  </span>
+                </label>
+                <label>
+                  No Bid
+                  <span class="range-inputs">
+                    <input name="no_bid_min" type="number" min="0" max="1" step="0.01" placeholder="min">
+                    <input name="no_bid_max" type="number" min="0" max="1" step="0.01" placeholder="max">
+                  </span>
+                </label>
+              </div>
+            </div>
+            <div class="market-category-panel">
+              <div class="market-category-panel-head">
+                <span>市场类别</span>
+                <span>可多选，点击切换</span>
+              </div>
+              <div id="marketCategoryChips" class="category-chip-list" aria-label="Polymarket categories"></div>
+            </div>
           </form>
+          <div id="marketMeta" class="table-meta"></div>
           <div id="marketTable"></div>
         </section>
       </main>
     </div>
     <script src="{{ url_for('static', filename='polymarket_links.js') }}"></script>
     <script src="{{ url_for('static', filename='strategy_params_bulk.js') }}?v=20260523_param_bulk"></script>
-    <script src="{{ url_for('static', filename='app.js') }}?v=20260525_schema_state"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20260623_human_override1"></script>
   </body>
 </html>

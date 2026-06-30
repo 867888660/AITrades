@@ -58,7 +58,7 @@
 
 - `services/virtual_execution.py` — 虚拟成交后写入 `strategy_virtual_positions`
 - `services/virtual_context_builder.py` — 策略 UseData 注入时读取虚拟持仓
-- `services/strategy_profit_engine.py` — 当策略 `state == 'Virtual'` 时从 `strategy_virtual_positions` 读取 qty/avg_price，不走钱包 API 或本地订单库
+- `services/strategy_profit_engine.py` — 当策略 `mode == 'Virtual'` 时从 `strategy_virtual_positions` 读取 qty/avg_price，不走钱包 API 或本地订单库
 
 ### 3. 策略监控数据库
 

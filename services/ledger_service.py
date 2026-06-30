@@ -95,19 +95,23 @@ def get_ledger_snapshot(limit: int = 100) -> Dict[str, Any]:
     limit = max(1, min(int(limit or 100), 500))
     conn = strategy_connect(readonly=True)
     try:
+        registry_cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(strategy_registry)").fetchall()}
+        mode_col = "mode" if "mode" in registry_cols else "state"
         strategies = _rows(
             conn,
-            """SELECT strategy_id, strategy_name, strategy_code, state, strategy_bankroll,
+            f"""SELECT strategy_id, strategy_name, strategy_code, {mode_col} AS mode, strategy_bankroll,
                       updated_at_utc
                FROM strategy_registry
                ORDER BY strategy_id""",
         )
+        for strategy in strategies:
+            strategy["state"] = strategy.get("mode") or "Stop"
         strategy_by_id = {int(s["strategy_id"]): s for s in strategies}
 
         legs = _rows(
             conn,
             """SELECT strategy_id, leg_uid, leg_index, condition_id, yes_token, no_token,
-                      asset_class, venue, symbol, instrument_id, instrument_json, budget_cap
+                      leg_kind, asset_class, venue, symbol, instrument_id, instrument_json, budget_cap
                FROM strategy_legs
                ORDER BY strategy_id, leg_index""",
         )

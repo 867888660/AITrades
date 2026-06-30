@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>History Workspace</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260629_history_coverage_refresh1">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">DT</div>
+          <div>
+            <div class="brand-title">DataTube</div>
+            <div class="brand-subtitle">History Workspace</div>
+          </div>
+        </div>
+        <nav class="nav">
+          <a class="nav-link" href="/" target="_blank" rel="noopener noreferrer">Dashboard</a>
+          <a class="nav-link" href="/event-graph" target="_blank" rel="noopener noreferrer">EventGraph</a>
+          <a class="nav-link" href="/ledger" target="_blank" rel="noopener noreferrer">Ledger</a>
+          <a class="nav-link active" href="/history" target="_blank" rel="noopener noreferrer">History</a>
+          <a class="nav-link" href="/agent-monitor" target="_blank" rel="noopener noreferrer">AgentMonitor</a>
+          <a class="nav-link" href="/watchlist" target="_blank" rel="noopener noreferrer">Watchlist</a>
+          <a class="nav-link" href="/settings" target="_blank" rel="noopener noreferrer">Settings</a>
+        </nav>
+        <div class="sidebar-note">
+          历史工作台用于整理回测标的池：先确认数据覆盖，再加入测试样例。
+        </div>
+      </aside>
+
+      <main class="page history-page">
+        <header class="history-header">
+          <div>
+            <span class="eyebrow">History Workspace</span>
+            <h1>历史数据工作台</h1>
+            <p id="historyMeta" class="muted">搜索 Binance / Polymarket 标的，查看本地覆盖并加入历史自选池。</p>
+          </div>
+          <div class="table-actions">
+            <button id="historyRefreshBtn" class="mini" type="button">刷新</button>
+          </div>
+        </header>
+
+        <section class="history-toolbar panel">
+          <div class="history-tabs" role="tablist" aria-label="数据源">
+            <button class="history-tab active" type="button" data-source="polymarket">Polymarket</button>
+            <button class="history-tab" type="button" data-source="binance">Binance</button>
+          </div>
+          <div class="history-search-grid">
+            <label>
+              关键词 / Symbol
+              <input id="historyQueryInput" placeholder="BTC / BTCUSDT / condition id">
+            </label>
+            <label id="historyQuoteField">
+              Quote
+              <select id="historyQuoteSelect">
+                <option value="USDT">USDT</option>
+                <option value="USDC">USDC</option>
+                <option value="">全部</option>
+              </select>
+            </label>
+            <label>
+              粒度
+              <select id="historyIntervalSelect">
+                <option value="1m">1m</option>
+                <option value="5m">5m</option>
+                <option value="15m">15m</option>
+                <option value="1h">1h</option>
+                <option value="1d">1d</option>
+              </select>
+            </label>
+            <div class="history-actions">
+              <button id="historySearchBtn" type="button">搜索</button>
+            </div>
+          </div>
+          <div class="history-download-grid">
+            <label>
+              历史数据 From
+              <input id="historyStartInput" type="datetime-local">
+            </label>
+            <label>
+              历史数据 To
+              <input id="historyEndInput" type="datetime-local">
+            </label>
+            <div class="history-actions">
+              <button id="historyDownloadBtn" class="secondary" type="button">补齐选中数据</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="grid two history-main-grid">
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>搜索结果</h2>
+                <p id="historyResultsMeta" class="muted">选择一个标的后可以加入自选或补齐历史数据。</p>
+              </div>
+            </div>
+            <div id="historyResults"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>历史自选池</h2>
+                <p id="historyWatchlistMeta" class="muted">勾选多个历史标的，用它们组成一套回测测试 legs。</p>
+              </div>
+            </div>
+            <div class="history-case-builder">
+              <label>
+                样例名称
+                <input id="historyCaseNameInput" placeholder="例如 BTC election + BTCUSDT">
+              </label>
+              <label>
+                集合
+                <input id="historyCaseCollectionInput" list="historyCaseCollections" placeholder="例如 BTC election set">
+                <datalist id="historyCaseCollections"></datalist>
+              </label>
+              <button id="historyCreateCaseBtn" class="secondary" type="button">创建回测样例</button>
+              <button id="historyDownloadWatchlistBtn" class="secondary" type="button">补齐勾选数据</button>
+            </div>
+            <div id="historyCaseCheck" class="history-case-check status">勾选 legs 后会自动检查数据覆盖；策略适配在回测运行台检查。</div>
+            <div id="historyWatchlist"></div>
+          </article>
+        </section>
+
+        <section class="grid two">
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>回测样例池</h2>
+                <p id="historyCasesMeta" class="muted">这里保存多套测试 legs；下一阶段回测引擎会从样例池运行。</p>
+              </div>
+            </div>
+            <div class="history-suite-builder">
+              <label>
+                样例集名称
+                <input id="historyCaseSuiteNameInput" placeholder="例如 2-leg Binance smoke set">
+              </label>
+              <button id="historyCreateCollectionBtn" class="secondary" type="button">用勾选样例创建样例集</button>
+            </div>
+            <div id="historyCases"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>回测运行台</h2>
+                <p class="muted">选择一个策略，再用它运行某个集合里的多套样例。</p>
+              </div>
+            </div>
+            <div class="history-runner">
+              <label>
+                策略代码
+                <select id="historyRunStrategySelect">
+                  <option value="">请选择 StrategyCode</option>
+                </select>
+              </label>
+              <label>
+                集合
+                <select id="historyRunCollectionSelect">
+                  <option value="">全部集合</option>
+                </select>
+              </label>
+              <button id="historyRunSelectedBtn" class="secondary" type="button">运行选中样例</button>
+            </div>
+            <div id="historyRunParams" class="history-run-params"></div>
+            <div id="historyRunCases"></div>
+          </article>
+        </section>
+
+        <section class="grid two">
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>数据预览</h2>
+                <p id="historyPreviewMeta" class="muted">下载后显示最近的数据点。</p>
+              </div>
+            </div>
+            <div id="historyPreview"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>覆盖详情</h2>
+                <p class="muted">区分本地采集数据与官方补齐数据。</p>
+              </div>
+            </div>
+            <pre id="historyCoverage" class="log-shell">尚未选择标的。</pre>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <script src="{{ url_for('static', filename='history_workspace.js') }}?v=20260629_history_coverage_refresh1"></script>
+  </body>
+</html>

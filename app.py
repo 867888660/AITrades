@@ -10,8 +10,39 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
 from services.config_loader import load_public_web_settings, load_web_settings, load_web_settings_for_ui, save_web_settings
+from services import agent_interface_service as agent_service
+from services.binance_market_service import search_binance_markets
 from services.crypto_service import fetch_crypto_quotes
+from services.event_graph_service import build_event_graph, get_event_graph_categories
+from services.event_news_service import (
+    event_news_scheduler,
+    get_status as get_event_news_status,
+    list_events as list_news_events,
+    list_observations as list_news_observations,
+    refresh_news,
+)
 from services.finance_service import fetch_finance_quotes
+from services.history_data_service import (
+    add_watchlist_item as add_history_watchlist_item,
+    create_backtest_case as create_history_backtest_case,
+    create_backtest_collection as create_history_backtest_collection,
+    create_backtest_run as create_history_backtest_run,
+    delete_backtest_case as delete_history_backtest_case,
+    delete_watchlist_item as delete_history_watchlist_item,
+    download_binance_klines,
+    download_binance_klines_range,
+    download_polymarket_price_history,
+    evaluate_backtest_case_payload,
+    get_coverage as get_history_coverage,
+    health_snapshot as get_history_health,
+    get_backtest_run as get_history_backtest_run,
+    list_backtest_cases as list_history_backtest_cases,
+    list_backtest_collections as list_history_backtest_collections,
+    list_backtest_runs as list_history_backtest_runs,
+    list_watchlist as list_history_watchlist,
+    preview_history,
+    rerun_backtest_run as rerun_history_backtest_run,
+)
 from services.http_client import SESSION
 from services.backtest_service import create_backtest_placeholder, get_backtest_placeholder
 from services.polymarket_dictionary_service import get_dictionary_status, start_dictionary_refresh
@@ -21,6 +52,7 @@ from services.polymarket_service import (
     fetch_strategy_monitoring,
     fetch_wallet_positions,
     get_overview,
+    list_market_categories,
     resolve_market_selection,
     search_markets,
 )
@@ -44,6 +76,7 @@ from services.strategy_registry_service import (
     list_strategy_codes,
     update_strategy as update_registry_strategy,
     update_strategy_legs,
+    update_strategy_mode,
     update_strategy_state,
 )
 from services.strategy_settings_service import update_strategy_settings
@@ -93,6 +126,25 @@ def debug_timing(name: str):
 
 
 def _json_error(exc: Exception, status_code: int = 500):
+    try:
+        path = request.path or ""
+        if path.startswith("/api/agent/") or path.startswith("/api/approvals/") or path.startswith("/api/event-graph/change-requests/"):
+            payload = request.get_json(silent=True) if request.method not in {"GET", "HEAD"} else dict(request.args)
+            if not isinstance(payload, dict):
+                payload = {}
+            payload.setdefault("actor_type", "agent" if path.startswith("/api/agent/") else "human")
+            payload.setdefault("actor_id", "agent_strategy_assistant" if path.startswith("/api/agent/") else "local_user")
+            payload.setdefault("_endpoint", path)
+            payload.setdefault("_method", request.method)
+            agent_service.record_request_error(
+                path=path,
+                method=request.method,
+                status_code=status_code,
+                error=str(exc),
+                payload=payload,
+            )
+    except Exception:
+        pass
     return jsonify({"ok": False, "error": str(exc)}), status_code
 
 
@@ -215,6 +267,31 @@ def settings_page():
 @app.get("/watchlist")
 def watchlist_page():
     return render_template("watchlist.html")
+
+
+@app.get("/history")
+def history_workspace_page():
+    return render_template("history_workspace.html")
+
+
+@app.get("/backtests/<int:run_id>")
+def backtest_report_page(run_id: int):
+    return render_template("backtest_report.html", run_id=run_id)
+
+
+@app.get("/agent-monitor")
+def agent_monitor_page():
+    return render_template("agent_monitor.html")
+
+
+@app.get("/event-graph")
+def event_graph_page():
+    return render_template("event_graph.html")
+
+
+@app.get("/eventgraph")
+def eventgraph_page_alias():
+    return render_template("event_graph.html")
 
 
 @app.get("/ledger")
@@ -381,12 +458,128 @@ def live_polymarket_dictionary():
     )
 
 
+@app.get("/api/polymarket/market-categories")
+def polymarket_market_categories():
+    force_refresh = request.args.get("refresh", "0") == "1"
+    limit = request.args.get("limit", "120")
+    try:
+        limit_num = max(0, min(int(limit), 500))
+    except ValueError:
+        limit_num = 120
+    try:
+        data = list_market_categories(force_refresh=force_refresh, limit=limit_num)
+        return jsonify({"ok": True, "count": len(data), "data": data})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/event-graph")
+@debug_timing("event_graph")
+def event_graph_api():
+    try:
+        return jsonify(build_event_graph(dict(request.args)))
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/event-graph/categories")
+@debug_timing("event_graph_categories")
+def event_graph_categories_api():
+    try:
+        limit = request.args.get("limit", "120")
+        try:
+            limit_num = max(1, min(int(limit), 240))
+        except ValueError:
+            limit_num = 120
+        return jsonify({"ok": True, "data": get_event_graph_categories(limit=limit_num)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/event-graph/news/status")
+@debug_timing("event_graph_news_status")
+def event_graph_news_status_api():
+    try:
+        return jsonify({"ok": True, "data": get_event_news_status()})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/event-graph/news/refresh")
+@debug_timing("event_graph_news_refresh")
+def event_graph_news_refresh_api():
+    try:
+        payload = request.get_json(silent=True) or {}
+        query = str(payload.get("q") or payload.get("query") or request.args.get("q", "") or "").strip()
+        limit = payload.get("limit_per_source") or payload.get("limit") or request.args.get("limit", "24")
+        return jsonify({"ok": True, "data": refresh_news(query=query, limit_per_source=limit)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/event-graph/news/search")
+@debug_timing("event_graph_news_search")
+def event_graph_news_search_api():
+    try:
+        payload = request.get_json(silent=True) or {}
+        query = str(payload.get("q") or payload.get("query") or request.args.get("q", "") or "").strip()
+        if not query:
+            return _json_error(ValueError("q is required"), 400)
+        limit = payload.get("limit_per_source") or payload.get("limit") or request.args.get("limit", "30")
+        return jsonify({"ok": True, "data": refresh_news(query=query, limit_per_source=limit)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/event-graph/events")
+@debug_timing("event_graph_events")
+def event_graph_events_api():
+    try:
+        query = str(request.args.get("q", "") or "").strip()
+        limit = request.args.get("limit", "80")
+        include_observations = str(request.args.get("include_observations", "1")).lower() not in {"0", "false", "no"}
+        return jsonify({"ok": True, "data": list_news_events(q=query, limit=limit, include_observations=include_observations)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/event-graph/observations")
+@debug_timing("event_graph_observations")
+def event_graph_observations_api():
+    try:
+        event_id = str(request.args.get("event_id", "") or "").strip()
+        query = str(request.args.get("q", "") or "").strip()
+        limit = request.args.get("limit", "120")
+        return jsonify({"ok": True, "data": list_news_observations(event_id=event_id, q=query, limit=limit)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
 @app.get("/api/polymarket/markets")
 def polymarket_markets():
     query = request.args.get("q", "")
-    category = request.args.get("category", "")
+    category_values = [value for value in request.args.getlist("category") if str(value or "").strip()]
+    category = ",".join(category_values) if category_values else request.args.get("category", "")
+    sort_by = request.args.get("sort", request.args.get("sort_by", ""))
+    sort_dir = request.args.get("order", request.args.get("sort_dir", "desc"))
     force_refresh = request.args.get("refresh", "0") == "1"
     limit = request.args.get("limit", "60")
+    price_filters = {
+        "yes_ask": (
+            request.args.get("yes_ask_min", request.args.get("ask_min")),
+            request.args.get("yes_ask_max", request.args.get("ask_max")),
+        ),
+        "yes_bid": (
+            request.args.get("yes_bid_min", request.args.get("bid_min")),
+            request.args.get("yes_bid_max", request.args.get("bid_max")),
+        ),
+        "no_ask": (request.args.get("no_ask_min"), request.args.get("no_ask_max")),
+        "no_bid": (request.args.get("no_bid_min"), request.args.get("no_bid_max")),
+    }
     try:
         limit_num = max(1, min(int(limit), 200))
     except ValueError:
@@ -397,8 +590,11 @@ def polymarket_markets():
             category=category,
             limit=limit_num,
             force_refresh=force_refresh,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+            price_filters=price_filters,
         )
-        return jsonify({"ok": True, "count": len(data), "data": data})
+        return jsonify({"ok": True, "count": len(data), "sort": sort_by, "order": sort_dir, "data": data})
     except Exception as exc:
         return _json_error(exc)
 
@@ -427,6 +623,289 @@ def polymarket_market_resolve():
         return _json_error(exc)
 
 
+@app.get("/api/binance/markets/search")
+def binance_markets_search():
+    try:
+        data = search_binance_markets(dict(request.args))
+        return jsonify(data)
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/history/health")
+@debug_timing("history_health")
+def history_health():
+    try:
+        return jsonify(get_history_health())
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/history/search")
+@debug_timing("history_search")
+def history_search():
+    source = str(request.args.get("source") or "polymarket").strip().lower()
+    limit = request.args.get("limit", "40")
+    try:
+        limit_num = max(1, min(int(limit), 100))
+    except ValueError:
+        limit_num = 40
+    try:
+        if source == "binance":
+            data = search_binance_markets(
+                {
+                    "category": "crypto_spot",
+                    "q": request.args.get("q", ""),
+                    "quote": request.args.get("quote", "USDT"),
+                    "limit": limit_num,
+                    "refresh": request.args.get("refresh", "0"),
+                }
+            )
+            rows = data.get("data") if isinstance(data, dict) else []
+            for row in rows or []:
+                row["history_coverage"] = get_history_coverage(
+                    "binance",
+                    symbol=row.get("symbol"),
+                    interval=request.args.get("interval", "1m"),
+                )
+            return jsonify({"ok": True, "source": source, "count": len(rows or []), "data": rows or [], "meta": data.get("meta", {})})
+        if source == "polymarket":
+            rows = search_markets(
+                query=request.args.get("q", ""),
+                category=request.args.get("category", ""),
+                limit=limit_num,
+                force_refresh=request.args.get("refresh", "0") == "1",
+                sort_by=request.args.get("sort", "volume24h"),
+                sort_dir=request.args.get("order", "desc"),
+            )
+            for row in rows:
+                token_id = str(row.get("yes_token") or row.get("token") or "").strip()
+                row["history_coverage"] = get_history_coverage(
+                    "polymarket",
+                    condition_id=row.get("condition_id"),
+                    token_id=token_id,
+                )
+            return jsonify({"ok": True, "source": source, "count": len(rows), "data": rows})
+        return _json_error(ValueError("source must be binance or polymarket"), 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/history/watchlist")
+@debug_timing("history_watchlist")
+def history_watchlist():
+    try:
+        source = str(request.args.get("source") or "").strip().lower()
+        return jsonify({"ok": True, "data": list_history_watchlist(source)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/history/watchlist")
+@debug_timing("history_watchlist_add")
+def history_watchlist_add():
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify({"ok": True, "data": add_history_watchlist_item(payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.delete("/api/history/watchlist/<int:item_id>")
+@debug_timing("history_watchlist_delete")
+def history_watchlist_delete(item_id: int):
+    try:
+        return jsonify({"ok": True, "deleted": delete_history_watchlist_item(item_id)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/history/backtest-cases")
+@debug_timing("history_backtest_cases")
+def history_backtest_cases():
+    try:
+        return jsonify({"ok": True, "data": list_history_backtest_cases()})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/history/backtest-collections")
+@debug_timing("history_backtest_collections")
+def history_backtest_collections():
+    try:
+        return jsonify({"ok": True, "data": list_history_backtest_collections()})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/history/backtest-collections")
+@debug_timing("history_backtest_collection_create")
+def history_backtest_collection_create():
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify({"ok": True, "data": create_history_backtest_collection(payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/history/backtest-cases")
+@debug_timing("history_backtest_case_create")
+def history_backtest_case_create():
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify({"ok": True, "data": create_history_backtest_case(payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.delete("/api/history/backtest-cases/<int:case_id>")
+@debug_timing("history_backtest_case_delete")
+def history_backtest_case_delete(case_id: int):
+    try:
+        return jsonify({"ok": True, "deleted": delete_history_backtest_case(case_id)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/history/backtest-cases/evaluate")
+@debug_timing("history_backtest_case_evaluate")
+def history_backtest_case_evaluate():
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify(evaluate_backtest_case_payload(payload))
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/history/backtest-runs")
+@debug_timing("history_backtest_runs")
+def history_backtest_runs():
+    try:
+        case_id = request.args.get("case_id")
+        return jsonify({"ok": True, "data": list_history_backtest_runs(int(case_id)) if case_id else list_history_backtest_runs()})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/history/backtest-cases/<int:case_id>/runs")
+@debug_timing("history_backtest_run_create")
+def history_backtest_run_create(case_id: int):
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify({"ok": True, "data": create_history_backtest_run(case_id, payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/history/backtest-runs/<int:run_id>")
+@debug_timing("history_backtest_run")
+def history_backtest_run(run_id: int):
+    try:
+        equity_limit = int(request.args.get("equity_limit") or 5000)
+        orders_limit = int(request.args.get("orders_limit") or 3000)
+        events_limit = int(request.args.get("events_limit") or 500)
+        data = get_history_backtest_run(
+            run_id,
+            equity_limit=equity_limit,
+            orders_limit=orders_limit,
+            events_limit=events_limit,
+        )
+        if not data:
+            return _json_error(ValueError("backtest run not found"), 404)
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/history/backtest-runs/<int:run_id>/rerun")
+@debug_timing("history_backtest_run_rerun")
+def history_backtest_run_rerun(run_id: int):
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify({"ok": True, "data": rerun_history_backtest_run(run_id, payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/history/coverage")
+@debug_timing("history_coverage")
+def history_coverage():
+    try:
+        return jsonify(
+            {
+                "ok": True,
+                "data": get_history_coverage(
+                    request.args.get("source", ""),
+                    symbol=request.args.get("symbol", ""),
+                    interval=request.args.get("interval", "1m"),
+                    condition_id=request.args.get("condition_id", ""),
+                    token_id=request.args.get("token_id", ""),
+                ),
+            }
+        )
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/history/binance/download")
+@debug_timing("history_binance_download")
+def history_binance_download():
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify(download_binance_klines_range(payload))
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/history/polymarket/download")
+@debug_timing("history_polymarket_download")
+def history_polymarket_download():
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify(download_polymarket_price_history(payload))
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/history/preview")
+@debug_timing("history_preview")
+def history_preview():
+    try:
+        return jsonify(
+            preview_history(
+                request.args.get("source", ""),
+                symbol=request.args.get("symbol", ""),
+                interval=request.args.get("interval", "1m"),
+                token_id=request.args.get("token_id", ""),
+                limit=request.args.get("limit", "240"),
+            )
+        )
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
 @app.get("/api/polymarket/holdings")
 def polymarket_holdings():
     wallet = request.args.get("wallet", "")
@@ -446,6 +925,685 @@ def ledger_snapshot():
         except ValueError:
             limit_num = 100
         return jsonify(get_ledger_snapshot(limit=limit_num))
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/capabilities")
+@debug_timing("agent_capabilities")
+def agent_capabilities():
+    try:
+        return jsonify({"ok": True, "data": agent_service.get_capabilities()})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+def _agent_query_payload() -> dict:
+    payload = dict(request.args)
+    categories = [value for value in request.args.getlist("category") if str(value or "").strip()]
+    if categories:
+        payload["categories"] = categories
+    payload.setdefault("actor_type", "agent")
+    payload.setdefault("actor_id", "agent_strategy_assistant")
+    payload.setdefault("_endpoint", request.path)
+    payload.setdefault("_method", request.method)
+    return payload
+
+
+def _agent_body_payload(default_type: str = "agent", default_id: str = "agent_strategy_assistant") -> dict:
+    payload = request.get_json(silent=True) or {}
+    payload.setdefault("actor_type", default_type)
+    payload.setdefault("actor_id", default_id)
+    payload.setdefault("_endpoint", request.path)
+    payload.setdefault("_method", request.method)
+    return payload
+
+
+@app.get("/api/agent/market-categories")
+@debug_timing("agent_market_categories")
+def agent_market_categories():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_list_market_categories(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/markets")
+@debug_timing("agent_market_search")
+def agent_market_search():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_search_markets(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/markets/resolve")
+@debug_timing("agent_market_resolve")
+def agent_market_resolve():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_resolve_market(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/agent/market-scan")
+@debug_timing("agent_market_scan")
+def agent_market_scan():
+    try:
+        payload = _agent_body_payload()
+        return jsonify({"ok": True, "data": agent_service.agent_hot_market_scan(payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/agent/market-scan/propose-strategies")
+@debug_timing("agent_market_scan_propose")
+def agent_market_scan_propose():
+    try:
+        payload = _agent_body_payload()
+        return jsonify({"ok": True, "data": agent_service.propose_strategies_from_market_scan(payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/event-graph")
+@debug_timing("agent_event_graph")
+def agent_event_graph_api():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_get_event_graph(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/event-graph/news/status")
+@debug_timing("agent_event_news_status")
+def agent_event_news_status_api():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_event_news_status(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/event-graph/events")
+@debug_timing("agent_event_graph_events")
+def agent_event_graph_events_api():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_list_event_graph_events(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/event-graph/observations")
+@debug_timing("agent_event_graph_observations")
+def agent_event_graph_observations_api():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_list_event_graph_observations(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/agent/event-graph/news/refresh")
+@debug_timing("agent_event_news_refresh")
+def agent_event_news_refresh_api():
+    try:
+        payload = _agent_body_payload()
+        return jsonify({"ok": True, "data": agent_service.agent_refresh_event_news(payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/agent/event-graph/news/search")
+@debug_timing("agent_event_news_search")
+def agent_event_news_search_api():
+    try:
+        payload = _agent_body_payload()
+        return jsonify({"ok": True, "data": agent_service.agent_search_event_news(payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.post("/api/agent/event-graph/patches/validate")
+@debug_timing("agent_event_graph_patch_validate")
+def agent_event_graph_patch_validate_api():
+    try:
+        payload = _agent_body_payload()
+        return jsonify({"ok": True, "data": agent_service.agent_validate_event_graph_patch(payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/agent/event-graph/change-requests")
+@debug_timing("agent_event_graph_change_request")
+def agent_event_graph_change_request_api():
+    try:
+        payload = _agent_body_payload()
+        return jsonify({"ok": True, "data": agent_service.agent_submit_change_request(payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/event-graph/change-requests")
+@debug_timing("agent_event_graph_change_requests_list")
+def agent_event_graph_change_requests_list_api():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_list_change_requests(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/event-graph/change-requests/<request_id>")
+@debug_timing("agent_event_graph_change_request_detail")
+def agent_event_graph_change_request_detail_api(request_id: str):
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_get_change_request(request_id, _agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/event-graph/core/events")
+@debug_timing("agent_event_graph_core_events")
+def agent_event_graph_core_events_api():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_list_graph_core_events(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/event-graph/core")
+@debug_timing("agent_event_graph_core")
+def agent_event_graph_core_api():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_list_graph_core(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/event-graph/core/finance")
+@debug_timing("agent_event_graph_core_finance")
+def agent_event_graph_core_finance_api():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_list_graph_core_finance_nodes(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/event-graph/core/edges")
+@debug_timing("agent_event_graph_core_edges")
+def agent_event_graph_core_edges_api():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_list_graph_core_edges(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/event-graph/core/expressions")
+@debug_timing("agent_event_graph_core_expressions")
+def agent_event_graph_core_expressions_api():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_list_graph_core_expressions(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/event-graph/core/versions")
+@debug_timing("agent_event_graph_core_versions")
+def agent_event_graph_core_versions_api():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_list_graph_core_versions(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/event-graph/change-requests/<request_id>/approve")
+@debug_timing("event_graph_change_request_approve")
+def event_graph_change_request_approve_api(request_id: str):
+    try:
+        payload = _agent_body_payload(default_type="human", default_id="local_user")
+        return jsonify(
+            {
+                "ok": True,
+                "data": agent_service.human_review_event_graph_change_request(
+                    request_id,
+                    payload,
+                    decision="approve",
+                ),
+            }
+        )
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/event-graph/change-requests/<request_id>/reject")
+@debug_timing("event_graph_change_request_reject")
+def event_graph_change_request_reject_api(request_id: str):
+    try:
+        payload = _agent_body_payload(default_type="human", default_id="local_user")
+        return jsonify(
+            {
+                "ok": True,
+                "data": agent_service.human_review_event_graph_change_request(
+                    request_id,
+                    payload,
+                    decision="reject",
+                ),
+            }
+        )
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/event-graph/change-requests/<request_id>/request-changes")
+@debug_timing("event_graph_change_request_needs_changes")
+def event_graph_change_request_needs_changes_api(request_id: str):
+    try:
+        payload = _agent_body_payload(default_type="human", default_id="local_user")
+        return jsonify(
+            {
+                "ok": True,
+                "data": agent_service.human_review_event_graph_change_request(
+                    request_id,
+                    payload,
+                    decision="request_changes",
+                ),
+            }
+        )
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/event-graph/change-requests/<request_id>/apply")
+@debug_timing("event_graph_change_request_apply")
+def event_graph_change_request_apply_api(request_id: str):
+    try:
+        payload = _agent_body_payload(default_type="human", default_id="local_user")
+        return jsonify({"ok": True, "data": agent_service.human_apply_event_graph_change_request(request_id, payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/dashboard")
+@debug_timing("agent_dashboard")
+def agent_dashboard():
+    try:
+        limit = request.args.get("limit", "20")
+        try:
+            limit_num = max(1, min(int(limit), 100))
+        except ValueError:
+            limit_num = 20
+        return jsonify({"ok": True, "data": agent_service.dashboard(limit=limit_num)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/activity")
+@debug_timing("agent_activity_list")
+def agent_activity_list():
+    try:
+        limit = request.args.get("limit", "50")
+        try:
+            limit_num = max(1, min(int(limit), 200))
+        except ValueError:
+            limit_num = 50
+        return jsonify({"ok": True, "data": agent_service.list_activity(limit=limit_num)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/agent/activity")
+@debug_timing("agent_activity_create")
+def agent_activity_create():
+    try:
+        payload = _agent_body_payload()
+        return jsonify({"ok": True, "data": agent_service.create_activity(payload)}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/strategy-drafts")
+@debug_timing("agent_drafts_list")
+def agent_strategy_drafts_list():
+    try:
+        limit = request.args.get("limit", "100")
+        try:
+            limit_num = max(1, min(int(limit), 500))
+        except ValueError:
+            limit_num = 100
+        return jsonify({"ok": True, "data": agent_service.list_drafts(limit=limit_num, payload=_agent_query_payload())})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/agent/strategy-drafts")
+@debug_timing("agent_drafts_create")
+def agent_strategy_drafts_create():
+    try:
+        payload = _agent_body_payload()
+        return jsonify({"ok": True, "data": agent_service.create_draft(payload)}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/strategy-drafts/<draft_id>")
+@debug_timing("agent_drafts_get")
+def agent_strategy_drafts_get(draft_id: str):
+    try:
+        result = agent_service.get_draft(draft_id, _agent_query_payload())
+        if not result:
+            return jsonify({"ok": False, "error": "draft not found"}), 404
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.patch("/api/agent/strategy-drafts/<draft_id>")
+@debug_timing("agent_drafts_update")
+def agent_strategy_drafts_update(draft_id: str):
+    try:
+        payload = _agent_body_payload()
+        return jsonify({"ok": True, "data": agent_service.update_draft(draft_id, payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.delete("/api/agent/strategy-drafts/<draft_id>")
+@debug_timing("agent_drafts_delete")
+def agent_strategy_drafts_delete(draft_id: str):
+    try:
+        payload = _agent_body_payload()
+        return jsonify({"ok": True, "data": agent_service.delete_draft(draft_id, payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/agent/strategy-drafts/<draft_id>/risk-check")
+@debug_timing("agent_drafts_risk")
+def agent_strategy_drafts_risk(draft_id: str):
+    try:
+        payload = _agent_body_payload()
+        return jsonify({"ok": True, "data": agent_service.risk_check(draft_id, payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/agent/strategy-drafts/<draft_id>/simulate")
+@debug_timing("agent_drafts_simulate")
+def agent_strategy_drafts_simulate(draft_id: str):
+    try:
+        payload = _agent_body_payload()
+        return jsonify({"ok": True, "data": agent_service.simulate_draft(draft_id, payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/agent/strategy-drafts/<draft_id>/submit")
+@debug_timing("agent_drafts_submit")
+def agent_strategy_drafts_submit(draft_id: str):
+    try:
+        payload = _agent_body_payload()
+        return jsonify({"ok": True, "data": agent_service.submit_draft(draft_id, payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/approvals")
+@debug_timing("agent_approvals_list")
+def agent_approvals_list():
+    try:
+        status = request.args.get("status", "")
+        limit = request.args.get("limit", "100")
+        try:
+            limit_num = max(1, min(int(limit), 500))
+        except ValueError:
+            limit_num = 100
+        return jsonify({"ok": True, "data": agent_service.list_approvals(status=status, limit=limit_num, payload=_agent_query_payload())})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/approvals/<approval_id>")
+@debug_timing("agent_approvals_get")
+def agent_approvals_get(approval_id: str):
+    try:
+        result = agent_service.get_approval(approval_id, _agent_query_payload())
+        if not result:
+            return jsonify({"ok": False, "error": "approval not found"}), 404
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.patch("/api/agent/approvals/<approval_id>/draft")
+@debug_timing("agent_approvals_update_draft")
+def agent_approvals_update_draft(approval_id: str):
+    try:
+        payload = _agent_body_payload(default_type="human", default_id="local_user")
+        return jsonify({"ok": True, "data": agent_service.update_approval_draft(approval_id, payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/approvals/<approval_id>/approve")
+@debug_timing("agent_approvals_approve")
+def agent_approvals_approve(approval_id: str):
+    try:
+        payload = _agent_body_payload(default_type="human", default_id="local_user")
+        return jsonify({"ok": True, "data": agent_service.approve_approval(approval_id, payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/approvals/<approval_id>/reject")
+@debug_timing("agent_approvals_reject")
+def agent_approvals_reject(approval_id: str):
+    try:
+        payload = _agent_body_payload(default_type="human", default_id="local_user")
+        return jsonify({"ok": True, "data": agent_service.reject_approval(approval_id, payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/approvals/<approval_id>/request-changes")
+@debug_timing("agent_approvals_changes")
+def agent_approvals_changes(approval_id: str):
+    try:
+        payload = _agent_body_payload(default_type="human", default_id="local_user")
+        return jsonify({"ok": True, "data": agent_service.request_changes(approval_id, payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/audit")
+@debug_timing("agent_audit")
+def agent_audit_list():
+    try:
+        limit = request.args.get("limit", "100")
+        try:
+            limit_num = max(1, min(int(limit), 500))
+        except ValueError:
+            limit_num = 100
+        return jsonify({"ok": True, "data": agent_service.list_audit(limit=limit_num, payload=_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/runs")
+@debug_timing("agent_runs")
+def agent_runs_list():
+    try:
+        limit = request.args.get("limit", "100")
+        try:
+            limit_num = max(1, min(int(limit), 500))
+        except ValueError:
+            limit_num = 100
+        return jsonify({"ok": True, "data": agent_service.list_runs(limit=limit_num, payload=_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/runs/<run_id>/steps")
+@debug_timing("agent_run_steps")
+def agent_run_steps_list(run_id: str):
+    try:
+        limit = request.args.get("limit", "200")
+        try:
+            limit_num = max(1, min(int(limit), 500))
+        except ValueError:
+            limit_num = 200
+        return jsonify({"ok": True, "data": agent_service.list_run_steps(run_id, limit=limit_num, payload=_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.delete("/api/agent/audit")
+@debug_timing("agent_audit_clear")
+def agent_audit_clear():
+    try:
+        payload = _agent_body_payload(default_type="human", default_id="local_user")
+        return jsonify({"ok": True, "data": agent_service.clear_audit(payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/strategies")
+@debug_timing("agent_strategies_list")
+def agent_strategies_list():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_list_strategies(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/strategies/<int:strategy_id>")
+@debug_timing("agent_strategy_detail")
+def agent_strategy_detail(strategy_id: int):
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_get_strategy(strategy_id, _agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/strategies/<int:strategy_id>/workspace")
+@debug_timing("agent_strategy_workspace")
+def agent_strategy_workspace(strategy_id: int):
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_get_strategy_workspace(strategy_id, _agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/strategies/<int:strategy_id>/usedata")
+@debug_timing("agent_strategy_usedata")
+def agent_strategy_usedata(strategy_id: int):
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_get_strategy_usedata(strategy_id, _agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/strategies/<int:strategy_id>/events")
+@debug_timing("agent_strategy_events")
+def agent_strategy_events(strategy_id: int):
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_get_strategy_events(strategy_id, _agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/strategies/<int:strategy_id>/state")
+@debug_timing("agent_strategy_state")
+def agent_strategy_state(strategy_id: int):
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_get_strategy_state(strategy_id, _agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
     except Exception as exc:
         return _json_error(exc)
 
@@ -540,7 +1698,11 @@ def polymarket_strategy_workspace(row_id: int):
 @debug_timing("strategy_usedata")
 def polymarket_strategy_usedata(row_id: int):
     try:
-        return jsonify({"ok": True, "data": get_strategy_usedata_snapshot(row_id)})
+        include_live_orderbook = str(request.args.get("live_orderbook", "1")).lower() not in {"0", "false", "no"}
+        return jsonify({
+            "ok": True,
+            "data": get_strategy_usedata_snapshot(row_id, include_live_orderbook=include_live_orderbook),
+        })
     except Exception as exc:
         return _json_error(exc)
 
@@ -549,7 +1711,14 @@ def polymarket_strategy_usedata(row_id: int):
 @debug_timing("strategy_usedata_draft")
 def polymarket_strategy_usedata_draft():
     try:
-        return jsonify({"ok": True, "data": get_strategy_usedata_draft(request.get_json(silent=True) or {})})
+        include_live_orderbook = str(request.args.get("live_orderbook", "1")).lower() not in {"0", "false", "no"}
+        return jsonify({
+            "ok": True,
+            "data": get_strategy_usedata_draft(
+                request.get_json(silent=True) or {},
+                include_live_orderbook=include_live_orderbook,
+            ),
+        })
     except Exception as exc:
         return _json_error(exc)
 
@@ -685,6 +1854,12 @@ def live_strategies():
             try:
                 payload = fetch_strategy_monitoring(limit=limit_num, sync_stats=False)
                 rows = payload.get("data", [])
+                valid_modes = {"Stop", "Virtual", "Real"}
+
+                def _machine_state_from_row(row):
+                    value = row.get("machine_state") or row.get("state") or "auto"
+                    return "auto" if value in valid_modes else value
+
                 light_rows = [
                     {
                         "row_id": row.get("row_id"),
@@ -722,7 +1897,10 @@ def live_strategies():
                         "updated_at": row.get("updated_at"),
                         "recent_events": row.get("recent_events"),
                         "profit": row.get("profit"),
-                        "state": row.get("state"),
+                        "mode": row.get("mode") or (row.get("state") if row.get("state") in valid_modes else "Stop"),
+                        "state": _machine_state_from_row(row),
+                        "machine_state": _machine_state_from_row(row),
+                        "state_options": row.get("state_options"),
                         "is_virtual": row.get("is_virtual"),
                         "editable": row.get("editable"),
                     }
@@ -741,6 +1919,7 @@ def live_strategies():
                         "realtime_snapshot_db_path": payload.get("realtime_snapshot_db_path"),
                         "running_strategy_count": payload.get("running_strategy_count"),
                         "total_strategy_profit": payload.get("total_strategy_profit"),
+                        "total_strategy_bankroll": payload.get("total_strategy_bankroll"),
                         "total_strategy_return_pct": payload.get("total_strategy_return_pct"),
                         "source_statuses": payload.get("source_statuses"),
                         "strategy_metrics_db_dir": payload.get("strategy_metrics_db_dir"),
@@ -881,13 +2060,28 @@ def registry_strategies_update(strategy_id: int):
         return _json_error(exc)
 
 
-@app.patch("/api/registry/strategies/<int:strategy_id>/state")
-@debug_timing("registry_state")
-def registry_strategies_state(strategy_id: int):
+@app.patch("/api/registry/strategies/<int:strategy_id>/mode")
+@debug_timing("registry_mode")
+def registry_strategies_mode(strategy_id: int):
     try:
         payload = request.get_json(silent=True) or {}
-        new_state = str(payload.get("state") or "").strip()
-        result = update_strategy_state(strategy_id, new_state)
+        new_mode = str(payload.get("mode") or payload.get("state") or "").strip()
+        result = update_strategy_mode(strategy_id, new_mode)
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.patch("/api/registry/strategies/<int:strategy_id>/state")
+@debug_timing("registry_state_compat")
+def registry_strategies_state(strategy_id: int):
+    """Compatibility route for the old Stop/Virtual/Real endpoint."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        new_mode = str(payload.get("mode") or payload.get("state") or "").strip()
+        result = update_strategy_state(strategy_id, new_mode)
         return jsonify({"ok": True, "data": result})
     except ValueError as exc:
         return _json_error(exc, 400)
@@ -906,7 +2100,7 @@ def registry_strategy_state_store_get(strategy_id: int):
             "ok": True,
             "data": {
                 "strategy_id": strategy_id,
-                "mode": strategy.get("state") or "Stop",
+                "mode": strategy.get("mode") or strategy.get("state") or "Stop",
                 **strategy_state_payload(
                     strategy.get("strategy_code") or "",
                     read_strategy_state_bundle(strategy_id),
@@ -924,8 +2118,8 @@ def registry_strategy_state_store_patch(strategy_id: int, namespace: str):
         ns = str(namespace or "").strip().lower()
         if ns == "controls":
             ns = "user"
-        if ns not in {"user", "runtime"}:
-            return _json_error(ValueError("namespace must be controls/user or runtime"), 400)
+        if ns not in {"user", "runtime", "machine", "state"}:
+            return _json_error(ValueError("namespace must be controls/user, runtime, or machine/state"), 400)
         strategy = get_registry_strategy(strategy_id)
         if not strategy:
             return jsonify({"ok": False, "error": "strategy not found"}), 404
@@ -936,7 +2130,8 @@ def registry_strategy_state_store_patch(strategy_id: int, namespace: str):
         if not isinstance(values, dict):
             return _json_error(ValueError("state values must be a JSON object"), 400)
         force = bool(payload.get("force"))
-        if ns == "runtime" and strategy.get("state") != "Stop" and not force:
+        mode = strategy.get("mode") or strategy.get("state") or "Stop"
+        if ns == "runtime" and mode != "Stop" and not force:
             return _json_error(
                 ValueError("RuntimeState can only be edited while the strategy is Stop"),
                 400,
@@ -970,13 +2165,14 @@ def registry_strategy_state_store_reset(strategy_id: int, namespace: str):
         ns = str(namespace or "").strip().lower()
         if ns == "controls":
             ns = "user"
-        if ns not in {"user", "runtime"}:
-            return _json_error(ValueError("namespace must be controls/user or runtime"), 400)
+        if ns not in {"user", "runtime", "machine", "state"}:
+            return _json_error(ValueError("namespace must be controls/user, runtime, or machine/state"), 400)
         strategy = get_registry_strategy(strategy_id)
         if not strategy:
             return jsonify({"ok": False, "error": "strategy not found"}), 404
         force = str(request.args.get("force") or "").lower() in {"1", "true", "yes"}
-        if ns == "runtime" and strategy.get("state") != "Stop" and not force:
+        mode = strategy.get("mode") or strategy.get("state") or "Stop"
+        if ns == "runtime" and mode != "Stop" and not force:
             return _json_error(
                 ValueError("RuntimeState can only be reset while the strategy is Stop"),
                 400,
@@ -1180,4 +2376,5 @@ if __name__ == "__main__":
     ws_market_sync.start()
     collector.start()
     virtual_runner.start()
+    event_news_scheduler.start()
     app.run(host="127.0.0.1", port=5001, debug=False, use_reloader=False)

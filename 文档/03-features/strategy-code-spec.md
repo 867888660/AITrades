@@ -160,9 +160,16 @@ LegCount           当前策略 leg 数量
 
 ```text
 L{n}_ConditionId
+L{n}_LegUid
+L{n}_LegKind
+L{n}_AssetClass
+L{n}_Venue
+L{n}_Symbol
+L{n}_InstrumentId
 L{n}_MarketTitle
 L{n}_MarketStatus
 L{n}_BudgetCap
+L{n}_ConfiguredBudgetCap
 L{n}_BudgetMin
 L{n}_EndTime
 L{n}_DayToEnd
@@ -189,6 +196,12 @@ L{n}_{Side}_LastPrice
 
 L{n}_{Side}_BestAskQty
 L{n}_{Side}_BestBidQty
+L{n}_{Side}_AskLevels
+L{n}_{Side}_BidLevels
+L{n}_{Side}_AskDepthQty
+L{n}_{Side}_BidDepthQty
+L{n}_{Side}_AskDepthNotional
+L{n}_{Side}_BidDepthNotional
 
 L{n}_{Side}_PositionQty
 L{n}_{Side}_PositionAvgPrice
@@ -201,6 +214,13 @@ L{n}_{Side}_AvailableSellQty
 
 L{n}_{Side}_DataStatus
 L{n}_{Side}_LastUpdateAgeSec
+
+L{n}_{Side}_MACD
+L{n}_{Side}_MACDSignal
+L{n}_{Side}_MACDHist
+L{n}_{Side}_MACDHistPrev
+L{n}_{Side}_MACDHistSlope
+L{n}_{Side}_MACDSampleCount
 ```
 
 说明：
@@ -211,6 +231,12 @@ BidPrice              当前最优买价
 LastPrice             最新成交价
 BestAskQty            当前最优卖价数量
 BestBidQty            当前最优买价数量
+AskLevels             当前可见卖盘档位列表，按价格从低到高排序，元素格式为 {"price": 0.34, "qty": 34}
+BidLevels             当前可见买盘档位列表，按价格从高到低排序，元素格式为 {"price": 0.33, "qty": 20}
+AskDepthQty           当前返回订单簿卖盘总数量
+BidDepthQty           当前返回订单簿买盘总数量
+AskDepthNotional      当前返回订单簿卖盘总名义金额，sum(price * qty)
+BidDepthNotional      当前返回订单簿买盘总名义金额，sum(price * qty)
 PositionQty           当前持有期权数量
 PositionAvgPrice      当前持仓平均成本
 PositionCost          当前持仓成本金额
@@ -220,7 +246,15 @@ OpenSellQty           未完成卖单数量
 AvailableSellQty      可卖数量，通常等于 PositionQty - OpenSellQty
 DataStatus            ok / stale / missing
 LastUpdateAgeSec      数据距当前时间的秒数
+MACD                  基于该 side 近期可卖 bid 历史计算的 MACD 值
+MACDSignal            MACD 信号线
+MACDHist              MACD histogram，等于 MACD - MACDSignal
+MACDHistPrev          上一根 MACD histogram
+MACDHistSlope         MACDHist - MACDHistPrev
+MACDSampleCount       本次 MACD 计算使用的有效价格样本数
 ```
+
+Polymarket binary 的 MACD 由 `virtual_context_builder.build_use_data()` 从本地 `market_deltas` 最近盘口历史计算，并把当前 CLOB `/book` bid 作为最后一个样本补入。周期默认遵循策略参数中的 `macd_fast` / `macd_slow` / `macd_signal`，没有声明这些参数时使用 `6 / 13 / 5`。单腿策略还会得到兼容别名，例如 `Yes_MACDHist`、`Yes_MACDHistPrev`、`No_MACDHist`。
 
 ## 8. 外部行情字段
 
@@ -399,6 +433,10 @@ null          使用系统默认当前价格
 阿拉伯数字     使用指定价格，例如 0.42
 ```
 
+Virtual 模式下，`price=null` / `"nowprice"` 的 BUY 不再假设最优 ask 有无限数量，而是按 `L{leg}_{Side}_AskLevels` 从低到高扫档成交。例如买入 100 qty，若最低 ask 只有 34 qty，则先成交 34，再继续吃更高 ask，最终订单价格按实际成交 VWAP 写入账本。若可见订单簿不足，允许按可见深度部分成交，并在动作事件中记录 `partial_fill_book_depth`。
+
+当 `price` 是数字时，Virtual 会把它视为 taker limit 边界：BUY 只吃 `price <= limit` 的 ask 档；如果当前 UseData 没有深度列表，则回退到旧的一口价模拟。
+
 示例：
 
 ```json
@@ -463,6 +501,8 @@ null          使用系统默认当前价格
 阿拉伯数字     使用指定价格，例如 0.38
 ```
 
+Virtual 模式下，SELL 会按 `L{leg}_{Side}_BidLevels` 从高到低扫档成交，成交价同样按 VWAP 入账。数字 `price` 会作为 taker limit 边界：SELL 只吃 `price >= limit` 的 bid 档；可见买盘不足时按可见深度部分成交。
+
 ## 14. SETPOS 动作
 
 用于把某个 leg 的某个 side 调整到目标仓位比例。
@@ -492,7 +532,9 @@ target_pct    目标仓位比例，范围 0~1
 当前成本 = L{leg}_{Side}_PositionQty * L{leg}_{Side}_PositionAvgPrice
 
 如果 leg 显式配置了 `budget_cap > 0`，`L{leg}_BudgetCap` 使用该配置值。
-如果 `budget_cap = 0`，Virtual 模式下 `L{leg}_BudgetCap` 使用虚拟账户当前权益，首次账户不存在时才回退到 `StrategyBankroll`。
+如果是单腿策略或 L0，且 `budget_cap = 0`，Virtual 模式下 `L{leg}_BudgetCap` 使用虚拟账户当前权益，首次账户不存在时才回退到 `StrategyBankroll`。
+如果是多腿策略的非 L0 leg，`budget_cap = 0` 表示该 leg 没有交易预算；`L{leg}_BudgetCap` 保持 0，`SETPOS` 会跳过加仓。
+`L{leg}_ConfiguredBudgetCap` 始终保留用户配置值，策略可以用它区分“显式预算”和“动态预算”。
 如果 `StrategyBankroll <= 0` 但 leg 配置了 `budget_cap > 0`，虚拟账户初始化资金必须从所有 leg 的 `budget_cap` 合计派生；不能出现 `L{leg}_BudgetCap > 0` 但 `virtual_account.cash = 0` 的资金错配。
 
 如果目标成本 > 当前成本：
@@ -818,10 +860,12 @@ portfolio = usedata.get("Portfolio", {})
 {
   "index": 0,
   "instrument_id": "crypto:binance:BTCUSDT",
+  "leg_kind": "spot",
   "asset_class": "crypto_spot",
   "venue": "binance",
   "symbol": "BTCUSDT",
   "budget_cap": 100,
+  "configured_budget_cap": 100,
   "quote": {"bid": 65000, "ask": 65010, "last": 65005},
   "position": {"qty": 0.1, "avg_price": 62000}
 }
@@ -839,6 +883,15 @@ portfolio = usedata.get("Portfolio", {})
 ```
 
 下一轮运行时这些状态会出现在 `UseData["RuntimeState"]`。`UseData["State"]` 暂时保留为 `RuntimeState` 的兼容别名。
+
+如果策略需要读取人工可切换的状态机状态，应读取：
+
+```python
+strategy_state = usedata.get("StrategyState", {})
+machine_state = strategy_state.get("state") or usedata.get("MachineState") or "auto"
+```
+
+`StrategyState` 存在 `strategy_state.namespace = machine`，和 `Stop / Virtual / Real` 的运行 `mode` 是两个概念。
 
 如果策略需要读取用户人工干预，例如暂停开仓、强制平仓、风险缩放，应读取：
 
@@ -881,6 +934,15 @@ if user_state.get("manual_pause_open"):
 ParamsSchema = {}
 ControlsSchema = {}
 RuntimeStateSchema = {}
+StateMachineSchema = {
+    "default": "auto",
+    "states": [
+        {"value": "auto", "label": "Auto"},
+        {"value": "holding", "label": "Holding"},
+        {"value": "cooldown", "label": "Cooldown"},
+        {"value": "manual_review", "label": "Manual Review"},
+    ],
+}
 ```
 
 默认值写在策略代码里，数据库只保存 override。运行时：
@@ -889,6 +951,7 @@ RuntimeStateSchema = {}
 UseData["Params"]       = ParamsSchema defaults + input_json
 UseData["Controls"]     = ControlsSchema defaults + strategy_state(user)
 UseData["RuntimeState"] = RuntimeStateSchema defaults + strategy_state(runtime)
+UseData["StrategyState"] = {"state": StateMachineSchema default + strategy_state(machine).state}
 ```
 
 兼容别名：
@@ -896,6 +959,7 @@ UseData["RuntimeState"] = RuntimeStateSchema defaults + strategy_state(runtime)
 ```text
 UseData["UserState"] = UseData["Controls"]
 UseData["State"]     = UseData["RuntimeState"]
+UseData["MachineState"] = UseData["StrategyState"]["state"]
 ```
 
 推荐策略读取：

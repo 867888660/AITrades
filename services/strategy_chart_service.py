@@ -1237,7 +1237,7 @@ def _normalize_rows_with_required_buckets(
 def _apply_virtual_account_pnl_to_rows(detail: Dict[str, Any], rows: List[Dict[str, Any]], chart_interval_seconds: int = 0) -> List[Dict[str, Any]]:
     """For Virtual charts, replay filled orders into PnL and position columns.
     Returns aggregated trade events per bucket for chart tooltip alignment."""
-    if str(detail.get("state") or "").strip().lower() != "virtual" or not detail.get("row_id") or not rows:
+    if str(detail.get("mode") or detail.get("state") or "").strip().lower() != "virtual" or not detail.get("row_id") or not rows:
         return []
     try:
         conn = strategy_data_source.connect(readonly=True)
@@ -1530,11 +1530,72 @@ _STATE_COLORS = [
 ]
 
 
-def _state_color(value: Any, meta: Dict[str, Any], index: int) -> str:
+_BOOL_STATE_LABELS: Dict[str, Dict[bool, str]] = {
+    "cooldown_active": {True: "Cooldown active", False: "Cooldown inactive"},
+    "shock_cooldown_active": {True: "Shock cooldown active", False: "Shock cooldown inactive"},
+    "shock_block_active": {True: "Shock block active", False: "Shock block inactive"},
+    "manual_pause_open": {True: "Manual pause open", False: "Manual pause closed"},
+    "stop_loss_locked": {True: "Stop loss locked", False: "Stop loss unlocked"},
+    "force_flat": {True: "Force flat", False: "Force flat off"},
+    "rank_ok": {True: "Rank OK", False: "Rank not OK"},
+}
+
+_BOOL_STATE_COLORS: Dict[str, Dict[bool, str]] = {
+    "cooldown_active": {True: "#f59e0b", False: "#64748b"},
+    "shock_cooldown_active": {True: "#f97316", False: "#64748b"},
+    "shock_block_active": {True: "#ef4444", False: "#64748b"},
+    "manual_pause_open": {True: "#f97316", False: "#64748b"},
+    "stop_loss_locked": {True: "#ef4444", False: "#64748b"},
+    "force_flat": {True: "#f97316", False: "#64748b"},
+    "rank_ok": {True: "#22c55e", False: "#f59e0b"},
+}
+
+
+def _state_meta_for_value(value: Any, meta: Dict[str, Any]) -> Dict[str, Any]:
     states = meta.get("states") if isinstance(meta.get("states"), dict) else {}
-    state_meta = states.get(str(value)) if isinstance(states, dict) else None
+    state_meta = None
+    if isinstance(states, dict):
+        for candidate in (str(value), str(value).lower(), str(value).upper()):
+            state_meta = states.get(candidate)
+            if state_meta is not None:
+                break
+    return state_meta if isinstance(state_meta, dict) else {}
+
+
+def _bool_state_label(key: str, value: bool) -> str:
+    mapped = _BOOL_STATE_LABELS.get(key)
+    if mapped:
+        return mapped[value]
+    words = key.replace("_", " ").strip()
+    if words.endswith(" active"):
+        base = words[: -len(" active")].strip()
+        return f"{base.title()} {'active' if value else 'inactive'}"
+    if words.endswith(" open"):
+        base = words[: -len(" open")].strip()
+        return f"{base.title()} {'open' if value else 'closed'}"
+    if words.endswith(" locked"):
+        base = words[: -len(" locked")].strip()
+        return f"{base.title()} {'locked' if value else 'unlocked'}"
+    return "True" if value else "False"
+
+
+def _state_label(key: str, value: Any, meta: Dict[str, Any]) -> str:
+    state_meta = _state_meta_for_value(value, meta)
+    if state_meta.get("label"):
+        return str(state_meta.get("label"))
+    if isinstance(value, bool):
+        return _bool_state_label(str(key or ""), value)
+    return str(value)
+
+
+def _state_color(key: str, value: Any, meta: Dict[str, Any], index: int) -> str:
+    state_meta = _state_meta_for_value(value, meta)
     if isinstance(state_meta, dict) and state_meta.get("color"):
         return str(state_meta.get("color"))
+    if isinstance(value, bool):
+        color_map = _BOOL_STATE_COLORS.get(str(key or ""))
+        if color_map and value in color_map:
+            return color_map[value]
     return _STATE_COLORS[index % len(_STATE_COLORS)]
 
 
@@ -1570,8 +1631,8 @@ def _metric_state_lanes(
                     "from": start,
                     "to": min(end, to_ts),
                     "value": str(value),
-                    "label": str(value),
-                    "color": _state_color(value, meta.get("meta") or {}, idx),
+                    "label": _state_label(key, value, meta.get("meta") or {}),
+                    "color": _state_color(key, value, meta.get("meta") or {}, idx),
                     "lane": lane_index,
                 }
             )

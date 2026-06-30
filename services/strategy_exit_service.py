@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 
 from services.config_loader import BASE_DIR, load_web_settings
 from services.realtime_collector import collector
-from services.strategy_registry_service import get_strategy, update_strategy_state
+from services.strategy_registry_service import get_strategy, update_strategy_mode
 from services.virtual_context_builder import build_use_data
 from services.virtual_execution import execute_actions
 
@@ -44,11 +44,16 @@ def force_flat_strategy(strategy_id: int, *, actor: str = "user") -> Dict[str, A
     if not strategy:
         raise ValueError(f"strategy {strategy_id} not found")
 
-    state = str(strategy.get("state") or "Stop")
-    if state == "Real":
+    mode = str(strategy.get("mode") or strategy.get("state") or "Stop")
+    if mode == "Real":
         raise ValueError("Real force-flat is blocked until strategy_real_positions and order attribution are reconciled")
 
-    use_data = build_use_data(strategy, _realtime_db_path(), collector.get_state())
+    use_data = build_use_data(
+        strategy,
+        _realtime_db_path(),
+        collector.get_state(),
+        include_live_orderbook=False,
+    )
     actions = _force_flat_actions(use_data)
     orders_placed, errors = execute_actions(
         strategy_id,
@@ -60,12 +65,12 @@ def force_flat_strategy(strategy_id: int, *, actor: str = "user") -> Dict[str, A
         audit_tick_id=None,
         function_json_hash=f"manual_force_flat:{actor}",
     )
-    if state != "Stop":
-        update_strategy_state(strategy_id, "Stop")
+    if mode != "Stop":
+        update_strategy_mode(strategy_id, "Stop")
     return {
         "strategy_id": strategy_id,
-        "previous_state": state,
-        "state": "Stop",
+        "previous_mode": mode,
+        "mode": "Stop",
         "orders_placed": orders_placed,
         "errors": errors,
         "actions": actions,

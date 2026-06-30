@@ -20,5 +20,14 @@
   "strategy_metrics_db_dir": "strategy_metrics_dbs",
   "strategy_monitoring_table": "strategy_registry",
   "include_crypto_fundamentals": true,
-  "coingecko_api_key_header": "x-cg-demo-api-key"
+  "coingecko_api_key_header": "x-cg-demo-api-key",
+  "llm_settings": {
+    "enabled": false,
+    "provider": "dashscope_openai_compatible",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model": "qwen-plus",
+    "temperature": 0.2,
+    "max_tokens": 2048,
+    "timeout_sec": 60
+  }
 }

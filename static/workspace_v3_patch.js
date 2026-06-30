@@ -185,7 +185,10 @@
   window.renderSummary = function renderSummaryV3(strategy) {
     const bar = document.getElementById("workspaceLegsBar");
     if (!bar) return;
-    const state = strategy?.state || "Stop";
+    const validModes = ["Stop", "Virtual", "Real"];
+    const legacyState = validModes.includes(strategy?.state) ? strategy.state : "";
+    const mode = strategy?.mode || legacyState || "Stop";
+    const machineState = strategy?.machine_state || (!validModes.includes(strategy?.state) ? strategy?.state : "") || "auto";
     const pnl = Number(strategy?.strategy_pnl);
     const pnlClass = pnl > 0 ? "positive" : pnl < 0 ? "negative" : "";
     const yesQty = Number(strategy?.yes_qty || 0);
@@ -199,9 +202,10 @@
         <div class="ws3-leg-row"><span>Bankroll</span><span class="val">${fmtNum(strategy?.strategy_bankroll)}</span></div>
         <div class="ws3-leg-row"><span>Exposure</span><span class="val">${fmtNum(exposure)}</span></div>
         <div class="ws3-leg-row"><span>PnL</span><span class="val ws3-leg-pnl ${pnlClass}">${fmtNum(pnl)}</span></div>
-        <div class="ws3-leg-row"><span>State</span><span class="val">${esc(state)}</span></div>
+        <div class="ws3-leg-row"><span>Mode</span><span class="val">${esc(mode)}</span></div>
+        <div class="ws3-leg-row"><span>State</span><span class="val">${esc(machineState)}</span></div>
       </div>
-      <div class="ws3-leg-card ${esc(String(state).toLowerCase())}">
+      <div class="ws3-leg-card ${esc(String(mode).toLowerCase())}">
         <div class="ws3-leg-title">主市场 <span class="ws3-leg-direction observe">observe</span></div>
         <div class="ws3-leg-row"><span>Yes Bid/Ask</span><span class="val">${fmtNum(strategy?.yes_bid, 4)} / ${fmtNum(strategy?.yes_ask, 4)}</span></div>
         <div class="ws3-leg-row"><span>No Bid/Ask</span><span class="val">${fmtNum(strategy?.no_bid, 4)} / ${fmtNum(strategy?.no_ask, 4)}</span></div>
@@ -212,6 +216,9 @@
 
     if (window.syncWorkspaceStateControl) {
       window.syncWorkspaceStateControl(strategy || {});
+    }
+    if (window.syncWorkspaceMachineStateControl) {
+      window.syncWorkspaceMachineStateControl(strategy || {}, window.workspaceStateStore || null);
     }
   };
 

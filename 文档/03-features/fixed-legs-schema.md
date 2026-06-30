@@ -26,6 +26,7 @@ LegsSchema = [
         "name": "target_market",
         "label": "Leg 1",
         "purpose": "Primary Polymarket market traded by the strategy.",
+        "leg_kind": "binary_market",
         "asset_class": "polymarket_binary",
         "venue": "polymarket",
         "required": True,
@@ -34,6 +35,7 @@ LegsSchema = [
         "name": "hedge_crypto",
         "label": "Leg 2",
         "purpose": "External crypto signal or hedge instrument.",
+        "leg_kind": "spot",
         "asset_class": "crypto_spot",
         "venue": "binance",
         "symbol": "BTCUSDT",
@@ -43,6 +45,7 @@ LegsSchema = [
         "name": "reference_equity",
         "label": "Leg 3",
         "purpose": "Reference equity used by the strategy.",
+        "leg_kind": "equity",
         "asset_class": "equity",
         "venue": "US",
         "symbol": "NVDA",
@@ -56,6 +59,7 @@ LegsSchema = [
 ```python
 {
     "label": "Leg 1",
+    "leg_kind": "binary_market",
     "asset_class": "polymarket_binary",
     "venue": "polymarket",
     "required": True,
@@ -68,12 +72,14 @@ LegsSchema = [
 - UI 渲染固定数量的 legs，不提供自由 `+ Leg`。
 - `polymarket_binary` 显示 `condition_id` 和自选按钮。
 - `crypto_spot` / `equity` 显示 `venue + symbol`。
-- 每条 leg 可填写 `budget_cap`，未来可按 `params_schema` 扩展腿级参数。
+- `leg_kind` 是腿的标的/合约形态，未声明时按 `asset_class` 推导；策略运行时可读 `Instruments[n].leg_kind` 或 `L{n}_LegKind`。
+- 每条 leg 可填写 `budget_cap`，未来可按 `params_schema` 扩展腿级参数；多腿策略中非 L0 的 `budget_cap=0` 表示该 leg 没有交易预算。
 - 保存时写入 `strategy_legs`；`UseData["LegCount"]` 等于 schema 定义数量。
 - 修改 leg 身份字段会清理该策略虚拟盘状态，避免旧持仓错配到新标的。
 
 ## 当前落地
 
 - `strategy_schema_service.get_strategy_code_schemas()` 返回 `legs` schema。
+- `strategy_legs` 已保存 `leg_kind`，并在 UseData 中注入。
 - Dashboard 新增 / 编辑策略弹窗根据 `legs` schema 渲染固定腿。
 - 旧策略保持单腿 Polymarket 默认行为。

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>策略工作台</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
-    <link rel="stylesheet" href="{{ url_for('static', filename='workspace_v3.css') }}?v=20260515_settings_usedata">
+    <link rel="stylesheet" href="{{ url_for('static', filename='workspace_v3.css') }}?v=20260608_state_lanes">
   </head>
   <body data-row-id="{{ row_id }}">
     <div class="ws3-shell">
@@ -20,6 +20,9 @@
             <option value="Stop">Stop</option>
             <option value="Virtual">Virtual</option>
             <option value="Real">Real</option>
+          </select>
+          <select id="workspaceMachineStateSelect" class="state-select workspace-machine-state-select" data-prev="auto" aria-label="Strategy state">
+            <option value="auto">Auto</option>
           </select>
         </div>
         <div class="ws3-header-right">
@@ -173,7 +176,7 @@
     <script src="{{ url_for('static', filename='echarts.min.js') }}" onerror="this.src='https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js'"></script>
     <script src="{{ url_for('static', filename='polymarket_links.js') }}"></script>
     <script src="{{ url_for('static', filename='strategy_params_bulk.js') }}?v=20260523_param_bulk"></script>
-    <script src="{{ url_for('static', filename='strategy_workspace_v2.js') }}?v=20260525_schema_state"></script>
+    <script src="{{ url_for('static', filename='strategy_workspace_v2.js') }}?v=20260608_events_smooth_ref"></script>
     <script src="{{ url_for('static', filename='workspace_v3_patch.js') }}?v=20260514_events_stable"></script>
   </body>
 </html>

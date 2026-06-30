@@ -359,6 +359,7 @@ def compute_and_persist_strategy_profit() -> Dict[str, Any]:
             "running_strategy_count": 0,
             "total_strategy_profit": 0.0,
             "total_strategy_cost": 0.0,
+            "total_strategy_bankroll": 0.0,
             "total_strategy_return_pct": None,
             "rows": [],
             "source_statuses": source_statuses,
@@ -367,6 +368,7 @@ def compute_and_persist_strategy_profit() -> Dict[str, Any]:
     results = []
     total_profit = 0.0
     total_cost = 0.0
+    total_bankroll = 0.0
     position_updates: List[Dict[str, Any]] = []
 
     for strat in strategies:
@@ -380,7 +382,7 @@ def compute_and_persist_strategy_profit() -> Dict[str, Any]:
         yes_price, no_price = _fetch_live_leg_prices(yes_token, no_token, leg)
 
         # Virtual 模式：从 strategy_virtual_positions 读持仓
-        is_virtual = str(strat.get("state") or "").strip().lower() == "virtual"
+        is_virtual = str(strat.get("mode") or strat.get("state") or "").strip().lower() == "virtual"
         if is_virtual:
             vpos = _fetch_virtual_positions(strategy_id)
             yes_vp = vpos.get((0, "YES"), {})
@@ -423,6 +425,7 @@ def compute_and_persist_strategy_profit() -> Dict[str, Any]:
         flat_item = strategy_data_source.strategy_to_flat_dict(strat)
         yes_pic, no_pic = calculate_position_pcts(flat_item, yes_qty, yes_price, no_qty, no_price)
         strategy_bankroll = resolve_strategy_bankroll(flat_item)
+        total_bankroll += strategy_bankroll or 0.0
         profit = 0.0
         cost = 0.0
         if yes_avg is not None:
@@ -472,13 +475,14 @@ def compute_and_persist_strategy_profit() -> Dict[str, Any]:
         strategy_data_source.update_strategy_profit(row["row_id"], row["profit"])
 
     running_count = sum(1 for row in results if (row["yes_qty"] or 0) > 0 or (row["no_qty"] or 0) > 0)
-    total_return_pct = (total_profit / total_cost) if total_cost > 0 else None
+    total_return_pct = (total_profit / total_bankroll) if total_bankroll > 0 else None
     return {
         "ok": True,
         "table": "strategy_registry",
         "running_strategy_count": running_count,
         "total_strategy_profit": total_profit,
         "total_strategy_cost": total_cost,
+        "total_strategy_bankroll": total_bankroll,
         "total_strategy_return_pct": total_return_pct,
         "rows": results,
         "source_statuses": source_statuses,

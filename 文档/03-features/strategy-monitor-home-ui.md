@@ -62,7 +62,7 @@ Risk
 
 这些都属于 leg 级或工作台级信息。
 
-`Mode` 是策略监控首页的运行状态切换入口；单策略工作台 header 也提供同一逻辑的局部入口：
+`Mode` 是策略监控首页的运行模式切换入口；单策略工作台 header 也提供同一逻辑的局部入口：
 
 ```text
 Stop | Virtual | Real
@@ -70,11 +70,19 @@ Stop | Virtual | Real
 
 一致性要求：
 
-- 两个入口都读写 `strategy_registry.state`。
-- 两个入口都调用 `PATCH /api/registry/strategies/<id>/state`。
+- 两个入口都读写 `strategy_registry.mode`。
+- 两个入口都调用 `PATCH /api/registry/strategies/<id>/mode`。
 - 两个入口都使用相同三态颜色：`Stop` 灰色 / slate，`Virtual` 蓝色，`Real` 绿色。
-- 两个入口都只改变策略状态，不自动迁移仓位、订单或 PnL。
+- 两个入口都只改变运行模式，不自动迁移仓位、订单或 PnL。
 - 涉及 `Virtual <-> Real`、`Stop -> Real`、`Real -> Stop` 的高风险切换必须弹确认提示。
+
+`State` 是独立的策略状态机入口：
+
+- 首页表格与工作台 header 都显示当前 `state`。
+- 数据源是 `strategy_state.namespace = machine` 的 `state` 键。
+- 保存接口是 `PATCH /api/registry/strategies/<id>/state-store/machine`。
+- 选项来自策略代码 `StateMachineSchema`；未声明时回退到默认状态集合。
+- `State` 不影响 Stop / Virtual / Real 调度，调度只看 `mode`。
 
 `Action` 列保留：
 

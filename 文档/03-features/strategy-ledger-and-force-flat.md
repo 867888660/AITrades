@@ -28,7 +28,7 @@ Dashboard 侧边栏新增 `Ledger` 入口。策略监控表每行新增 `平仓`
 | 区域 | 数据源 | 说明 |
 |---|---|---|
 | 策略 | `strategy_registry` | 策略名称、代码、状态、资金 |
-| Leg 归属 | `strategy_legs` | `leg_uid`、`asset_class`、`venue`、`symbol`、`instrument_id`、Polymarket token |
+| Leg 归属 | `strategy_legs` | `leg_uid`、`leg_kind`、`asset_class`、`venue`、`symbol`、`instrument_id`、Polymarket token |
 | 虚拟挂单 | `strategy_virtual_open_orders` | open / partially_filled 虚拟挂单 |
 | 虚拟持仓 v1 | `strategy_virtual_positions` | 旧 Polymarket 二元市场持仓，按 `strategy_id + leg_index + side` |
 | 虚拟持仓 v2 | `strategy_virtual_positions_v2` | 多资产持仓，按 `strategy_id + instrument_id + side` |

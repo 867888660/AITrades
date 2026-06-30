@@ -57,6 +57,20 @@ RuntimeStateSchema = {
     "last_action_at": {"type": "string", "default": None, "label": "上次动作时间"},
 }
 
+StateMachineSchema = {
+    "default": "auto",
+    "label": "Strategy State",
+    "states": [
+        {"value": "auto", "label": "Auto"},
+        {"value": "P0_EMPTY", "label": "Empty"},
+        {"value": "P1_YES_HALF", "label": "Yes Half"},
+        {"value": "P2_YES_FULL", "label": "Yes Full"},
+        {"value": "P3_NO_HALF", "label": "No Half"},
+        {"value": "P4_NO_FULL", "label": "No Full"},
+        {"value": "manual_review", "label": "Manual Review"},
+    ],
+}
+
 FunctionIntroduction = (
     "组件功能：Fllow_Stock_Value（股票市值排名跟随策略）。\n\n"
     "参数：\n"

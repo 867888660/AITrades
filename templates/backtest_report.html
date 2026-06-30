@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Backtest Report</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='workspace_v3.css') }}?v=20260629_backtest_download_prompt1">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260629_backtest_download_prompt1">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">DT</div>
+          <div>
+            <div class="brand-title">DataTube</div>
+            <div class="brand-subtitle">Backtest Report</div>
+          </div>
+        </div>
+        <nav class="nav">
+          <a class="nav-link" href="/" target="_blank" rel="noopener noreferrer">Dashboard</a>
+          <a class="nav-link active" href="/history" target="_blank" rel="noopener noreferrer">History</a>
+          <a class="nav-link" href="/watchlist" target="_blank" rel="noopener noreferrer">Watchlist</a>
+          <a class="nav-link" href="/settings" target="_blank" rel="noopener noreferrer">Settings</a>
+        </nav>
+        <div class="sidebar-note">
+          回测报告保存当次样例、策略代码、参数和 legs 快照；可以在报告页调整测试时间段并重新运行。
+        </div>
+      </aside>
+
+      <main class="page history-page backtest-report-page">
+        <header class="history-header">
+          <div>
+            <span class="eyebrow">Backtest Report</span>
+            <h1 id="reportTitle">回测报告</h1>
+            <p id="reportMeta" class="muted">加载中...</p>
+          </div>
+          <div class="table-actions">
+            <a class="mini ghost" href="/history" target="_blank" rel="noopener noreferrer">返回历史工作台</a>
+            <button id="reportRefreshBtn" class="mini" type="button">刷新</button>
+          </div>
+        </header>
+
+        <section id="reportStatus" class="panel report-status">
+          <div class="status">加载报告中...</div>
+        </section>
+
+        <section class="panel report-window-editor">
+          <div class="panel-header compact">
+            <div>
+              <h2>测试时间段</h2>
+              <p class="muted">直接编辑当前报告的回测窗口，然后重跑同一个 run。</p>
+            </div>
+            <div class="table-actions">
+              <button id="reportUseActualWindowBtn" class="mini ghost" type="button">使用当前结果区间</button>
+              <button id="reportRerunBtn" class="mini" type="button">重新回测</button>
+            </div>
+          </div>
+          <div class="report-window-form">
+            <label>
+              From
+              <input id="reportWindowStart" type="datetime-local">
+            </label>
+            <label>
+              To
+              <input id="reportWindowEnd" type="datetime-local">
+            </label>
+            <span id="reportWindowHint" class="muted">留空时系统会自动选择可用历史区间。</span>
+          </div>
+        </section>
+
+        <section>
+          <div class="panel-header">
+            <div>
+              <h2>技术总结</h2>
+              <p class="muted">收益、风险、测试时间窗口和交易规模。</p>
+            </div>
+          </div>
+          <div id="reportMetrics" class="metric-grid report-metric-grid"></div>
+        </section>
+
+        <section class="grid two report-main-grid">
+          <article class="panel report-chart-panel">
+            <div class="panel-header">
+              <div>
+                <h2>资金曲线</h2>
+                <p id="reportEquityMeta" class="muted">回测完成后显示账户净值曲线。</p>
+              </div>
+            </div>
+            <div id="reportEquityChart" class="report-equity-chart"></div>
+            <div id="reportEquity"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>测试 Legs</h2>
+                <p class="muted">创建 run 时固化的样例快照。</p>
+              </div>
+            </div>
+            <div id="reportLegs"></div>
+          </article>
+        </section>
+
+        <section class="grid two">
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>订单明细</h2>
+                <p class="muted">信号触发后的模拟成交和费用。</p>
+              </div>
+            </div>
+            <div id="reportOrders"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-header">
+              <div>
+                <h2>事件日志</h2>
+                <p class="muted">数据补齐、兼容性、执行和失败原因。</p>
+              </div>
+            </div>
+            <div id="reportEvents"></div>
+          </article>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      window.BACKTEST_RUN_ID = {{ run_id | tojson }};
+    </script>
+    <script src="{{ url_for('static', filename='echarts.min.js') }}" onerror="this.src='https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js'"></script>
+    <script src="{{ url_for('static', filename='backtest_report.js') }}?v=20260629_backtest_download_prompt1"></script>
+  </body>
+</html>

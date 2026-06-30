@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>EventGraph</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=eventgraph-art-20260627">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">EG</div>
+          <div>
+            <div class="brand-title">EventGraph</div>
+            <div class="brand-subtitle">Event Intelligence</div>
+          </div>
+        </div>
+        <nav class="nav">
+          <a class="nav-link" href="/" target="_blank" rel="noopener noreferrer">Dashboard</a>
+          <a class="nav-link active" href="/event-graph" target="_blank" rel="noopener noreferrer">EventGraph</a>
+          <a class="nav-link" href="/ledger" target="_blank" rel="noopener noreferrer">Ledger</a>
+          <a class="nav-link" href="/agent-monitor" target="_blank" rel="noopener noreferrer">AgentMonitor</a>
+          <a class="nav-link" href="/watchlist" target="_blank" rel="noopener noreferrer">Watchlist</a>
+          <a class="nav-link" href="/settings" target="_blank" rel="noopener noreferrer">Settings</a>
+        </nav>
+        <div class="sidebar-note">
+          第一版从 Polymarket 热门市场即时生成 derived preview：Event、Market、Signal、Finance 关系均可回滚重建。
+        </div>
+      </aside>
+
+      <main class="page event-graph-page">
+        <header class="hero hero-gradient event-graph-hero">
+          <div>
+            <span class="eyebrow">Event Intelligence Graph</span>
+            <h1>EventGraph</h1>
+            <p>把热门事件、市场信号和金融产品放进同一个可查询关系图，先验证交互，再接入正式存储和 CLI ingestion。</p>
+          </div>
+          <div class="hero-actions">
+            <div id="eventGraphBadge" class="badge">Preview</div>
+            <button id="eventGraphRefreshBtn" class="secondary" type="button">刷新图谱</button>
+          </div>
+        </header>
+
+        <section id="eventGraphStats" class="stats-grid event-graph-stats"></section>
+
+        <section class="event-graph-shell">
+          <aside class="panel event-graph-filter-panel">
+            <div class="panel-header compact">
+              <div>
+                <h2>筛选</h2>
+                <p class="muted">按事件、资产、市场问题或分类检索。</p>
+              </div>
+            </div>
+            <form id="eventGraphForm" class="form event-graph-form">
+              <label>
+                搜索
+                <input id="eventGraphSearch" name="q" placeholder="BTC / Trump / Hormuz / rates">
+              </label>
+              <label>
+                分类
+                <input id="eventGraphCategoryInput" name="category" value="Politics,Crypto,Elections,Economics,Geopolitics,World" placeholder="留空表示全部">
+              </label>
+              <div class="grid two event-graph-filter-grid">
+                <label>
+                  排序
+                  <select id="eventGraphSort" name="sort">
+                    <option value="volume24h" selected>24h 热度</option>
+                    <option value="volume">总成交量</option>
+                    <option value="liquidity">流动性</option>
+                    <option value="price_change_24h">价格变化</option>
+                    <option value="updated_at">最近更新</option>
+                    <option value="end_date">到期时间</option>
+                  </select>
+                </label>
+                <label>
+                  数量
+                  <input id="eventGraphLimit" name="limit" type="number" min="10" max="180" value="80">
+                </label>
+              </div>
+              <div class="event-graph-toggles">
+                <label class="checkbox"><input id="showEventsToggle" type="checkbox" checked> Event</label>
+                <label class="checkbox"><input id="showFinanceToggle" type="checkbox" checked> Finance</label>
+                <label class="checkbox"><input id="showSignalsToggle" type="checkbox" checked> Signal</label>
+              </div>
+              <button type="submit">查询图谱</button>
+            </form>
+            <div class="event-graph-category-head">
+              <span>市场分类</span>
+              <button id="clearEventGraphCategory" class="mini ghost" type="button">清空</button>
+            </div>
+            <div id="eventGraphCategories" class="event-graph-category-list"></div>
+            <div class="event-graph-rank-head">高热度 Event</div>
+            <div id="eventGraphRankings" class="event-graph-rankings"></div>
+          </aside>
+
+          <section class="panel event-graph-canvas-panel">
+            <div class="panel-header compact">
+              <div>
+                <h2>关系图</h2>
+                <p id="eventGraphMeta" class="muted">加载中...</p>
+              </div>
+              <div class="event-graph-legend">
+                <span class="legend-dot event"></span>Event
+                <span class="legend-dot finance"></span>Finance
+                <span class="legend-dot signal"></span>Signal
+              </div>
+            </div>
+            <div class="event-graph-toolbar" aria-label="Graph controls">
+              <button id="eventGraphLocateBtn" class="mini" type="button">定位选中</button>
+              <button id="eventGraphZoomInBtn" class="mini ghost" type="button">+</button>
+              <button id="eventGraphZoomOutBtn" class="mini ghost" type="button">-</button>
+              <button id="eventGraphResetViewBtn" class="mini ghost" type="button">重置视图</button>
+            </div>
+            <div id="eventGraphCanvas" class="event-graph-canvas"></div>
+          </section>
+
+          <aside class="panel event-graph-detail-panel">
+            <div class="panel-header compact">
+              <div>
+                <h2>详情</h2>
+                <p class="muted">点击节点查看来源、热度、市场和关系。</p>
+              </div>
+            </div>
+            <div id="eventGraphDetails" class="event-graph-details"></div>
+          </aside>
+        </section>
+      </main>
+    </div>
+    <script src="{{ url_for('static', filename='echarts.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='event_graph.js') }}?v=eventgraph-art-20260627"></script>
+  </body>
+</html>

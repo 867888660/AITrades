@@ -13,7 +13,7 @@
 - 支持按 `conditionId`、`tokenId`、关键词搜索并点击选择任意期权。
 - 时间范围支持快捷范围、自定义起止时间和拖动缩放。
 - 图表支持系列样式编辑，以及 `MA` / `MACD` 技术指标参数配置。
-- 工作台左上角支持和策略监控首页一致的 `Stop` / `Virtual` / `Real` 三态切换。
+- 工作台左上角支持和策略监控首页一致的 `Stop` / `Virtual` / `Real` mode 切换，并可查看/手动切换策略状态机 state。
 - 当 24h/6h 范围内只有很少市场历史点时，图表会使用前序快照补一个区间起点，避免“接口成功但图上看不到线”。
 - 支持命名工作台预设的保存、加载和删除。
 - 为回测系统预留了 UI 和 API 契约。
@@ -23,7 +23,7 @@
 - 工作台通过 SSE 实时接收策略摘要和事件追加推送。
 - 多 Leg 策略图表使用预定义颜色对（8 组 yes/no 配色），自动按 leg_index 分配。
 - 图表工具栏新增间隔选择器（5s / 30s / 1m / 5m），控制采样粒度。
-- 图表上方新增 Legs Bar 策略汇总区，展示 Bankroll、PnL、State 和主市场盘口/持仓快照。
+- 图表上方新增 Legs Bar 策略汇总区，展示 Bankroll、PnL、Mode、State 和主市场盘口/持仓快照。
 
 ## 页面入口
 
@@ -47,17 +47,17 @@ strategy_workspace.html
 
 其中 `strategy_workspace_v2.js` 负责核心状态、请求、图表和保存逻辑；`workspace_v3_patch.js` 负责 V3 布局和若干展示层覆盖；`workspace_v3.css` 负责当前工作台视觉样式。
 
-## 运行状态切换
+## Mode 与 State 切换
 
-工作台标题区的状态控件与策略监控首页 `Mode` 列使用同一套逻辑：
+工作台标题区的 `Mode` 控件与策略监控首页 `Mode` 列使用同一套逻辑：
 
 ```text
 Stop | Virtual | Real
 ```
 
-- 数据源是 `strategy_registry.state`，不是旧的 `IsVirtual`。
-- 保存接口是 `PATCH /api/registry/strategies/<row_id>/state`。
-- 请求体示例：`{ "state": "Virtual" }`。
+- 数据源是 `strategy_registry.mode`，不是旧的 `IsVirtual`。
+- 保存接口是 `PATCH /api/registry/strategies/<row_id>/mode`。
+- 请求体示例：`{ "mode": "Virtual" }`。
 - 后端只校验目标值必须属于 `Stop` / `Virtual` / `Real`，不会自动迁移仓位、订单或 PnL。
 - 前端负责高风险切换确认，工作台与策略监控首页文案和行为应保持一致。
 
@@ -66,6 +66,14 @@ Stop | Virtual | Real
 - `Stop`：策略不参与虚拟盘调度，也不代表实盘自动动作。
 - `Virtual`：由 `VirtualRunner` 调度虚拟盘逻辑，写入虚拟账户、虚拟订单和虚拟事件。
 - `Real`：代表实盘模式入口；从 `Virtual` 切到 `Real` 不会把虚拟仓位迁移到真实账户。
+
+工作台标题区和参数面板还提供独立的 `State` 控件：
+
+- 数据源是 `strategy_state.namespace = machine` 的 `state` 键。
+- 保存接口是 `PATCH /api/registry/strategies/<row_id>/state-store/machine`。
+- 请求体示例：`{ "values": { "state": "manual_review" }, "replace": false }`。
+- 选项来自策略代码 `StateMachineSchema`；未声明时使用 `auto / idle / holding / cooldown / manual_review / stop_loss_locked` 默认集合。
+- `State` 不决定虚拟盘/实盘调度，调度仍只看 `mode`。
 
 颜色约定：
 

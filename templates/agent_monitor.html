@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AgentMonitor</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=agent-monitor-split-20260628">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">DT</div>
+          <div>
+            <div class="brand-title">DataTube</div>
+            <div class="brand-subtitle">Agent Monitor</div>
+          </div>
+        </div>
+        <nav class="nav">
+          <a class="nav-link" href="/" target="_blank" rel="noopener noreferrer">Dashboard</a>
+          <a class="nav-link" href="/event-graph" target="_blank" rel="noopener noreferrer">EventGraph</a>
+          <a class="nav-link" href="/ledger" target="_blank" rel="noopener noreferrer">Ledger</a>
+          <a class="nav-link active" href="/agent-monitor" target="_blank" rel="noopener noreferrer">AgentMonitor</a>
+          <a class="nav-link" href="/watchlist" target="_blank" rel="noopener noreferrer">Watchlist</a>
+          <a class="nav-link" href="/settings" target="_blank" rel="noopener noreferrer">Settings</a>
+        </nav>
+        <div class="sidebar-note">
+          单独查看 agent 当前动作、待人工确认策略、草案、风控与模拟结果。
+        </div>
+      </aside>
+
+      <main class="page agent-monitor-page">
+        <header class="hero hero-gradient">
+          <div>
+            <span class="eyebrow">Agent Operations Window</span>
+            <h1>AgentMonitor</h1>
+            <p>集中处理 agent 提交、审批、活动日志和策略草案。</p>
+          </div>
+          <div class="hero-actions">
+            <a class="button-link secondary-link" href="/settings" target="_blank" rel="noopener noreferrer">Agent 权限</a>
+            <button id="refreshAgentBtn" class="secondary" type="button">刷新</button>
+          </div>
+        </header>
+
+        <section class="agent-workbench agent-monitor-workbench">
+          <div class="panel-header">
+            <div>
+              <h2>Agent 工作台</h2>
+              <p id="agentMeta" class="muted">分开查看 EventGraph 变更、外接策略 Agent 和完整审计流水。</p>
+            </div>
+          </div>
+          <div class="agent-monitor-tabs" role="tablist" aria-label="AgentMonitor views">
+            <button class="agent-monitor-tab active" type="button" data-agent-monitor-tab="overview">总览</button>
+            <button class="agent-monitor-tab" type="button" data-agent-monitor-tab="internal">EventGraph 变更</button>
+            <button class="agent-monitor-tab" type="button" data-agent-monitor-tab="external">外接 Agent</button>
+            <button class="agent-monitor-tab" type="button" data-agent-monitor-tab="audit">审计日志</button>
+          </div>
+
+          <div class="agent-monitor-pane active" data-agent-monitor-pane="overview">
+            <div id="agentOverviewCards" class="agent-overview-grid"></div>
+            <div class="agent-grid">
+              <article class="panel agent-panel">
+                <div class="agent-panel-head">
+                  <h3>待处理策略</h3>
+                  <span id="agentOverviewPendingCount" class="badge">0</span>
+                </div>
+                <div id="agentOverviewPending" class="agent-list compact"></div>
+              </article>
+              <article class="panel agent-panel">
+                <div class="agent-panel-head">
+                  <h3>最近图谱变更</h3>
+                  <span id="agentOverviewInternalCount" class="badge">0</span>
+                </div>
+                <div id="agentOverviewInternal" class="agent-list compact"></div>
+              </article>
+            </div>
+          </div>
+
+          <div class="agent-monitor-pane" data-agent-monitor-pane="internal">
+            <div class="agent-grid">
+              <article class="panel agent-panel agent-panel-wide internal-event-search-panel">
+                <div class="agent-panel-head">
+                  <div>
+                    <h3>提交变更请求</h3>
+                    <p id="graphChangeMeta" class="muted">外部 agent 先校验 patch，再提交 change request。</p>
+                  </div>
+                  <a class="button-link internal-event-graph-link" href="/event-graph" target="_blank" rel="noopener noreferrer">打开图谱</a>
+                </div>
+                <form id="graphChangeForm" class="graph-change-form">
+                  <label>
+                    类型
+                    <select id="graphChangeType">
+                      <option value="event_create">event_create</option>
+                      <option value="event_update">event_update</option>
+                      <option value="edge_create">edge_create</option>
+                      <option value="edge_update">edge_update</option>
+                      <option value="edge_delete">edge_delete</option>
+                      <option value="finance_create">finance_create</option>
+                      <option value="finance_update">finance_update</option>
+                      <option value="finance_archive">finance_archive</option>
+                      <option value="finance_mapping_create">finance_mapping_create</option>
+                      <option value="event_archive">event_archive</option>
+                      <option value="event_merge">event_merge</option>
+                      <option value="expression_create">expression_create</option>
+                      <option value="expression_update">expression_update</option>
+                      <option value="expression_archive">expression_archive</option>
+                      <option value="observation_link">observation_link</option>
+                      <option value="metadata_update">metadata_update</option>
+                    </select>
+                  </label>
+                  <label>
+                    标题
+                    <input id="graphChangeTitle" type="text" placeholder="例如：新增霍尔木兹事件影响关系">
+                  </label>
+                  <label class="graph-change-wide">
+                    Evidence
+                    <textarea id="graphChangeEvidence" rows="3" placeholder="证据摘要、来源 URL、需要人工审核的重点"></textarea>
+                  </label>
+                  <label class="graph-change-wide">
+                    Patch JSON
+                    <textarea id="graphChangePatch" rows="8" spellcheck="false">{
+  "items": [
+    {
+      "action": "edge_create",
+      "source_id": "evt_example",
+      "source_type": "event",
+      "target_id": "fin_example",
+      "target_type": "finance",
+      "relation_class": "IMPACT",
+      "relation_type": "ASSOCIATED",
+      "confidence": 0.55,
+      "mechanism": "brief mechanism",
+      "evidence_refs": []
+    }
+  ]
+}</textarea>
+                  </label>
+                  <div class="graph-change-actions">
+                    <button id="graphChangeValidateBtn" class="secondary" type="button">校验</button>
+                    <button id="graphChangeSubmitBtn" type="submit">提交请求</button>
+                  </div>
+                </form>
+                <div id="graphChangeValidation" class="internal-event-search-result"></div>
+              </article>
+              <article class="panel agent-panel agent-panel-wide">
+                <div class="agent-panel-head">
+                  <div>
+                    <h3>Change Requests</h3>
+                    <p class="muted">外部 agent 提交的 EventGraph 修改请求，等待校验、修改或人工审核。</p>
+                  </div>
+                  <span id="agentInternalCount" class="badge">0</span>
+                </div>
+                <div id="agentInternalList" class="agent-list"></div>
+              </article>
+            </div>
+          </div>
+
+          <div class="agent-monitor-pane" data-agent-monitor-pane="external">
+            <div class="agent-grid">
+            <article class="panel agent-panel">
+              <div class="agent-panel-head">
+                <h3>待人工确认</h3>
+                <span id="agentPendingCount" class="badge">0</span>
+              </div>
+              <div id="agentPendingApprovals" class="agent-list"></div>
+            </article>
+            <article class="panel agent-panel agent-panel-wide">
+              <div class="agent-panel-head">
+                <h3>策略草案</h3>
+                <span id="agentDraftCount" class="badge">0</span>
+              </div>
+              <div id="agentDraftList" class="agent-list"></div>
+            </article>
+            <article class="panel agent-panel agent-panel-wide">
+              <div class="agent-panel-head">
+                <div>
+                  <h3>外接 Agent 最近活动</h3>
+                  <p class="muted">包含市场扫描、草案、风控、模拟和审批提交。</p>
+                </div>
+                <span id="agentExternalActivityCount" class="badge">0</span>
+              </div>
+              <div id="agentExternalActivityList" class="agent-list compact"></div>
+            </article>
+            </div>
+          </div>
+
+          <div class="agent-monitor-pane" data-agent-monitor-pane="audit">
+            <div class="agent-grid">
+            <article class="panel agent-panel agent-panel-wide">
+              <div class="agent-panel-head agent-activity-head">
+                <div>
+                  <h3>完整审计日志</h3>
+                  <p id="agentActivityModeLabel" class="muted">全部类别</p>
+                </div>
+                <div class="agent-activity-head-actions">
+                  <span id="agentActivityCount" class="badge">0</span>
+                  <button id="agentActivityClearBtn" class="mini ghost" type="button">清除当前</button>
+                </div>
+              </div>
+              <div class="agent-activity-toolbar">
+                <input id="agentActivitySearch" type="search" placeholder="搜索 capability / actor / target / 内容">
+                <select id="agentActivityCategory">
+                  <option value="all">全部类别</option>
+                </select>
+                <button id="agentActivityPinBtn" class="mini ghost" type="button">固定</button>
+              </div>
+              <div id="agentActivityFilters" class="agent-activity-filters"></div>
+              <div id="agentActivityList" class="agent-list compact"></div>
+            </article>
+          </div>
+          </div>
+        </section>
+
+        <div id="agentApprovalModal" class="modal-overlay" hidden>
+          <div class="modal-glass agent-approval-glass">
+            <button class="modal-close" id="agentApprovalModalClose" type="button" aria-label="关闭">&times;</button>
+            <div class="modal-header">
+              <div>
+                <h3 id="agentApprovalTitle">Agent 策略审批</h3>
+                <p id="agentApprovalSubtitle" class="muted">审批前查看完整参数、市场、预算、风控和模拟。</p>
+              </div>
+            </div>
+            <div id="agentApprovalBody" class="agent-approval-body"></div>
+            <div class="modal-actions">
+              <button id="agentApprovalSaveBtn" class="mini ghost" type="button">保存修改</button>
+              <button id="agentApprovalApproveBtn" class="mini" type="button">批准</button>
+              <button id="agentApprovalChangeBtn" class="mini ghost" type="button">要求修改</button>
+              <button id="agentApprovalRejectBtn" class="mini danger" type="button">拒绝</button>
+              <button id="agentApprovalCloseBtn" class="mini ghost" type="button">关闭</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="agentAuditModal" class="modal-overlay" hidden>
+          <div class="modal-glass agent-audit-glass">
+            <button class="modal-close" id="agentAuditModalClose" type="button" aria-label="关闭">&times;</button>
+            <div class="modal-header">
+              <div>
+                <h3 id="agentAuditTitle">Activity Detail</h3>
+                <p id="agentAuditSubtitle" class="muted">查看 agent 请求、输入、输出摘要和策略对象。</p>
+              </div>
+            </div>
+            <div id="agentAuditBody" class="agent-audit-body"></div>
+            <div class="modal-actions">
+              <button id="agentAuditCloseBtn" class="mini ghost" type="button">关闭</button>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+    <script src="{{ url_for('static', filename='agent_monitor.js') }}?v=agent-monitor-split-20260628"></script>
+  </body>
+</html>

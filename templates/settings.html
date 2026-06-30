@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>DataTube Settings</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=llm-settings-20260628">
   </head>
   <body>
     <div class="app-shell">
@@ -18,6 +18,10 @@
         </div>
         <nav class="nav">
           <a class="nav-link" href="/" target="_blank" rel="noopener noreferrer">Dashboard</a>
+          <a class="nav-link" href="/event-graph" target="_blank" rel="noopener noreferrer">EventGraph</a>
+          <a class="nav-link" href="/ledger" target="_blank" rel="noopener noreferrer">Ledger</a>
+          <a class="nav-link" href="/agent-monitor" target="_blank" rel="noopener noreferrer">AgentMonitor</a>
+          <a class="nav-link" href="/watchlist" target="_blank" rel="noopener noreferrer">Watchlist</a>
           <a class="nav-link active" href="/settings" target="_blank" rel="noopener noreferrer">Settings</a>
         </nav>
         <div class="sidebar-note">
@@ -38,6 +42,7 @@
           <div class="glass-tabs">
             <button type="button" class="tab-btn active" data-tab="api">API & 数据源</button>
             <button type="button" class="tab-btn" data-tab="wallet">钱包 & 策略</button>
+            <button type="button" class="tab-btn" data-tab="agent">Agent 权限</button>
             <button type="button" class="tab-btn" data-tab="refresh">刷新 & 采集</button>
           </div>
           <form id="settingsForm" class="form">
@@ -63,6 +68,54 @@
                   <input id="coingeckoApiHeader" placeholder="默认 x-cg-demo-api-key">
                 </label>
               </div>
+
+              <section class="settings-section">
+                <div class="settings-section-head">
+                  <h2>LLM Provider</h2>
+                  <p>内置调查 Agent 和 EventGraph Proposal 会使用这里的 OpenAI-compatible 模型配置；第一版仅启用阿里百炼兼容模式。</p>
+                </div>
+                <div class="grid three">
+                  <label class="switch">
+                    <input id="llmEnabled" type="checkbox">
+                    <span>启用 LLM 调查能力</span>
+                  </label>
+                  <label>
+                    平台
+                    <select id="llmProvider">
+                      <option value="dashscope_openai_compatible">阿里百炼 OpenAI 兼容模式</option>
+                    </select>
+                  </label>
+                  <label>
+                    模型名称
+                    <input id="llmModel" placeholder="例如 qwen-plus / qwen-max">
+                  </label>
+                </div>
+                <div class="grid two">
+                  <label>
+                    Base URL
+                    <input id="llmBaseUrl" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1">
+                  </label>
+                  <label>
+                    API Key
+                    <input id="llmApiKey" type="password" autocomplete="off" placeholder="sk-...">
+                  </label>
+                </div>
+                <div class="grid three">
+                  <label>
+                    Temperature
+                    <input id="llmTemperature" type="number" min="0" max="2" step="0.1">
+                  </label>
+                  <label>
+                    Max Tokens
+                    <input id="llmMaxTokens" type="number" min="1" max="32768" step="1">
+                  </label>
+                  <label>
+                    Timeout 秒
+                    <input id="llmTimeoutSec" type="number" min="5" max="300" step="1">
+                  </label>
+                </div>
+                <p class="settings-note">API Key 会和现有行情密钥一样保存到本地加密 secrets 文件；EventGraph 正式入图仍必须经过 Proposal/人工确认。</p>
+              </section>
             </div>
 
             <div class="tab-pane" data-tab-content="wallet">
@@ -102,6 +155,145 @@
                 <input id="strategyMetricsDbDir" placeholder="例如 G:/linkO/TempFiles/polymarket_datatube/strategy_metrics_dbs">
               </label>
               </div>
+            </div>
+
+            <div class="tab-pane" data-tab-content="agent">
+              <section class="settings-section">
+                <div class="settings-section-head">
+                  <h2>Agent 权限边界</h2>
+                  <p>这些设置会直接限制 `/api/agent/*` 能力；批准、实盘执行和策略注册仍只能由人类完成。</p>
+                </div>
+                <div class="grid three">
+                  <label class="switch">
+                    <input id="agentEnabled" type="checkbox">
+                    <span>启用 Agent 接口</span>
+                  </label>
+                  <label class="switch">
+                    <input id="agentRequireHumanApproval" type="checkbox">
+                    <span>提交必须人工确认</span>
+                  </label>
+                  <label class="switch">
+                    <input id="agentAllowMarketOrder" type="checkbox">
+                    <span>允许市价单</span>
+                  </label>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-head">
+                  <h2>资金与风险上限</h2>
+                  <p>Agent 超过这些边界时，风控会阻止提交或要求人工修改。</p>
+                </div>
+                <div class="grid four">
+                  <label>
+                    单策略预算上限 USDC
+                    <input id="agentMaxStrategyBudgetUsdc" type="number" min="0" step="0.01">
+                  </label>
+                  <label>
+                    单笔资金上限 USDC
+                    <input id="agentMaxSingleOrderUsdc" type="number" min="0" step="0.01">
+                  </label>
+                  <label>
+                    单日预算上限 USDC
+                    <input id="agentMaxDailySpendUsdc" type="number" min="0" step="0.01">
+                  </label>
+                  <label>
+                    单市场敞口上限 USDC
+                    <input id="agentMaxMarketExposureUsdc" type="number" min="0" step="0.01">
+                  </label>
+                  <label>
+                    全局敞口上限 USDC
+                    <input id="agentMaxGlobalExposureUsdc" type="number" min="0" step="0.01">
+                  </label>
+                  <label>
+                    最大滑点 bps
+                    <input id="agentMaxSlippageBps" type="number" min="0" step="1">
+                  </label>
+                  <label>
+                    审批过期分钟
+                    <input id="agentApprovalExpiresMinutes" type="number" min="1" step="1">
+                  </label>
+                  <label>
+                    允许交易场所
+                    <input id="agentAllowedVenues" placeholder="polymarket">
+                  </label>
+                </div>
+                <label>
+                  市场白名单 Condition IDs
+                  <textarea id="agentAllowedMarketIds" rows="3" placeholder="留空表示不限制；每行一个 condition_id"></textarea>
+                </label>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-head">
+                  <h2>扫描与提案默认值</h2>
+                  <p>Agent 做热门市场扫描和批量草案时，会优先使用这些默认参数。</p>
+                </div>
+                <div class="grid three">
+                  <label>
+                    默认提案预算 USDC
+                    <input id="agentProposalBudgetUsdc" type="number" min="0" step="0.01">
+                  </label>
+                  <label>
+                    默认单笔 USDC
+                    <input id="agentProposalSingleOrderUsdc" type="number" min="0" step="0.01">
+                  </label>
+                  <label>
+                    单次最多草案数
+                    <input id="agentMaxBatchDrafts" type="number" min="1" max="50" step="1">
+                  </label>
+                </div>
+                <div class="grid three">
+                  <label>
+                    默认方向选择
+                    <select id="agentSelectionMode">
+                      <option value="yes">Yes</option>
+                      <option value="no">No</option>
+                      <option value="cheaper">价格更低的一侧</option>
+                      <option value="balanced">接近 50% 的一侧</option>
+                    </select>
+                  </label>
+                  <label>
+                    默认扫描分类
+                    <textarea id="agentScanCategories" rows="3" placeholder="Elections Politics&#10;World&#10;Geopolitics"></textarea>
+                  </label>
+                  <label>
+                    默认排序字段
+                    <textarea id="agentScanSorts" rows="3" placeholder="volume24h&#10;volume&#10;liquidity&#10;spread"></textarea>
+                  </label>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-head">
+                  <h2>能力开关</h2>
+                  <p>关闭后，对应 agent 接口会返回权限错误；人类审批和人工参数修改不受影响。</p>
+                </div>
+                <div class="permission-grid">
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="market_read"><span>读取市场与审批状态</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="market_search"><span>搜索市场</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="market_scan"><span>热门市场扫描</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="strategy_read_all"><span>查看全部策略列表</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="strategy_detail_read"><span>查看策略详情</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="strategy_workspace_read"><span>查看策略工作台 / UseData</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="strategy_events_read"><span>查看策略 Action 日志</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="strategy_state_read"><span>查看策略 State</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="strategy_batch_propose"><span>批量生成策略草案</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="strategy_draft_create"><span>新增策略草案</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="strategy_draft_update"><span>修改策略草案</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="strategy_draft_delete"><span>删除未提交草案</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="risk_check"><span>执行风控检查</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="strategy_simulate"><span>执行策略模拟</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="strategy_submit"><span>提交人工确认</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="order_read"><span>读取订单</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="pnl_read"><span>读取收益</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="audit_read"><span>读取审计日志</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="event_read"><span>读取 EventGraph / 新闻事件</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="event_news_refresh"><span>刷新全球新闻事件</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="event_news_search"><span>检索指定新闻事件</span></label>
+                </div>
+                <p class="settings-note">硬性禁止：agent 不能批准自己的策略、不能直接执行实盘、不能修改自身权限。</p>
+              </section>
             </div>
 
             <div class="tab-pane" data-tab-content="refresh">
@@ -146,6 +338,6 @@
         </section>
       </main>
     </div>
-    <script src="{{ url_for('static', filename='settings.js') }}"></script>
+    <script src="{{ url_for('static', filename='settings.js') }}?v=llm-settings-20260628"></script>
   </body>
 </html>

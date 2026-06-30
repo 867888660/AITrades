@@ -9,6 +9,8 @@ from services.strategy_registry_service import get_strategy_code_inputs
 
 _NUMBER_FIELDS = {"strategy_bankroll"}
 _BOOLEAN_FIELDS: set = set()
+_DEADLINE_FIELD = "Enddate"
+_DEADLINE_ALIASES = {"enddate", "endtime", "l0endtime"}
 _GROUPS = {
     "capital": {"strategy_bankroll"},
 }
@@ -44,6 +46,14 @@ def _field_label(field: str) -> str:
     return field.replace("_", " ").title()
 
 
+def _normalize_param_name(value: Any) -> str:
+    return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+
+def _has_deadline_field(fields: List[str]) -> bool:
+    return any(_normalize_param_name(field) in _DEADLINE_ALIASES for field in fields)
+
+
 def _strategy_code_input_meta(detail: Dict[str, Any] | None) -> Dict[str, Dict[str, Any]]:
     if not isinstance(detail, dict):
         return {}
@@ -74,7 +84,7 @@ def build_strategy_settings_schema(detail: Dict[str, Any] | None = None) -> List
     input_keys: List[str] = []
     if isinstance(editable, dict):
         for key, value in editable.items():
-            if key in _NUMBER_FIELDS or key == "state":
+            if key in _NUMBER_FIELDS or key in {"mode", "state"}:
                 continue
             text = str(value or "").strip()
             if key.startswith("Inputs") and not text:
@@ -82,6 +92,8 @@ def build_strategy_settings_schema(detail: Dict[str, Any] | None = None) -> List
             input_keys.append(str(key))
     if not input_keys:
         input_keys = [field for field in STRATEGY_EDITABLE_FIELDS if field.startswith("Inputs")]
+    if not _has_deadline_field(input_keys):
+        input_keys.append(_DEADLINE_FIELD)
 
     fields = [
         *input_keys,
@@ -110,7 +122,7 @@ def validate_strategy_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any
         for field in payload.keys()
         if str(field) not in STRATEGY_EDITABLE_FIELDS
         and str(field) not in _NUMBER_FIELDS
-        and str(field) != "state"
+        and str(field) not in {"mode", "state"}
     ]
     for field in [*STRATEGY_EDITABLE_FIELDS, *dynamic_fields]:
         if field not in payload:

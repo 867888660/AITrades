@@ -9,6 +9,7 @@
 | `Params` | `strategy_registry.input_json` / `strategy_legs.params_json` | `ParamsSchema` / 旧 `Inputs` | 用户 | 长期参数，例如阈值、风险预算、窗口长度 |
 | `Controls` | `strategy_state.namespace = user` | `ControlsSchema` | 用户 / UI | 人工控制开关，例如暂停开仓、强制清仓、风险缩放 |
 | `RuntimeState` | `strategy_state.namespace = runtime` | `RuntimeStateSchema` | 策略代码 | 策略运行记忆，例如 `last_signal`、`entry_price`、`cooldown_until` |
+| `StrategyState` | `strategy_state.namespace = machine` | `StateMachineSchema` | 用户 / UI / 策略读取 | 策略状态机当前状态，例如 `auto`、`holding`、`cooldown`、`manual_review`、`stop_loss_locked` |
 | `SystemState` | `strategy_state.namespace = system` | 系统 | 系统 | 调度器、风控、执行层预留 |
 | `Portfolio` / `Instruments` | 系统事实表或实时行情 | 系统 | 系统 | 账户、仓位、行情事实，策略只读 |
 
@@ -16,6 +17,8 @@
 
 - `UseData["Controls"]` 是推荐新名字。
 - `UseData["UserState"]` 暂时等于 `Controls`，兼容上一版策略。
+- `UseData["StrategyState"]` 是新的策略状态机对象，例如 `{ "state": "holding" }`。
+- `UseData["MachineState"]` 暂时等于当前状态字符串，例如 `"holding"`。
 - `UseData["State"]` 暂时等于 `RuntimeState`，兼容旧策略。
 - 旧版 `default` namespace 会迁移到 `runtime`。
 
@@ -38,6 +41,17 @@ RuntimeStateSchema = {
     "last_signal": {"type": "string", "default": "none"},
     "last_action_at": {"type": "string", "default": None}
 }
+
+StateMachineSchema = {
+    "default": "auto",
+    "states": [
+        {"value": "auto", "label": "Auto"},
+        {"value": "holding", "label": "Holding"},
+        {"value": "cooldown", "label": "Cooldown"},
+        {"value": "manual_review", "label": "Manual Review"},
+        {"value": "stop_loss_locked", "label": "Stop Loss Locked"}
+    ]
+}
 ```
 
 系统运行时按以下规则合并：
@@ -46,6 +60,7 @@ RuntimeStateSchema = {
 effective Params       = ParamsSchema defaults + strategy input_json
 effective Controls     = ControlsSchema defaults + strategy_state(user)
 effective RuntimeState = RuntimeStateSchema defaults + strategy_state(runtime)
+effective State        = StateMachineSchema default + strategy_state(machine).state
 ```
 
 数据库只保存用户或策略实际写过的 override。用户点击清空 override 后，会自然回到策略代码默认值。
@@ -84,9 +99,11 @@ if controls.get("force_flat"):
 GET    /api/registry/strategies/<id>/state-store
 PATCH  /api/registry/strategies/<id>/state-store/controls
 PATCH  /api/registry/strategies/<id>/state-store/user
+PATCH  /api/registry/strategies/<id>/state-store/machine
 PATCH  /api/registry/strategies/<id>/state-store/runtime
 DELETE /api/registry/strategies/<id>/state-store/controls
 DELETE /api/registry/strategies/<id>/state-store/user
+DELETE /api/registry/strategies/<id>/state-store/machine
 DELETE /api/registry/strategies/<id>/state-store/runtime
 ```
 
@@ -111,7 +128,11 @@ DELETE /api/registry/strategies/<id>/state-store/runtime
   "controls": {},
   "runtime_defaults": {},
   "runtime_overrides": {},
-  "runtime": {}
+  "runtime": {},
+  "state_machine_schema": {},
+  "machine_overrides": {},
+  "machine_state": "auto",
+  "state_options": []
 }
 ```
 
@@ -119,12 +140,18 @@ DELETE /api/registry/strategies/<id>/state-store/runtime
 
 ## Dashboard UI
 
+Dashboard 策略表直接显示 `Mode` 与 `State` 两列：
+
+- `Mode`：写入 `strategy_registry.mode`，取值 `Stop / Virtual / Real`。
+- `State`：写入 `strategy_state.namespace = machine` 的 `state` 键，选项来自策略代码 `StateMachineSchema`。
+
 Dashboard 策略表的 `State` 按钮打开状态弹窗：
 
 - 左侧编辑 `Controls` override。
 - 右侧编辑 `RuntimeState` override，只有策略 Stop 时可编辑。
 - 每侧都会显示 effective value，即默认值 + override。
 - 保存时只保存 override，不把默认值写入数据库。
+- 策略状态机 state 可在首页、工作台 header、工作台参数面板人工切换；它不影响虚拟盘/实盘调度，调度只看 `mode`。
 - 清空 override 后回到策略代码默认值。
 
 ## 当前策略默认值
@@ -132,7 +159,7 @@ Dashboard 策略表的 `State` 按钮打开状态弹窗：
 两个现有策略已经声明：
 
 - `ControlsSchema`: `manual_pause_open=false`、`force_flat=false`、`risk_scale=1.0`、`debug_raw_inputs=false`
-- `RuntimeStateSchema`: `last_signal`、`last_action_at` 等基础记忆字段
+- `RuntimeStateSchema`: `last_signal`、`last_action_at` 等基础记忆字段；`Stragy_Fllow_Truth` 额外维护 `peak_bid`、`momentum_hold_since`、`profit_protected`、`partial_tp_done`、`last_macd_hist`，用于 MACD 动量保护退出和追踪止盈。
 - `ParamsSchema`: 与原有 `Inputs` 对齐的参数默认值
 
 两个策略也开始读取基础 Controls：

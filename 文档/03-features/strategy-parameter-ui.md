@@ -100,7 +100,7 @@ POST /api/polymarket/strategies/usedata/draft
 {
   "strategy_name": "...",
   "strategy_code": "Stragy_Fllow_Truth",
-  "state": "Virtual",
+  "mode": "Virtual",
   "condition_id": "...",
   "strategy_bankroll": 100,
   "input_json": {}

@@ -1,3 +1,13 @@
+# Polymarket DataTube 文档入口（补充）
+
+## 2026-06-29 历史数据工作台与回测报告
+
+- 新增专题文档：[历史数据工作台与回测报告](03-features/history-workspace-backtest.md)。
+- 记录 Binance K 线按用户选择时间窗口分页补齐、`coverage.segments` 合并语义、补齐后前端回写搜索结果覆盖区间、Backtest Report 缺数据时由用户确认下载并纳入进度条。
+- 维护相关功能时，优先阅读该文档，再查看 `services/history_data_service.py`、`static/history_workspace.js` 和 `static/backtest_report.js`。
+
+---
+
 # Polymarket DataTube 文档入口
 
 这个目录按阅读目的组织文档：先看全局，再看使用方式，需要改功能时看功能设计，需要查字段或历史决策时看参考与决策记录。

@@ -1,0 +1,4 @@
+interface:
+  display_name: "DataTube"
+  short_description: "Install and operate DataTube"
+  default_prompt: "Use $datatube to start DataTube and run a Polymarket/Binance research or strategy workflow."

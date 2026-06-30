@@ -39,6 +39,112 @@ function linesToArray(text) {
     .filter(Boolean);
 }
 
+function arrayToLines(value) {
+  return Array.isArray(value) ? value.join("\n") : "";
+}
+
+function setSelectValue(id, value, fallback = "") {
+  const el = getEl(id);
+  if (!el) {
+    return;
+  }
+  el.value = value || fallback;
+  if (el.value !== (value || fallback)) {
+    el.value = fallback;
+  }
+}
+
+function fillAgentPolicy(agentPolicy) {
+  const agent = agentPolicy || {};
+  const limits = agent.limits || {};
+  const defaults = agent.defaults || {};
+  const permissions = agent.permissions || {};
+
+  setChecked("agentEnabled", agent.enabled !== false);
+  setChecked("agentRequireHumanApproval", limits.require_human_approval !== false);
+  setChecked("agentAllowMarketOrder", limits.allow_market_order);
+  setValue("agentMaxStrategyBudgetUsdc", limits.max_strategy_budget_usdc ?? 100);
+  setValue("agentMaxSingleOrderUsdc", limits.max_single_order_usdc ?? 20);
+  setValue("agentMaxDailySpendUsdc", limits.max_daily_spend_usdc ?? 150);
+  setValue("agentMaxMarketExposureUsdc", limits.max_market_exposure_usdc ?? 50);
+  setValue("agentMaxGlobalExposureUsdc", limits.max_global_exposure_usdc ?? 300);
+  setValue("agentMaxSlippageBps", limits.max_slippage_bps ?? 100);
+  setValue("agentApprovalExpiresMinutes", limits.approval_expires_minutes ?? 1440);
+  setValue("agentAllowedVenues", arrayToLines(limits.allowed_venues || ["polymarket"]));
+  setValue("agentAllowedMarketIds", arrayToLines(limits.allowed_market_ids || []));
+
+  setValue("agentProposalBudgetUsdc", defaults.proposal_budget_usdc ?? 20);
+  setValue("agentProposalSingleOrderUsdc", defaults.proposal_single_order_usdc ?? 5);
+  setValue("agentMaxBatchDrafts", defaults.max_batch_drafts ?? 5);
+  setSelectValue("agentSelectionMode", defaults.selection_mode || "yes", "yes");
+  setValue("agentScanCategories", arrayToLines(defaults.scan_categories || ["Elections Politics", "World", "Geopolitics"]));
+  setValue("agentScanSorts", arrayToLines(defaults.scan_sorts || ["volume24h", "volume", "liquidity", "spread"]));
+
+  document.querySelectorAll("[data-agent-permission]").forEach((input) => {
+    input.checked = permissions[input.dataset.agentPermission] !== false;
+  });
+}
+
+function collectAgentPermissions() {
+  const permissions = {};
+  document.querySelectorAll("[data-agent-permission]").forEach((input) => {
+    permissions[input.dataset.agentPermission] = Boolean(input.checked);
+  });
+  return permissions;
+}
+
+function buildAgentPolicyPayload() {
+  return {
+    enabled: getChecked("agentEnabled", true),
+    permissions: collectAgentPermissions(),
+    limits: {
+      max_strategy_budget_usdc: getValue("agentMaxStrategyBudgetUsdc"),
+      max_single_order_usdc: getValue("agentMaxSingleOrderUsdc"),
+      max_daily_spend_usdc: getValue("agentMaxDailySpendUsdc"),
+      max_market_exposure_usdc: getValue("agentMaxMarketExposureUsdc"),
+      max_global_exposure_usdc: getValue("agentMaxGlobalExposureUsdc"),
+      max_slippage_bps: getValue("agentMaxSlippageBps"),
+      allowed_market_ids: linesToArray(getValue("agentAllowedMarketIds")),
+      allowed_venues: linesToArray(getValue("agentAllowedVenues")) || ["polymarket"],
+      allow_market_order: getChecked("agentAllowMarketOrder"),
+      require_human_approval: getChecked("agentRequireHumanApproval", true),
+      approval_expires_minutes: getValue("agentApprovalExpiresMinutes"),
+    },
+    defaults: {
+      scan_categories: linesToArray(getValue("agentScanCategories")),
+      scan_sorts: linesToArray(getValue("agentScanSorts")),
+      proposal_budget_usdc: getValue("agentProposalBudgetUsdc"),
+      proposal_single_order_usdc: getValue("agentProposalSingleOrderUsdc"),
+      max_batch_drafts: getValue("agentMaxBatchDrafts"),
+      selection_mode: getValue("agentSelectionMode", "yes"),
+    },
+  };
+}
+
+function fillLlmSettings(settings) {
+  const llm = settings.llm_settings || {};
+  setChecked("llmEnabled", Boolean(llm.enabled));
+  setSelectValue("llmProvider", llm.provider || "dashscope_openai_compatible", "dashscope_openai_compatible");
+  setValue("llmBaseUrl", llm.base_url || "https://dashscope.aliyuncs.com/compatible-mode/v1");
+  setValue("llmModel", llm.model || "qwen-plus");
+  setValue("llmApiKey", settings.llm_api_key || "");
+  setValue("llmTemperature", llm.temperature ?? 0.2);
+  setValue("llmMaxTokens", llm.max_tokens ?? 2048);
+  setValue("llmTimeoutSec", llm.timeout_sec ?? 60);
+}
+
+function buildLlmSettingsPayload() {
+  return {
+    enabled: getChecked("llmEnabled"),
+    provider: getValue("llmProvider", "dashscope_openai_compatible"),
+    base_url: getValue("llmBaseUrl").trim(),
+    model: getValue("llmModel").trim(),
+    temperature: getValue("llmTemperature"),
+    max_tokens: getValue("llmMaxTokens"),
+    timeout_sec: getValue("llmTimeoutSec"),
+  };
+}
+
 async function fetchJson(url, options = undefined) {
   const response = await fetch(url, options);
   const data = await response.json();
@@ -69,7 +175,9 @@ function fillForm(settings) {
   setValue("uiRefreshSec", settings.ui_refresh_sec || 5);
   setValue("coingeckoApiKey", settings.coingecko_api_key || "");
   setValue("coingeckoApiHeader", settings.coingecko_api_key_header || "x-cg-demo-api-key");
+  fillLlmSettings(settings);
   setChecked("includeCryptoFundamentals", settings.include_crypto_fundamentals);
+  fillAgentPolicy(settings.agent_policy || {});
 }
 
 async function loadSettings() {
@@ -100,7 +208,10 @@ settingsForm.addEventListener("submit", async (event) => {
     ui_refresh_sec: getValue("uiRefreshSec"),
     coingecko_api_key: getValue("coingeckoApiKey").trim(),
     coingecko_api_key_header: getValue("coingeckoApiHeader").trim(),
+    llm_settings: buildLlmSettingsPayload(),
+    llm_api_key: getValue("llmApiKey").trim(),
     include_crypto_fundamentals: getChecked("includeCryptoFundamentals"),
+    agent_policy: buildAgentPolicyPayload(),
   };
 
   try {

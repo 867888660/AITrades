@@ -37,6 +37,7 @@ SET_TARGET_EPSILON = 1e-9
 MIN_SET_TARGET_BUY_QTY = 0.01
 CASH_EPSILON = 1e-9
 OPEN_ORDER_ACTIVE_STATUSES = ("open", "partially_filled")
+STOP_LOSS_LOCKED_STATE = "stop_loss_locked"
 
 _GENERIC_FEE_RATE: Dict[str, float] = {
     "crypto_spot": 0.001,
@@ -165,6 +166,88 @@ def _parse_raw_action(raw: Any) -> Dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _state_text(value: Any) -> str:
+    if isinstance(value, dict):
+        value = value.get("state")
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if parsed is not raw:
+                    return _state_text(parsed)
+            except Exception:
+                pass
+        return raw.lower()
+    return str(value or "").strip().lower()
+
+
+def _is_stop_loss_locked(
+    conn: sqlite3.Connection,
+    strategy_id: int,
+    use_data: Optional[Dict[str, Any]] = None,
+) -> bool:
+    state_values: List[Any] = []
+    try:
+        row = conn.execute(
+            """SELECT value_json
+               FROM strategy_state
+               WHERE strategy_id = ? AND namespace = 'machine' AND key = 'state'""",
+            (strategy_id,),
+        ).fetchone()
+        if row:
+            raw = row["value_json"] if isinstance(row, sqlite3.Row) else row[0]
+            try:
+                state_values.append(json.loads(raw))
+            except Exception:
+                state_values.append(raw)
+    except Exception:
+        pass
+
+    if isinstance(use_data, dict):
+        state_values.append(use_data.get("MachineState"))
+        strategy_state = use_data.get("StrategyState")
+        state_values.append(strategy_state)
+        if isinstance(strategy_state, dict):
+            state_values.append(strategy_state.get("state"))
+
+    return any(_state_text(value) == STOP_LOSS_LOCKED_STATE for value in state_values)
+
+
+def _write_stop_loss_locked_block(
+    conn: sqlite3.Connection,
+    strategy_id: int,
+    action_type: str,
+    *,
+    audit_tick_id: Optional[int],
+    leg: int,
+    side: Optional[str],
+    qty: Optional[float] = None,
+    price: Optional[float] = None,
+    order_ref: Optional[str] = None,
+    raw_action: Optional[Dict[str, Any]] = None,
+    raw_action_json: Optional[str] = None,
+    function_json_hash: Optional[str] = None,
+) -> None:
+    write_action_event_conn(
+        conn,
+        strategy_id,
+        MODE_VIRTUAL,
+        action_type,
+        tick_id=audit_tick_id,
+        leg_index=leg,
+        side=side,
+        qty=qty,
+        price=price,
+        status="blocked",
+        reason=STOP_LOSS_LOCKED_STATE,
+        order_ref=order_ref,
+        raw_action=raw_action,
+        raw_action_json=raw_action_json,
+        raw_function_json_hash=function_json_hash,
+    )
+
+
 # ---------------------------------------------------------------------------
 # 核心写入函数
 # ---------------------------------------------------------------------------
@@ -182,6 +265,13 @@ def _upsert_account(conn: sqlite3.Connection, strategy_id: int, initial_cash: fl
                VALUES (?,?,?,0,0,0,0,?)""",
             (strategy_id, initial_cash, initial_cash, ts),
         )
+        if abs(_safe_float(initial_cash, 0.0)) > CASH_EPSILON:
+            conn.execute(
+                """INSERT INTO strategy_cash_ledger(
+                       strategy_id, currency, amount_delta, reason, ref_table, ref_id, created_at_utc
+                   ) VALUES (?, 'USD', ?, 'initial_funding', NULL, NULL, ?)""",
+                (strategy_id, initial_cash, ts),
+            )
         return
 
     old_initial = _safe_float(row["initial_cash"], 0.0)
@@ -195,6 +285,12 @@ def _upsert_account(conn: sqlite3.Connection, strategy_id: int, initial_cash: fl
                    updated_at_utc = ?
                WHERE strategy_id = ?""",
             (initial_cash, cash_delta, ts, strategy_id),
+        )
+        conn.execute(
+            """INSERT INTO strategy_cash_ledger(
+                   strategy_id, currency, amount_delta, reason, ref_table, ref_id, created_at_utc
+               ) VALUES (?, 'USD', ?, 'initial_cash_adjustment', NULL, NULL, ?)""",
+            (strategy_id, cash_delta, ts),
         )
 
 
@@ -232,6 +328,7 @@ def _update_account_cash(
     net_cash_change: float,
     fee: float,
     realized_pnl_delta: float = 0.0,
+    reason: str = "trade_cash_change",
 ) -> None:
     ts = _now()
     conn.execute(
@@ -243,6 +340,13 @@ def _update_account_cash(
            WHERE strategy_id = ?""",
         (net_cash_change, fee, realized_pnl_delta, ts, strategy_id),
     )
+    if abs(_safe_float(net_cash_change, 0.0)) > CASH_EPSILON:
+        conn.execute(
+            """INSERT INTO strategy_cash_ledger(
+                   strategy_id, currency, amount_delta, reason, ref_table, ref_id, created_at_utc
+               ) VALUES (?, 'USD', ?, ?, NULL, NULL, ?)""",
+            (strategy_id, net_cash_change, reason, ts),
+        )
 
 
 def _instrument_by_index(use_data: Dict[str, Any], index: int) -> Dict[str, Any]:
@@ -422,12 +526,18 @@ def _mark_account_equity(
             continue
         side = str(pos.get("side") or "YES")
         leg = int(pos.get("leg_index") or 0)
-        mark = _resolve_price(side, leg, "SELL", use_data, None)
-        if mark is None or mark <= 0:
-            mark = avg_price
-        liquidation_value += qty * mark
+        fill = _simulate_taker_fill(side, leg, "SELL", use_data, None, fee_rate, qty_limit=qty)
+        mark = _safe_float(fill.get("price"), 0.0)
+        if mark > 0 and _safe_float(fill.get("qty"), 0.0) > 0:
+            liquidation_value += _safe_float(fill.get("gross"), 0.0)
+            estimated_exit_fees += _safe_float(fill.get("fee"), 0.0)
+        else:
+            mark = _resolve_price(side, leg, "SELL", use_data, None)
+            if mark is None or mark <= 0:
+                mark = avg_price
+            liquidation_value += qty * mark
+            estimated_exit_fees += _calc_fee(qty, mark, fee_rate)
         open_cost += qty * avg_price
-        estimated_exit_fees += _calc_fee(qty, mark, fee_rate)
 
     instruments = {
         str(item.get("instrument_id") or ""): item
@@ -548,10 +658,12 @@ def _write_order(
     status: str,
     reason: Optional[str] = None,
     liquidity_role: str = "taker",
+    gross_override: Optional[float] = None,
+    fee_override: Optional[float] = None,
 ) -> int:
     """写入虚拟订单，返回 id。"""
-    gross = qty * price
-    fee = _calc_fee(qty, price, fee_rate)
+    gross = gross_override if gross_override is not None else qty * price
+    fee = fee_override if fee_override is not None else _calc_fee(qty, price, fee_rate)
     if action == "BUY":
         net_cash = -(gross + fee)
     else:
@@ -889,6 +1001,20 @@ def _execute_generic_order(
     cash = _safe_float(acct.get("cash"), 0.0)
 
     if order_action == "BUY":
+        if _is_stop_loss_locked(conn, strategy_id, use_data):
+            _write_stop_loss_locked_block(
+                conn,
+                strategy_id,
+                "ORDER",
+                audit_tick_id=audit_tick_id,
+                leg=instrument_index,
+                side=side,
+                qty=qty,
+                price=price,
+                raw_action=raw_action,
+                function_json_hash=function_json_hash,
+            )
+            return 0, None
         total_cost = notional + fee
         if cash < total_cost:
             order_id = _write_order_v2(
@@ -1050,6 +1176,21 @@ def _execute_place_order(
             tick_id=audit_tick_id, leg_index=leg, side=side, qty=0.0, price=price,
             status="skipped", reason="qty_le_zero",
             raw_action=raw_action, raw_function_json_hash=function_json_hash,
+        )
+        return 0, None
+
+    if order_side == "BUY" and _is_stop_loss_locked(conn, strategy_id, use_data):
+        _write_stop_loss_locked_block(
+            conn,
+            strategy_id,
+            str(raw_action.get("type") or "PLACE_ORDER").upper(),
+            audit_tick_id=audit_tick_id,
+            leg=leg,
+            side=side,
+            qty=qty,
+            price=price,
+            raw_action=raw_action,
+            function_json_hash=function_json_hash,
         )
         return 0, None
 
@@ -1413,6 +1554,7 @@ def sync_virtual_open_orders(
                ORDER BY id""",
             (strategy_id,),
         ).fetchall()
+        stop_loss_locked = _is_stop_loss_locked(conn, strategy_id, use_data)
         for row in rows:
             order = dict(row)
             leg = int(order.get("leg_index") or 0)
@@ -1420,6 +1562,28 @@ def sync_virtual_open_orders(
             action = str(order.get("action") or "SELL").upper()
             price = _safe_float(order.get("price"), 0.0)
             remaining = _safe_float(order.get("remaining_qty"), 0.0)
+            raw_action_json = str(order.get("raw_action_json") or "")
+            if stop_loss_locked and action == "BUY":
+                conn.execute(
+                    """UPDATE strategy_virtual_open_orders
+                       SET status = 'canceled', reason = ?,
+                           remaining_qty = 0, updated_at_utc = ?
+                       WHERE id = ?""",
+                    (STOP_LOSS_LOCKED_STATE, _now(), order["id"]),
+                )
+                _write_stop_loss_locked_block(
+                    conn,
+                    strategy_id,
+                    "OPEN_ORDER_FILL",
+                    audit_tick_id=audit_tick_id,
+                    leg=leg,
+                    side=side,
+                    qty=remaining,
+                    price=price,
+                    order_ref=f"open:{order['id']}",
+                    raw_action_json=raw_action_json,
+                )
+                continue
             if price <= 0 or remaining <= 0:
                 conn.execute(
                     """UPDATE strategy_virtual_open_orders
@@ -1553,7 +1717,7 @@ def _resolve_price(side: str, leg: int, action: str, use_data: Dict[str, Any], o
             except (TypeError, ValueError):
                 pass
         marker = str(override).strip().lower() if isinstance(override, str) else ""
-        if marker not in ("", "none", "null", "nowprice"):
+        if marker not in ("", "none", "null", "nowprice", "market"):
             try:
                 return float(override)
             except (TypeError, ValueError):
@@ -1579,6 +1743,194 @@ def _resolve_price(side: str, leg: int, action: str, use_data: Dict[str, Any], o
         if price > 0:
             return price
     return None
+
+
+def _numeric_price_override(override: Any) -> Optional[float]:
+    if override is None:
+        return None
+    if isinstance(override, str):
+        marker = override.strip().lower()
+        if marker in ("", "none", "null", "nowprice", "market"):
+            return None
+    try:
+        value = float(override)
+        return value if value > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_book_levels(raw: Any, *, side: str) -> List[Dict[str, float]]:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw) if raw.strip() else []
+        except Exception:
+            raw = []
+    if not isinstance(raw, list):
+        return []
+    by_price: Dict[float, float] = {}
+    for level in raw:
+        if not isinstance(level, dict):
+            continue
+        price = _safe_float(level.get("price"), 0.0)
+        qty = _safe_float(level.get("qty", level.get("size")), 0.0)
+        if price <= 0 or qty <= 0:
+            continue
+        by_price[price] = by_price.get(price, 0.0) + qty
+    return [
+        {"price": price, "qty": qty}
+        for price, qty in sorted(by_price.items(), key=lambda item: item[0], reverse=(side == "bid"))
+    ]
+
+
+def _orderbook_levels(side: str, leg: int, action: str, use_data: Dict[str, Any]) -> List[Dict[str, float]]:
+    side_name = _side_label(side)
+    field = "AskLevels" if str(action or "").upper() == "BUY" else "BidLevels"
+    candidates = [
+        f"L{leg}_{side_name}_{field}",
+        f"{side_name}_{field}_L{leg}",
+    ]
+    if leg == 0:
+        candidates.append(f"{side_name}_{field}")
+    else:
+        candidates.append(f"{side_name}_{field}")
+    for key in candidates:
+        if key not in use_data:
+            continue
+        levels = _normalize_book_levels(
+            use_data.get(key),
+            side="ask" if field == "AskLevels" else "bid",
+        )
+        if levels:
+            return levels
+    return []
+
+
+def _simulate_taker_fill(
+    side: str,
+    leg: int,
+    action: str,
+    use_data: Dict[str, Any],
+    price_override: Any,
+    fee_rate: float,
+    *,
+    qty_limit: Optional[float] = None,
+    gross_limit: Optional[float] = None,
+    cash_limit: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Simulate an immediate taker fill by walking visible orderbook levels."""
+    action = str(action or "").upper()
+    limit_price = _numeric_price_override(price_override)
+    levels = _orderbook_levels(side, leg, action, use_data)
+    requested_qty = max(0.0, _safe_float(qty_limit, 0.0)) if qty_limit is not None else None
+    remaining_qty = requested_qty
+    remaining_gross = max(0.0, _safe_float(gross_limit, 0.0)) if gross_limit is not None else None
+    remaining_cash = max(0.0, _safe_float(cash_limit, 0.0)) if cash_limit is not None else None
+    fills: List[Dict[str, float]] = []
+    gross = 0.0
+    fee = 0.0
+    filled_qty = 0.0
+    stopped_by_cash = False
+    stopped_by_gross = False
+
+    def add_fill(level_price: float, level_qty: float) -> None:
+        nonlocal gross, fee, filled_qty, remaining_qty, remaining_gross, remaining_cash
+        level_fee = _calc_fee(level_qty, level_price, fee_rate)
+        fills.append({"price": level_price, "qty": level_qty})
+        gross += level_qty * level_price
+        fee += level_fee
+        filled_qty += level_qty
+        if remaining_qty is not None:
+            remaining_qty = max(0.0, remaining_qty - level_qty)
+        if remaining_gross is not None:
+            remaining_gross = max(0.0, remaining_gross - level_qty * level_price)
+        if remaining_cash is not None and action == "BUY":
+            remaining_cash = max(0.0, remaining_cash - level_qty * level_price - level_fee)
+
+    for level in levels:
+        price = _safe_float(level.get("price"), 0.0)
+        available = _safe_float(level.get("qty"), 0.0)
+        if price <= 0 or available <= 0:
+            continue
+        if limit_price is not None:
+            if action == "BUY" and price > limit_price + CASH_EPSILON:
+                break
+            if action == "SELL" and price + CASH_EPSILON < limit_price:
+                break
+        take_qty = available
+        if remaining_qty is not None:
+            take_qty = min(take_qty, remaining_qty)
+        if remaining_gross is not None:
+            if remaining_gross <= CASH_EPSILON:
+                stopped_by_gross = True
+                break
+            take_qty = min(take_qty, remaining_gross / price)
+        if remaining_cash is not None and action == "BUY":
+            per_share_cost = price + _calc_fee(1.0, price, fee_rate)
+            if remaining_cash <= CASH_EPSILON or per_share_cost <= 0:
+                stopped_by_cash = True
+                break
+            take_qty = min(take_qty, remaining_cash / per_share_cost)
+        if take_qty <= CASH_EPSILON:
+            break
+        add_fill(price, take_qty)
+        if remaining_qty is not None and remaining_qty <= CASH_EPSILON:
+            break
+        if remaining_gross is not None and remaining_gross <= CASH_EPSILON:
+            stopped_by_gross = True
+            break
+        if remaining_cash is not None and action == "BUY" and remaining_cash <= CASH_EPSILON:
+            stopped_by_cash = True
+            break
+
+    used_orderbook = bool(levels)
+    if not fills and not used_orderbook:
+        fallback_price = _resolve_price(side, leg, action, use_data, price_override)
+        if fallback_price and fallback_price > 0:
+            take_qty = requested_qty if requested_qty is not None else 0.0
+            if remaining_gross is not None:
+                take_qty = remaining_gross / fallback_price if take_qty <= 0 else min(take_qty, remaining_gross / fallback_price)
+            if remaining_cash is not None and action == "BUY":
+                if remaining_cash <= CASH_EPSILON:
+                    stopped_by_cash = True
+                    take_qty = 0.0
+                else:
+                    per_share_cost = fallback_price + _calc_fee(1.0, fallback_price, fee_rate)
+                    affordable = remaining_cash / per_share_cost if per_share_cost > 0 else 0.0
+                    take_qty = affordable if take_qty <= 0 else min(take_qty, affordable)
+            if take_qty > CASH_EPSILON:
+                add_fill(fallback_price, take_qty)
+
+    vwap = gross / filled_qty if filled_qty > CASH_EPSILON else 0.0
+    depth_limited = (
+        used_orderbook
+        and requested_qty is not None
+        and filled_qty + CASH_EPSILON < requested_qty
+        and not stopped_by_cash
+        and not stopped_by_gross
+    )
+    gross_depth_limited = (
+        used_orderbook
+        and gross_limit is not None
+        and gross + CASH_EPSILON < _safe_float(gross_limit, 0.0)
+        and not stopped_by_cash
+    )
+    gross_capped = gross_limit is not None and (remaining_gross is not None and remaining_gross <= CASH_EPSILON)
+    cash_capped = cash_limit is not None and action == "BUY" and stopped_by_cash
+    return {
+        "qty": filled_qty,
+        "requested_qty": requested_qty,
+        "price": vwap,
+        "gross": gross,
+        "fee": fee,
+        "fills": fills,
+        "levels_used": len(fills),
+        "used_orderbook": used_orderbook,
+        "depth_limited": depth_limited,
+        "gross_depth_limited": gross_depth_limited,
+        "gross_capped": gross_capped,
+        "cash_capped": cash_capped,
+        "limit_price": limit_price,
+    }
 
 
 def _budget_cap(use_data: Dict[str, Any], leg: int) -> float:
@@ -1658,9 +2010,33 @@ def _execute_buy(
 ) -> Tuple[int, Optional[str]]:
     if qty <= 0:
         return 0, None
-    price = _resolve_price(side, leg, "BUY", use_data, price_override)
-    if price is None or price <= 0:
-        order_id = _write_order(conn, strategy_id, leg, side, "BUY", qty, 0.0, fee_rate, "failed", "no_price")
+    if _is_stop_loss_locked(conn, strategy_id, use_data):
+        _write_stop_loss_locked_block(
+            conn,
+            strategy_id,
+            "BUY",
+            audit_tick_id=audit_tick_id,
+            leg=leg,
+            side=side,
+            qty=qty,
+            raw_action=raw_action,
+            function_json_hash=function_json_hash,
+        )
+        return 0, None
+    fill = _simulate_taker_fill(
+        side,
+        leg,
+        "BUY",
+        use_data,
+        price_override,
+        fee_rate,
+        qty_limit=qty,
+    )
+    price = _safe_float(fill.get("price"), 0.0)
+    fill_qty = _safe_float(fill.get("qty"), 0.0)
+    if price <= 0 or fill_qty <= 0:
+        fail_reason = "no_book_liquidity" if fill.get("used_orderbook") else "no_price"
+        order_id = _write_order(conn, strategy_id, leg, side, "BUY", qty, 0.0, fee_rate, "failed", fail_reason)
         write_action_event_conn(
             conn,
             strategy_id,
@@ -1672,16 +2048,16 @@ def _execute_buy(
             qty=qty,
             price=0.0,
             status="failed",
-            reason="no_price",
+            reason=fail_reason,
             order_ref=order_id,
             raw_action=raw_action,
             raw_function_json_hash=function_json_hash,
         )
-        return 1, f"BUY L{leg} {side}: no valid price"
+        return 1, f"BUY L{leg} {side}: {fail_reason}"
 
-    gross = qty * price
-    fee = _calc_fee(qty, price, fee_rate)
-    total_cost = _buy_total_cost(qty, price, fee_rate)
+    gross = _safe_float(fill.get("gross"), 0.0)
+    fee = _safe_float(fill.get("fee"), 0.0)
+    total_cost = gross + fee
 
     acct = _get_account(conn, strategy_id)
     cash = float(acct.get("cash", 0.0))
@@ -1708,12 +2084,43 @@ def _execute_buy(
         )
         return 1, None
 
-    order_id = _write_order(conn, strategy_id, leg, side, "BUY", qty, price, fee_rate, "filled")
-    _upsert_position(conn, strategy_id, leg, side, qty, price)
+    fill_reason = reason
+    if fill.get("depth_limited"):
+        fill_reason = "partial_fill_book_depth"
+    elif _safe_float(fill.get("levels_used"), 0.0) > 1:
+        fill_reason = reason or "orderbook_sweep"
+
+    order_id = _write_order(
+        conn,
+        strategy_id,
+        leg,
+        side,
+        "BUY",
+        fill_qty,
+        price,
+        fee_rate,
+        "filled",
+        fill_reason,
+        gross_override=gross,
+        fee_override=fee,
+    )
+    _upsert_position(conn, strategy_id, leg, side, fill_qty, price)
     _update_account_cash(conn, strategy_id, -(gross + fee), fee)
-    event_payload = {"type": "BUY", "leg": leg, "side": side, "qty": qty, "price": price, "status": "filled"}
-    if reason:
-        event_payload["reason"] = reason
+    event_payload = {
+        "type": "BUY",
+        "leg": leg,
+        "side": side,
+        "qty": fill_qty,
+        "requested_qty": qty,
+        "price": price,
+        "gross": gross,
+        "fee": fee,
+        "levels_used": fill.get("levels_used"),
+        "fills": fill.get("fills"),
+        "status": "filled",
+    }
+    if fill_reason:
+        event_payload["reason"] = fill_reason
     _write_event(conn, strategy_id, tick_id, "action", json.dumps(event_payload))
     write_action_event_conn(
         conn,
@@ -1723,10 +2130,10 @@ def _execute_buy(
         tick_id=audit_tick_id,
         leg_index=leg,
         side=side,
-        qty=qty,
+        qty=fill_qty,
         price=price,
         status="filled",
-        reason=reason,
+        reason=fill_reason,
         order_ref=order_id,
         raw_action=raw_action,
         raw_function_json_hash=function_json_hash,
@@ -1750,32 +2157,13 @@ def _execute_sell(
 ) -> Tuple[int, Optional[str]]:
     if qty <= 0:
         return 0, None
-    price = _resolve_price(side, leg, "SELL", use_data, price_override)
-    if price is None or price <= 0:
-        order_id = _write_order(conn, strategy_id, leg, side, "SELL", qty, 0.0, fee_rate, "failed", "no_price")
-        write_action_event_conn(
-            conn,
-            strategy_id,
-            MODE_VIRTUAL,
-            "SELL",
-            tick_id=audit_tick_id,
-            leg_index=leg,
-            side=side,
-            qty=qty,
-            price=0.0,
-            status="failed",
-            reason="no_price",
-            order_ref=order_id,
-            raw_action=raw_action,
-            raw_function_json_hash=function_json_hash,
-        )
-        return 1, f"SELL L{leg} {side}: no valid price"
 
     pos = _get_position(conn, strategy_id, leg, side)
     held = float(pos.get("qty", 0.0))
     sell_qty = min(qty, held)
     if sell_qty <= 0:
-        order_id = _write_order(conn, strategy_id, leg, side, "SELL", qty, price, fee_rate, "blocked", "no_position")
+        display_price = _resolve_price(side, leg, "SELL", use_data, price_override) or 0.0
+        order_id = _write_order(conn, strategy_id, leg, side, "SELL", qty, display_price, fee_rate, "blocked", "no_position")
         write_action_event_conn(
             conn,
             strategy_id,
@@ -1785,7 +2173,7 @@ def _execute_sell(
             leg_index=leg,
             side=side,
             qty=qty,
-            price=price,
+            price=display_price,
             status="blocked",
             reason="no_position",
             order_ref=order_id,
@@ -1794,16 +2182,79 @@ def _execute_sell(
         )
         return 1, None
 
-    gross = sell_qty * price
-    fee = _calc_fee(sell_qty, price, fee_rate)
-    avg_cost = float(pos.get("avg_price", 0.0))
-    realized = sell_qty * (price - avg_cost)
+    fill = _simulate_taker_fill(
+        side,
+        leg,
+        "SELL",
+        use_data,
+        price_override,
+        fee_rate,
+        qty_limit=sell_qty,
+    )
+    price = _safe_float(fill.get("price"), 0.0)
+    fill_qty = _safe_float(fill.get("qty"), 0.0)
+    if price <= 0 or fill_qty <= 0:
+        fail_reason = "no_book_liquidity" if fill.get("used_orderbook") else "no_price"
+        order_id = _write_order(conn, strategy_id, leg, side, "SELL", sell_qty, 0.0, fee_rate, "failed", fail_reason)
+        write_action_event_conn(
+            conn,
+            strategy_id,
+            MODE_VIRTUAL,
+            "SELL",
+            tick_id=audit_tick_id,
+            leg_index=leg,
+            side=side,
+            qty=sell_qty,
+            price=0.0,
+            status="failed",
+            reason=fail_reason,
+            order_ref=order_id,
+            raw_action=raw_action,
+            raw_function_json_hash=function_json_hash,
+        )
+        return 1, f"SELL L{leg} {side}: {fail_reason}"
 
-    order_id = _write_order(conn, strategy_id, leg, side, "SELL", sell_qty, price, fee_rate, "filled")
-    _upsert_position(conn, strategy_id, leg, side, -sell_qty, price)
+    gross = _safe_float(fill.get("gross"), 0.0)
+    fee = _safe_float(fill.get("fee"), 0.0)
+    avg_cost = float(pos.get("avg_price", 0.0))
+    realized = fill_qty * (price - avg_cost)
+    fill_reason = None
+    if fill.get("depth_limited"):
+        fill_reason = "partial_fill_book_depth"
+    elif _safe_float(fill.get("levels_used"), 0.0) > 1:
+        fill_reason = "orderbook_sweep"
+
+    order_id = _write_order(
+        conn,
+        strategy_id,
+        leg,
+        side,
+        "SELL",
+        fill_qty,
+        price,
+        fee_rate,
+        "filled",
+        fill_reason,
+        gross_override=gross,
+        fee_override=fee,
+    )
+    _upsert_position(conn, strategy_id, leg, side, -fill_qty, price)
     _update_account_cash(conn, strategy_id, gross - fee, fee, realized)
     _write_event(conn, strategy_id, tick_id, "action",
-                 json.dumps({"type": "SELL", "leg": leg, "side": side, "qty": sell_qty, "price": price, "status": "filled"}))
+                 json.dumps({
+                     "type": "SELL",
+                     "leg": leg,
+                     "side": side,
+                     "qty": fill_qty,
+                     "requested_qty": qty,
+                     "price": price,
+                     "gross": gross,
+                     "fee": fee,
+                     "levels_used": fill.get("levels_used"),
+                     "fills": fill.get("fills"),
+                     "status": "filled",
+                     **({"reason": fill_reason} if fill_reason else {}),
+                 }))
     write_action_event_conn(
         conn,
         strategy_id,
@@ -1812,9 +2263,10 @@ def _execute_sell(
         tick_id=audit_tick_id,
         leg_index=leg,
         side=side,
-        qty=sell_qty,
+        qty=fill_qty,
         price=price,
         status="filled",
+        reason=fill_reason,
         order_ref=order_id,
         raw_action=raw_action,
         raw_function_json_hash=function_json_hash,
@@ -1838,9 +2290,36 @@ def _execute_buy_notional(
 ) -> Tuple[int, Optional[str]]:
     if notional <= 0:
         return 0, None
-    price = _resolve_price(side, leg, "BUY", use_data, price_override)
-    if price is None or price <= 0:
-        order_id = _write_order(conn, strategy_id, leg, side, "BUY", 0.0, 0.0, fee_rate, "failed", "no_price")
+    if _is_stop_loss_locked(conn, strategy_id, use_data):
+        _write_stop_loss_locked_block(
+            conn,
+            strategy_id,
+            "BUY_NOTIONAL",
+            audit_tick_id=audit_tick_id,
+            leg=leg,
+            side=side,
+            qty=0.0,
+            raw_action=raw_action,
+            function_json_hash=function_json_hash,
+        )
+        return 0, None
+    acct = _get_account(conn, strategy_id)
+    cash = _safe_float(acct.get("cash"), 0.0)
+    fill = _simulate_taker_fill(
+        side,
+        leg,
+        "BUY",
+        use_data,
+        price_override,
+        fee_rate,
+        gross_limit=notional,
+        cash_limit=cash,
+    )
+    price = _safe_float(fill.get("price"), 0.0)
+    qty = _safe_float(fill.get("qty"), 0.0)
+    if price <= 0 or qty <= 0:
+        fail_reason = "no_book_liquidity" if fill.get("used_orderbook") else "no_price"
+        order_id = _write_order(conn, strategy_id, leg, side, "BUY", 0.0, 0.0, fee_rate, "failed", fail_reason)
         write_action_event_conn(
             conn,
             strategy_id,
@@ -1852,18 +2331,19 @@ def _execute_buy_notional(
             qty=0.0,
             price=0.0,
             status="failed",
-            reason="no_price",
+            reason=fail_reason,
             order_ref=order_id,
             raw_action=raw_action,
             raw_function_json_hash=function_json_hash,
         )
-        return 1, f"BUY_NOTIONAL L{leg} {side}: no valid price"
-    acct = _get_account(conn, strategy_id)
-    cash = _safe_float(acct.get("cash"), 0.0)
-    requested_qty = notional / price
-    max_qty = _max_buy_qty_for_cash(cash, price, fee_rate)
-    qty = min(requested_qty, max_qty)
-    reason = "cash_capped" if qty + CASH_EPSILON < requested_qty else None
+        return 1, f"BUY_NOTIONAL L{leg} {side}: {fail_reason}"
+    reason = None
+    if fill.get("cash_capped"):
+        reason = "cash_capped"
+    elif fill.get("gross_depth_limited"):
+        reason = "partial_fill_book_depth"
+    elif _safe_float(fill.get("levels_used"), 0.0) > 1:
+        reason = "orderbook_sweep"
     if qty < MIN_SET_TARGET_BUY_QTY:
         write_action_event_conn(
             conn,
@@ -1881,13 +2361,64 @@ def _execute_buy_notional(
             raw_function_json_hash=function_json_hash,
         )
         return 0, None
-    return _execute_buy(
-        conn, strategy_id, leg, side, qty, price, fee_rate, use_data, tick_id,
-        audit_tick_id=audit_tick_id,
-        function_json_hash=function_json_hash,
-        raw_action=raw_action,
-        reason=reason,
+
+    gross = _safe_float(fill.get("gross"), 0.0)
+    fee = _safe_float(fill.get("fee"), 0.0)
+    order_id = _write_order(
+        conn,
+        strategy_id,
+        leg,
+        side,
+        "BUY",
+        qty,
+        price,
+        fee_rate,
+        "filled",
+        reason,
+        gross_override=gross,
+        fee_override=fee,
     )
+    _upsert_position(conn, strategy_id, leg, side, qty, price)
+    _update_account_cash(conn, strategy_id, -(gross + fee), fee)
+    _write_event(
+        conn,
+        strategy_id,
+        tick_id,
+        "action",
+        json.dumps(
+            {
+                "type": "BUY_NOTIONAL",
+                "leg": leg,
+                "side": side,
+                "notional": notional,
+                "qty": qty,
+                "price": price,
+                "gross": gross,
+                "fee": fee,
+                "levels_used": fill.get("levels_used"),
+                "fills": fill.get("fills"),
+                "status": "filled",
+                **({"reason": reason} if reason else {}),
+            }
+        ),
+    )
+    write_action_event_conn(
+        conn,
+        strategy_id,
+        MODE_VIRTUAL,
+        "BUY_NOTIONAL",
+        tick_id=audit_tick_id,
+        leg_index=leg,
+        side=side,
+        qty=qty,
+        price=price,
+        status="filled",
+        reason=reason,
+        order_ref=order_id,
+        raw_action=raw_action,
+        raw_function_json_hash=function_json_hash,
+    )
+    return 1, None
 
 
 def _execute_sell_notional(
@@ -1906,9 +2437,43 @@ def _execute_sell_notional(
 ) -> Tuple[int, Optional[str]]:
     if notional <= 0:
         return 0, None
-    price = _resolve_price(side, leg, "SELL", use_data, price_override)
-    if price is None or price <= 0:
-        order_id = _write_order(conn, strategy_id, leg, side, "SELL", 0.0, 0.0, fee_rate, "failed", "no_price")
+    pos = _get_position(conn, strategy_id, leg, side)
+    held = _safe_float(pos.get("qty"), 0.0)
+    if held <= 0:
+        display_price = _resolve_price(side, leg, "SELL", use_data, price_override) or 0.0
+        order_id = _write_order(conn, strategy_id, leg, side, "SELL", 0.0, display_price, fee_rate, "blocked", "no_position")
+        write_action_event_conn(
+            conn,
+            strategy_id,
+            MODE_VIRTUAL,
+            "SELL_NOTIONAL",
+            tick_id=audit_tick_id,
+            leg_index=leg,
+            side=side,
+            qty=0.0,
+            price=display_price,
+            status="blocked",
+            reason="no_position",
+            order_ref=order_id,
+            raw_action=raw_action,
+            raw_function_json_hash=function_json_hash,
+        )
+        return 1, None
+    fill = _simulate_taker_fill(
+        side,
+        leg,
+        "SELL",
+        use_data,
+        price_override,
+        fee_rate,
+        qty_limit=held,
+        gross_limit=notional,
+    )
+    price = _safe_float(fill.get("price"), 0.0)
+    qty = _safe_float(fill.get("qty"), 0.0)
+    if price <= 0 or qty <= 0:
+        fail_reason = "no_book_liquidity" if fill.get("used_orderbook") else "no_price"
+        order_id = _write_order(conn, strategy_id, leg, side, "SELL", 0.0, 0.0, fee_rate, "failed", fail_reason)
         write_action_event_conn(
             conn,
             strategy_id,
@@ -1920,19 +2485,76 @@ def _execute_sell_notional(
             qty=0.0,
             price=0.0,
             status="failed",
-            reason="no_price",
+            reason=fail_reason,
             order_ref=order_id,
             raw_action=raw_action,
             raw_function_json_hash=function_json_hash,
         )
-        return 1, f"SELL_NOTIONAL L{leg} {side}: no valid price"
-    qty = notional / price
-    return _execute_sell(
-        conn, strategy_id, leg, side, qty, price, fee_rate, use_data, tick_id,
-        audit_tick_id=audit_tick_id,
-        function_json_hash=function_json_hash,
-        raw_action=raw_action,
+        return 1, f"SELL_NOTIONAL L{leg} {side}: {fail_reason}"
+    reason = None
+    if fill.get("gross_depth_limited") or fill.get("depth_limited"):
+        reason = "partial_fill_book_depth"
+    elif _safe_float(fill.get("levels_used"), 0.0) > 1:
+        reason = "orderbook_sweep"
+    gross = _safe_float(fill.get("gross"), 0.0)
+    fee = _safe_float(fill.get("fee"), 0.0)
+    avg_cost = _safe_float(pos.get("avg_price"), 0.0)
+    realized = qty * (price - avg_cost)
+    order_id = _write_order(
+        conn,
+        strategy_id,
+        leg,
+        side,
+        "SELL",
+        qty,
+        price,
+        fee_rate,
+        "filled",
+        reason,
+        gross_override=gross,
+        fee_override=fee,
     )
+    _upsert_position(conn, strategy_id, leg, side, -qty, price)
+    _update_account_cash(conn, strategy_id, gross - fee, fee, realized)
+    _write_event(
+        conn,
+        strategy_id,
+        tick_id,
+        "action",
+        json.dumps(
+            {
+                "type": "SELL_NOTIONAL",
+                "leg": leg,
+                "side": side,
+                "notional": notional,
+                "qty": qty,
+                "price": price,
+                "gross": gross,
+                "fee": fee,
+                "levels_used": fill.get("levels_used"),
+                "fills": fill.get("fills"),
+                "status": "filled",
+                **({"reason": reason} if reason else {}),
+            }
+        ),
+    )
+    write_action_event_conn(
+        conn,
+        strategy_id,
+        MODE_VIRTUAL,
+        "SELL_NOTIONAL",
+        tick_id=audit_tick_id,
+        leg_index=leg,
+        side=side,
+        qty=qty,
+        price=price,
+        status="filled",
+        reason=reason,
+        order_ref=order_id,
+        raw_action=raw_action,
+        raw_function_json_hash=function_json_hash,
+    )
+    return 1, None
 
 
 def _execute_close(
@@ -1992,7 +2614,8 @@ def _execute_setpos(
     configured_leg_budget = _safe_float(use_data.get(f"L{leg}_ConfiguredBudgetCap"), 0.0)
     if leg == 0 and configured_leg_budget <= 0:
         configured_leg_budget = _safe_float(use_data.get("ConfiguredBudgetCap"), 0.0)
-    if configured_leg_budget <= 0:
+    leg_count = int(_safe_float(use_data.get("LegCount"), 1.0))
+    if configured_leg_budget <= 0 and (leg_count <= 1 or leg == 0):
         budget = _dynamic_account_budget(conn, strategy_id, budget)
     target_pct = max(0.0, min(1.0, _safe_float(pct, 0.0)))
     target_cost = budget * target_pct
@@ -2023,6 +2646,20 @@ def _execute_setpos(
         )
         return 0, None
 
+    if delta_cost > SET_TARGET_EPSILON and _is_stop_loss_locked(conn, strategy_id, use_data):
+        _write_stop_loss_locked_block(
+            conn,
+            strategy_id,
+            "SETPOS",
+            audit_tick_id=audit_tick_id,
+            leg=leg,
+            side=side,
+            qty=current_qty,
+            raw_action=raw_action,
+            function_json_hash=function_json_hash,
+        )
+        return 0, None
+
     if abs(delta_cost) <= SET_TARGET_EPSILON:
         write_action_event_conn(
             conn,
@@ -2041,9 +2678,28 @@ def _execute_setpos(
         return 0, None
 
     if delta_cost > 0:
-        price = _resolve_price(side, leg, "BUY", use_data, None)
-        if price is None or price <= 0:
-            order_id = _write_order(conn, strategy_id, leg, side, "BUY", 0.0, 0.0, fee_rate, "failed", "no_price")
+        acct = _get_account(conn, strategy_id)
+        cash = float(acct.get("cash", 0.0))
+        fill = _simulate_taker_fill(
+            side,
+            leg,
+            "BUY",
+            use_data,
+            None,
+            fee_rate,
+            gross_limit=delta_cost,
+            cash_limit=cash,
+        )
+        price = _safe_float(fill.get("price"), 0.0)
+        qty = _safe_float(fill.get("qty"), 0.0)
+        if price <= 0 or qty <= 0:
+            fail_reason = "insufficient_cash_for_setpos" if fill.get("cash_capped") else (
+                "no_book_liquidity" if fill.get("used_orderbook") else "no_price"
+            )
+            status = "skipped" if fail_reason == "insufficient_cash_for_setpos" else "failed"
+            order_id = None
+            if status == "failed":
+                order_id = _write_order(conn, strategy_id, leg, side, "BUY", 0.0, 0.0, fee_rate, "failed", fail_reason)
             write_action_event_conn(
                 conn,
                 strategy_id,
@@ -2054,19 +2710,20 @@ def _execute_setpos(
                 side=side,
                 qty=0.0,
                 price=0.0,
-                status="failed",
-                reason="no_price",
+                status=status,
+                reason=fail_reason,
                 order_ref=order_id,
                 raw_action=raw_action,
                 raw_function_json_hash=function_json_hash,
             )
-            return 1, f"SETPOS L{leg} {side}: no valid buy price"
-        requested_qty = delta_cost / price
-        acct = _get_account(conn, strategy_id)
-        cash = float(acct.get("cash", 0.0))
-        max_qty = _max_buy_qty_for_cash(cash, price, fee_rate)
-        qty = min(requested_qty, max_qty)
-        reason = "cash_capped" if qty + CASH_EPSILON < requested_qty else None
+            return (1 if order_id else 0), (None if status == "skipped" else f"SETPOS L{leg} {side}: {fail_reason}")
+        reason = None
+        if fill.get("cash_capped"):
+            reason = "cash_capped"
+        elif fill.get("gross_depth_limited"):
+            reason = "partial_fill_book_depth"
+        elif _safe_float(fill.get("levels_used"), 0.0) > 1:
+            reason = "orderbook_sweep"
         if qty < MIN_SET_TARGET_BUY_QTY:
             write_action_event_conn(
                 conn,
@@ -2084,13 +2741,64 @@ def _execute_setpos(
                 raw_function_json_hash=function_json_hash,
             )
             return 0, None
-        return _execute_buy(
-            conn, strategy_id, leg, side, qty, price, fee_rate, use_data, tick_id,
-            audit_tick_id=audit_tick_id,
-            function_json_hash=function_json_hash,
-            raw_action=raw_action,
-            reason=reason,
+        gross = _safe_float(fill.get("gross"), 0.0)
+        fee = _safe_float(fill.get("fee"), 0.0)
+        order_id = _write_order(
+            conn,
+            strategy_id,
+            leg,
+            side,
+            "BUY",
+            qty,
+            price,
+            fee_rate,
+            "filled",
+            reason,
+            gross_override=gross,
+            fee_override=fee,
         )
+        _upsert_position(conn, strategy_id, leg, side, qty, price)
+        _update_account_cash(conn, strategy_id, -(gross + fee), fee)
+        _write_event(
+            conn,
+            strategy_id,
+            tick_id,
+            "action",
+            json.dumps(
+                {
+                    "type": "BUY",
+                    "source_action": "SETPOS",
+                    "leg": leg,
+                    "side": side,
+                    "qty": qty,
+                    "target_cost_delta": delta_cost,
+                    "price": price,
+                    "gross": gross,
+                    "fee": fee,
+                    "levels_used": fill.get("levels_used"),
+                    "fills": fill.get("fills"),
+                    "status": "filled",
+                    **({"reason": reason} if reason else {}),
+                }
+            ),
+        )
+        write_action_event_conn(
+            conn,
+            strategy_id,
+            MODE_VIRTUAL,
+            "BUY",
+            tick_id=audit_tick_id,
+            leg_index=leg,
+            side=side,
+            qty=qty,
+            price=price,
+            status="filled",
+            reason=reason,
+            order_ref=order_id,
+            raw_action=raw_action,
+            raw_function_json_hash=function_json_hash,
+        )
+        return 1, None
 
     price = _resolve_price(side, leg, "SELL", use_data, None)
     if price is None or price <= 0:

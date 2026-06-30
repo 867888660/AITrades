@@ -81,6 +81,7 @@ crypto_service.py
 finance_service.py
 http_client.py
 polymarket_service.py
+event_graph_service.py
 strategy_chart_service.py
 strategy_event_service.py
 strategy_profit_engine.py
@@ -182,7 +183,7 @@ app.py
 * 注册 SSE 推送接口。
 * 启动 `ws_market_sync_service`。
 * 启动 `realtime_collector`。
-* 启动 `virtual_runner`，运行 `state=Virtual` 的策略虚拟盘循环。
+* 启动 `virtual_runner`，运行 `mode=Virtual` 的策略虚拟盘循环。
 
 ### 它不负责什么
 
@@ -212,11 +213,12 @@ app.py
 
 ### 路由分组
 
-* 页面：`/`、`/settings`、`/watchlist`、`/strategies/<row_id>/workspace`
+* 页面：`/`、`/event-graph`、`/eventgraph`、`/settings`、`/watchlist`、`/strategies/<row_id>/workspace`
 * 健康检查：`/api/health`
 * 配置：`/api/settings`
 * 概览：`/api/overview`
-* 市场：`/api/polymarket/markets`、`/resolve`
+* 市场：`/api/polymarket/market-categories`、`/api/polymarket/markets`、`/resolve`
+* EventGraph：`/api/event-graph`、`/api/event-graph/categories`
 * 持仓：`/api/polymarket/holdings`
 * 策略：`/api/polymarket/strategies`、`/<row_id>`、`/<row_id>/workspace`
 * 图表：`/api/polymarket/strategies/<row_id>/chart`
@@ -224,7 +226,7 @@ app.py
 * 事件：`/api/polymarket/strategies/<row_id>/events`
 * 回测：`/api/polymarket/strategies/<row_id>/backtest`、`/backtest/results`
 * 预设：`/api/polymarket/workspace-presets`、`/api/polymarket/workspace-presets/<preset_id>`
-* 策略注册：`/api/registry/strategies`、`/api/registry/strategies/<strategy_id>`、`/api/registry/strategies/<strategy_id>/state`、`/api/registry/strategies/<strategy_id>/legs`
+* 策略注册：`/api/registry/strategies`、`/api/registry/strategies/<strategy_id>`、`/api/registry/strategies/<strategy_id>/mode`、`/api/registry/strategies/<strategy_id>/legs`
 * 策略代码：`/api/strategy-codes`、`/api/strategy-codes/<code_name>/inputs`
 * 虚拟盘：`/api/virtual/strategies/<strategy_id>/account`、`/positions`、`/orders`、`/events`、`/ticks`、`/reset`
 * 实时状态：`/api/realtime/state`、`/api/realtime/crypto`、`/api/realtime/finance`
@@ -573,7 +575,8 @@ app.py
    * 拉活跃市场
    * 缓存市场
    * 本地快照回退
-   * 市场搜索 `search_markets()`：多关键词分词 AND 匹配，类别支持多选 OR，同时查活跃市场缓存 + Dictionary DB（22000+ 条），本地不足时 fallback 到 Gamma API slug 精确查找
+   * 市场类别 `list_market_categories()`：从 active markets 统计类别及数量，供首页类别多选条使用
+   * 市场搜索 `search_markets()`：多关键词分词 AND 匹配，类别支持多选 OR，同时查活跃市场缓存 + Dictionary DB（22000+ 条），本地不足时 fallback 到 Gamma API slug 精确查找；支持按 24h 成交量、总交易量、流动性、价差、到期、更新时间等字段在后端全量候选集合上排序
    * 市场解析 `resolve_market_selection()`
 
 2. **持仓能力**
@@ -1186,6 +1189,10 @@ HTML 模板(index.html / settings.html / watchlist.html / strategy_workspace.htm
 * 策略监控面板
 * 市场查询相关区域
 
+市场查询区域包含 `Binance市场查询` 和 `Polymarket 市场查询` 两块。Polymarket 市场查询支持关键词、类别多选、后端排序和自选入口；类别标签来自 `/api/polymarket/market-categories`，搜索结果来自 `/api/polymarket/markets`。详见 [Polymarket 市场查询](../03-features/polymarket-market-query.md)。
+
+EventGraph 独立页面位于 `/event-graph`，第一版从现有 Polymarket 市场查询结果即时派生 Event / Finance / Signal 图谱，用于验证事件、金融产品和市场热度信号的关系化浏览。详见 [EventGraph derived preview](../03-features/event-graph.md)。
+
 #### 对应脚本
 
 * `app.js`
@@ -1455,7 +1462,7 @@ Polymarket 市场链接与本地自选功能公共脚本。
 
    * 拉取 `/api/polymarket/strategies/<row_id>/workspace`
    * 渲染 header、summary、sources、backtest、settings 等
-   * 同步 `strategy_registry.state` 到 header 状态 select
+   * 同步 `strategy_registry.mode` 到 header mode select，并同步 `strategy_state.namespace = machine` 到 header state select
 
 4. **图表功能**
 
@@ -1497,7 +1504,8 @@ Polymarket 市场链接与本地自选功能公共脚本。
 * `/api/polymarket/strategies/<row_id>/chart`
 * `/api/polymarket/strategies/<row_id>/events`
 * `/api/polymarket/strategies/<row_id>`（更新设置）
-* `/api/registry/strategies/<row_id>/state`（更新 `Stop` / `Virtual` / `Real`）
+* `/api/registry/strategies/<row_id>/mode`（更新 `Stop` / `Virtual` / `Real`）
+* `/api/registry/strategies/<row_id>/state-store/machine`（更新策略状态机 state）
 * `/api/polymarket/workspace-presets`
 * `/api/polymarket/markets`
 * `/api/polymarket/markets/resolve`
@@ -1544,11 +1552,11 @@ workspace_v3_patch.js
 
 职责边界：
 
-* `strategy_workspace_v2.js`：核心状态、API 请求、图表渲染、状态切换、设置保存、预设保存。
+* `strategy_workspace_v2.js`：核心状态、API 请求、图表渲染、mode/state 切换、设置保存、预设保存。
 * `workspace_v3_patch.js`：V3 展示层覆盖，包括 summary 布局、事件流合并、右侧面板和部分 DOM 重绘。
-* `workspace_v3.css`：当前工作台视觉样式，包括布局、滚动条、图表面板、状态 select 和右侧抽屉。
+* `workspace_v3.css`：当前工作台视觉样式，包括布局、滚动条、图表面板、mode/state select 和右侧抽屉。
 
-修改规则：涉及业务状态、请求参数、chart option、状态切换时优先改 `strategy_workspace_v2.js`；涉及排版和视觉时优先改 `workspace_v3.css`；涉及 V3 展示覆写时再改 `workspace_v3_patch.js`。
+修改规则：涉及业务状态、请求参数、chart option、mode/state 切换时优先改 `strategy_workspace_v2.js`；涉及排版和视觉时优先改 `workspace_v3.css`；涉及 V3 展示覆写时再改 `workspace_v3_patch.js`。
 
 ---
 
@@ -1581,9 +1589,10 @@ settings.js
 strategy_workspace_v2.js
    ├─ /api/polymarket/strategies/<row_id>/workspace
    ├─ /api/polymarket/strategies/<row_id>/chart
-   ├─ /api/polymarket/strategies/<row_id>/events
-   ├─ /api/registry/strategies/<row_id>/state
-   ├─ /api/polymarket/markets
+    ├─ /api/polymarket/strategies/<row_id>/events
+    ├─ /api/registry/strategies/<row_id>/mode
+    ├─ /api/registry/strategies/<row_id>/state-store/machine
+    ├─ /api/polymarket/markets
    ├─ /api/polymarket/markets/resolve
    ├─ /api/polymarket/workspace-presets
    └─ 对应 live SSE
@@ -1685,6 +1694,8 @@ Finnhub
 ### 18.1 页面接口
 
 * `GET /`
+* `GET /event-graph`
+* `GET /eventgraph`
 * `GET /settings`
 * `GET /watchlist`
 * `GET /strategies/<row_id>/workspace`
@@ -1712,6 +1723,7 @@ Finnhub
 ### 18.4 Polymarket 市场与策略接口
 
 * `GET /api/polymarket/markets`
+* `GET /api/polymarket/market-categories`
 * `GET /api/polymarket/markets/resolve`
 * `GET /api/polymarket/holdings`
 * `GET /api/polymarket/strategies`
@@ -1721,7 +1733,12 @@ Finnhub
 * `GET /api/polymarket/strategies/<row_id>/chart`
 * `GET /api/polymarket/strategies/<row_id>/events`
 
-### 18.5 工作台预设与回测接口
+### 18.5 EventGraph 接口
+
+* `GET /api/event-graph`
+* `GET /api/event-graph/categories`
+
+### 18.6 工作台预设与回测接口
 
 * `GET /api/polymarket/workspace-presets`
 * `POST /api/polymarket/workspace-presets`
@@ -1736,7 +1753,7 @@ Finnhub
 * 回测接口目前仍是占位接口，真实执行尚未落地。
 * 预设接口既支持全局预设，也支持绑定具体策略的预设。
 
-### 18.6 SSE 接口
+### 18.7 SSE 接口
 
 * `GET /api/live/strategies`
 * `GET /api/live/strategies/<row_id>/workspace`
@@ -2374,31 +2391,43 @@ Finnhub
 
 ---
 
-## 29. 策略状态机与虚拟盘表
+## 29. Mode、策略状态机与虚拟盘表
 
-### 29.1 状态机
+### 29.1 Mode
 
-`strategy_registry.state` 三态：`Stop / Virtual / Real`。
+`strategy_registry.mode` 表示运行模式，取值：`Stop / Virtual / Real`。
 
 切换规则：
-- 所有状态两两可切
-- 监控首页 `Mode` 列与工作台 header 状态 select 使用同一套逻辑
+- 所有 mode 两两可切
+- 监控首页 `Mode` 列与工作台 header mode select 使用同一套逻辑
 - Virtual ↔ Real、Stop -> Real、Real -> Stop 等高风险切换需前端弹确认框，仓位、订单、PnL 不迁移
-- `VirtualRunner` 只调度 `state=Virtual` 的策略
+- `VirtualRunner` 只调度 `mode=Virtual` 的策略
 
-后端校验在 `strategy_registry_service.update_strategy_state()` 中执行，当前只校验目标状态必须属于 Stop / Virtual / Real，非法枚举返回 HTTP 400。当前源码的 `strategy_registry` 建表定义没有 `ever_real` 字段；历史文档中“进入 Real 后永久置灰 Virtual”的描述不再代表当前实现。
+后端校验在 `strategy_registry_service.update_strategy_mode()` 中执行，当前只校验目标 mode 必须属于 Stop / Virtual / Real，非法枚举返回 HTTP 400。当前源码的 `strategy_registry` 建表定义没有 `ever_real` 字段；历史文档中“进入 Real 后永久置灰 Virtual”的描述不再代表当前实现。
 
-### 29.2 前端状态控件
+### 29.2 Strategy State
 
-策略监控首页和工作台都使用三态 select：
+`state` 表示策略代码声明的状态机状态，存储在 `strategy_state.namespace = machine` 的 `state` 键。选项来自 `StateMachineSchema`，默认回退为 `auto / idle / holding / cooldown / manual_review / stop_loss_locked`。
+
+前端入口：
+
+- 策略监控首页：`State` 列
+- 策略工作台：header 中的 `#workspaceMachineStateSelect`
+- 工作台参数面板：`Strategy State`
+
+保存接口：`PATCH /api/registry/strategies/<row_id>/state-store/machine`。
+
+### 29.3 前端模式控件
+
+策略监控首页和工作台都使用 mode select：
 - 策略监控首页：`Mode` 列 `.state-select`
 - 策略工作台：header 中的 `#workspaceStateSelect`
-- 当前状态通过 `state-Stop` / `state-Virtual` / `state-Real` class 着色
+- 当前 mode 通过 `state-Stop` / `state-Virtual` / `state-Real` class 着色
 - 切换成功后刷新对应页面数据，确保 summary、事件流和 source 状态同步
 
 颜色：Real=浅绿，Virtual=浅蓝，Stop=灰色 / slate。
 
-### 29.3 虚拟盘数据表
+### 29.4 虚拟盘数据表
 
 五张表在 `services/strategy_data_source.py` 的 `_DDL_VIRTUAL` 中定义，每次 `connect()` 幂等建表，与现有表共存于同一 SQLite 文件。
 
@@ -2410,11 +2439,11 @@ Finnhub
 | `strategy_virtual_events` | 策略事件流（actions/print/error/settle），支持相邻去重 |
 | `strategy_virtual_ticks` | 每次调度运行日志，记录 FunctionJson 原始输出与执行结果 |
 
-### 29.4 新增字段
+### 29.5 新增字段
 
-`_build_strategy_item()` 返回值至少包含 `state` 与 `strategy_id`，供前端状态 select 正确渲染并调用注册表 API。
+`_build_strategy_item()` 返回值至少包含 `mode`、`state` / `machine_state` 与 `strategy_id`，供前端 mode/state select 正确渲染并调用注册表与 state-store API。
 
-### 29.5 策略删除
+### 29.6 策略删除
 
 首页策略表每行操作列新增「删除」按钮：
 
@@ -2432,7 +2461,7 @@ Finnhub
 ```
 VirtualRunner（定时轮询，每 N 秒）
     ↓
-1. 读取 state=Virtual 的策略（strategy_registry + strategy_legs）
+1. 读取 mode=Virtual 的策略（strategy_registry + strategy_legs）
     ↓
 2. VirtualContextBuilder 构造 UseData（五层注入）
     ↓

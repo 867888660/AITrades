@@ -40,6 +40,7 @@ ON strategy_metric_events(strategy_id, run_at_utc DESC, id DESC);
 """
 
 _CATALOG_HIDE_BY_DEFAULT: set = set()
+_STATE_LANE_TIME_KEYS = {"now", "ts", "timestamp", "time"}
 
 
 def _now_iso() -> str:
@@ -243,10 +244,26 @@ def list_metric_catalog(strategy_id: int, limit: int = 200) -> Dict[str, Any]:
         return {
             "items": items,
             "numeric": [item for item in items if item["metric_type"] == "number" and item["value_state"] == "value"],
-            "state": [item for item in items if item["kind"] == "state" and item["value_state"] == "value"],
+            "state": [item for item in items if _is_state_lane_metric(item)],
         }
     finally:
         conn.close()
+
+
+def _looks_like_datetime_text(value: Any) -> bool:
+    text = str(value or "").strip()
+    return len(text) >= 16 and "T" in text and (text.endswith("Z") or "+" in text[10:] or text.count("-") >= 2)
+
+
+def _is_state_lane_metric(item: Dict[str, Any]) -> bool:
+    if item["kind"] != "state" or item["value_state"] != "value":
+        return False
+    key = str(item.get("key") or "").strip().lower()
+    if key in _STATE_LANE_TIME_KEYS or key.endswith("_until") or key.endswith("_at") or key.endswith("_time"):
+        return False
+    if str(item.get("metric_type") or "") == "text" and _looks_like_datetime_text(item.get("latest_value")):
+        return False
+    return True
 
 
 def _row_to_catalog_item(row: sqlite3.Row, count: int) -> Dict[str, Any]:

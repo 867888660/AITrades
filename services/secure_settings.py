@@ -13,6 +13,7 @@ SENSITIVE_SETTING_KEYS = (
     "finnhub_api_keys",
     "active_finnhub_api_key",
     "coingecko_api_key",
+    "llm_api_key",
 )
 
 
@@ -148,4 +149,6 @@ def strip_sensitive(settings: Dict[str, Any]) -> Dict[str, Any]:
             public["finnhub_api_key_count"] = len(value or [])
         elif key == "coingecko_api_key":
             public["has_coingecko_api_key"] = bool(value)
+        elif key == "llm_api_key":
+            public["has_llm_api_key"] = bool(value)
     return public

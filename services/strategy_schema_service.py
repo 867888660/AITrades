@@ -10,8 +10,22 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
+from services.strategy_data_source import derive_leg_kind
+
 _BASE_DIR = Path(__file__).resolve().parent.parent
 _STRATEGY_CODE_DIR = _BASE_DIR / "StrategyCode"
+
+_DEFAULT_STATE_MACHINE_SCHEMA = {
+    "default": "auto",
+    "states": [
+        {"value": "auto", "label": "Auto"},
+        {"value": "idle", "label": "Idle"},
+        {"value": "holding", "label": "Holding"},
+        {"value": "cooldown", "label": "Cooldown"},
+        {"value": "manual_review", "label": "Manual Review"},
+        {"value": "stop_loss_locked", "label": "Stop Loss Locked"},
+    ],
+}
 
 
 def _safe_code_name(code_name: Any) -> str:
@@ -72,6 +86,8 @@ def _normalize_schema(raw: Any) -> Dict[str, Dict[str, Any]]:
             item = dict(meta)
         else:
             item = {"default": meta}
+        if item.get("hidden") is True or item.get("visible") is False:
+            continue
         item.setdefault("label", name)
         item["type"] = _normalize_type(item.get("type") or item.get("kind"))
         result[name] = item
@@ -94,6 +110,7 @@ def _normalize_leg_schema(raw: Any) -> List[Dict[str, Any]]:
         items = [{
             "name": "Primary Polymarket",
             "label": "Leg 1",
+            "leg_kind": "binary_market",
             "asset_class": "polymarket_binary",
             "venue": "polymarket",
             "required": True,
@@ -101,12 +118,14 @@ def _normalize_leg_schema(raw: Any) -> List[Dict[str, Any]]:
     result: List[Dict[str, Any]] = []
     for index, item in enumerate(items):
         asset_class = str(item.get("asset_class") or item.get("type") or "polymarket_binary").strip() or "polymarket_binary"
+        leg_kind = derive_leg_kind({**item, "asset_class": asset_class})
         venue = str(item.get("venue") or ("polymarket" if asset_class == "polymarket_binary" else "")).strip()
         result.append({
             "leg_index": int(item.get("leg_index", index) or 0),
             "name": str(item.get("name") or item.get("label") or f"Leg {index + 1}"),
             "label": str(item.get("label") or item.get("name") or f"Leg {index + 1}"),
             "purpose": str(item.get("purpose") or item.get("description") or ""),
+            "leg_kind": leg_kind,
             "asset_class": asset_class,
             "venue": venue,
             "symbol": str(item.get("symbol") or "").strip().upper(),
@@ -116,6 +135,45 @@ def _normalize_leg_schema(raw: Any) -> List[Dict[str, Any]]:
             "params_schema": _normalize_schema(item.get("params_schema") or item.get("params") or {}),
         })
     return sorted(result, key=lambda item: int(item.get("leg_index") or 0))
+
+
+def _normalize_state_machine_schema(raw: Any) -> Dict[str, Any]:
+    """Normalize strategy-declared machine states for UI/API use."""
+    if isinstance(raw, list):
+        raw = {"states": raw}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    states_raw = raw.get("states") or raw.get("values") or raw.get("options") or []
+    states: List[Dict[str, Any]] = []
+    for item in states_raw:
+        if isinstance(item, str):
+            entry = {"value": item, "label": item.replace("_", " ").title()}
+        elif isinstance(item, dict):
+            value = str(item.get("value") or item.get("name") or item.get("key") or "").strip()
+            if not value:
+                continue
+            entry = dict(item)
+            entry["value"] = value
+            entry.setdefault("label", value.replace("_", " ").title())
+        else:
+            continue
+        states.append(entry)
+
+    if not states:
+        states = [dict(item) for item in _DEFAULT_STATE_MACHINE_SCHEMA["states"]]
+
+    values = {str(item.get("value")) for item in states}
+    default = str(raw.get("default") or _DEFAULT_STATE_MACHINE_SCHEMA["default"]).strip()
+    if default not in values:
+        default = str(states[0].get("value") or "auto")
+
+    return {
+        "default": default,
+        "states": states,
+        "label": raw.get("label") or "Strategy State",
+        "description": raw.get("description") or "Strategy-machine state, independent from Stop/Virtual/Real mode.",
+    }
 
 
 def _params_schema_from_inputs(inputs: Any) -> Dict[str, Dict[str, Any]]:
@@ -150,6 +208,7 @@ def get_strategy_code_schemas(code_name: Any) -> Dict[str, Dict[str, Dict[str, A
             "params": {},
             "controls": {},
             "runtime": {},
+            "state_machine": _normalize_state_machine_schema(None),
             "legs": _normalize_leg_schema(None),
         }
     params_schema = _normalize_schema(getattr(mod, "ParamsSchema", None))
@@ -161,6 +220,11 @@ def get_strategy_code_schemas(code_name: Any) -> Dict[str, Dict[str, Dict[str, A
         or getattr(mod, "UserControlsSchema", None)
     )
     runtime_schema = _normalize_schema(getattr(mod, "RuntimeStateSchema", None))
+    state_machine_schema = _normalize_state_machine_schema(
+        getattr(mod, "StateMachineSchema", None)
+        or getattr(mod, "StrategyStateSchema", None)
+        or getattr(mod, "MachineStateSchema", None)
+    )
     legs_schema = _normalize_leg_schema(
         getattr(mod, "LegsSchema", None)
         or getattr(mod, "InstrumentsSchema", None)
@@ -170,6 +234,7 @@ def get_strategy_code_schemas(code_name: Any) -> Dict[str, Dict[str, Dict[str, A
         "params": params_schema,
         "controls": controls_schema,
         "runtime": runtime_schema,
+        "state_machine": state_machine_schema,
         "legs": legs_schema,
     }
 
@@ -197,21 +262,34 @@ def strategy_state_payload(code_name: Any, state_bundle: Dict[str, Any]) -> Dict
     schemas = get_strategy_code_schemas(code_name)
     user_overrides = dict((state_bundle or {}).get("user") or {})
     runtime_overrides = dict((state_bundle or {}).get("runtime") or {})
+    machine_overrides = dict((state_bundle or {}).get("machine") or {})
     system_overrides = dict((state_bundle or {}).get("system") or {})
     controls_schema = schemas.get("controls") or {}
     runtime_schema = schemas.get("runtime") or {}
+    state_machine_schema = schemas.get("state_machine") or _normalize_state_machine_schema(None)
+    machine_state = str(machine_overrides.get("state") or state_machine_schema.get("default") or "auto").strip() or "auto"
     return {
         "schemas": schemas,
         "controls_schema": controls_schema,
         "runtime_state_schema": runtime_schema,
+        "state_machine_schema": state_machine_schema,
         "params_schema": schemas.get("params") or {},
         "user_defaults": schema_defaults(controls_schema),
         "runtime_defaults": schema_defaults(runtime_schema),
         "user_overrides": user_overrides,
         "runtime_overrides": runtime_overrides,
+        "machine_overrides": machine_overrides,
         "system_overrides": system_overrides,
         "controls": merge_schema_defaults(controls_schema, user_overrides),
         "user": merge_schema_defaults(controls_schema, user_overrides),
         "runtime": merge_schema_defaults(runtime_schema, runtime_overrides),
+        "machine": {"state": machine_state, **machine_overrides},
+        "state": machine_state,
+        "machine_state": machine_state,
+        "state_options": state_machine_schema.get("states") or [],
         "system": system_overrides,
     }
+
+
+def resolve_strategy_machine_state(code_name: Any, state_bundle: Dict[str, Any]) -> str:
+    return str(strategy_state_payload(code_name, state_bundle).get("machine_state") or "auto")

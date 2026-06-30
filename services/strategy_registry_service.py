@@ -13,16 +13,29 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from services.config_loader import load_web_settings
-from services.strategy_data_source import connect as _ds_connect, derive_instrument_id
+from services.strategy_data_source import connect as _ds_connect, derive_instrument_id, derive_leg_kind
 
 _BASE_DIR = Path(__file__).resolve().parent.parent
 _STRATEGY_CODE_DIR = _BASE_DIR / "StrategyCode"
-_VALID_STATES = {"Stop", "Virtual", "Real"}
+_VALID_MODES = {"Stop", "Virtual", "Real"}
+_DEADLINE_INPUT = {
+    "name": "Enddate",
+    "kind": "String",
+    "required": False,
+    "default": "",
+    "min": None,
+    "max": None,
+    "values": None,
+    "label": "Enddate",
+    "description": "Strategy deadline. Auto-filled from the selected market end date; edit it if the market date is wrong.",
+}
+_DEADLINE_INPUT_ALIASES = {"enddate", "endtime", "l0endtime"}
 
 _LEG_IDENTITY_FIELDS = (
     "condition_id",
     "yes_token",
     "no_token",
+    "leg_kind",
     "asset_class",
     "venue",
     "symbol",
@@ -89,6 +102,12 @@ def _normalize_input_name(value: Any) -> str:
     return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
 
 
+def _with_deadline_input(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if any(_normalize_input_name(item.get("name")) in _DEADLINE_INPUT_ALIASES for item in items):
+        return items
+    return [*items, dict(_DEADLINE_INPUT)]
+
+
 def _parse_function_introduction_inputs(text: Any) -> Dict[str, Dict[str, Any]]:
     intro = str(text or "")
     if not intro:
@@ -115,6 +134,22 @@ def _parse_function_introduction_inputs(text: Any) -> Dict[str, Dict[str, Any]]:
     return result
 
 
+def _schema_field_to_input(name: str, meta: Any) -> Dict[str, Any]:
+    item = dict(meta) if isinstance(meta, dict) else {"default": meta}
+    kind = str(item.get("type") or item.get("kind") or "String").strip()
+    return {
+        "name": name,
+        "kind": kind,
+        "required": bool(item.get("required", False)),
+        "default": item.get("default"),
+        "min": item.get("min"),
+        "max": item.get("max"),
+        "values": item.get("values") if isinstance(item.get("values"), list) else None,
+        "label": item.get("label") or name,
+        "description": item.get("description", ""),
+    }
+
+
 def get_strategy_code_inputs(code_name: str) -> List[Dict[str, Any]]:
     import importlib.util, sys as _sys
     safe = "".join(ch for ch in code_name if ch.isalnum() or ch in ("_", "-"))
@@ -129,6 +164,14 @@ def get_strategy_code_inputs(code_name: str) -> List[Dict[str, Any]]:
         mod = importlib.util.module_from_spec(spec)
         _sys.modules[mod_name] = mod
         spec.loader.exec_module(mod)
+        params_schema = getattr(mod, "ParamsSchema", None)
+        if isinstance(params_schema, dict) and params_schema:
+            return _with_deadline_input([
+                _schema_field_to_input(str(name), meta)
+                for name, meta in params_schema.items()
+                if str(name or "").strip()
+                and not (isinstance(meta, dict) and (meta.get("hidden") is True or meta.get("visible") is False))
+            ])
         inputs_raw = getattr(mod, "Inputs", [])
         intro = getattr(mod, "FunctionIntroduction", "")
         intro_inputs = _parse_function_introduction_inputs(intro)
@@ -152,7 +195,7 @@ def get_strategy_code_inputs(code_name: str) -> List[Dict[str, Any]]:
                 "max": inp.get("Max"),
                 "description": intro_meta.get("description") or inp.get("Description", ""),
             })
-        return result
+        return _with_deadline_input(result)
     except Exception:
         return []
     finally:
@@ -199,6 +242,7 @@ def _normalize_leg_payload(leg: Dict[str, Any], index: int = 0) -> Dict[str, Any
     result["no_token"] = result.get("no_token") or None
     asset_class = str(result.get("asset_class") or "polymarket_binary").strip() or "polymarket_binary"
     result["asset_class"] = asset_class
+    result["leg_kind"] = derive_leg_kind(result)
     result["venue"] = str(result.get("venue") or ("polymarket" if asset_class == "polymarket_binary" else "")).strip()
     result["symbol"] = str(result.get("symbol") or "").strip().upper()
     result["instrument_json"] = _json_text(result.get("instrument_json"), "{}")
@@ -213,9 +257,11 @@ def _normalize_leg_payload(leg: Dict[str, Any], index: int = 0) -> Dict[str, Any
 
 def _leg_identity(leg: Dict[str, Any], fallback_index: int = 0) -> tuple:
     return (
+        int(_safe_float(leg.get("leg_index"), fallback_index)),
         str(leg.get("condition_id") or "").strip(),
         str(leg.get("yes_token") or "").strip(),
         str(leg.get("no_token") or "").strip(),
+        str(leg.get("leg_kind") or derive_leg_kind(leg)).strip(),
         str(leg.get("asset_class") or "polymarket_binary").strip(),
         str(leg.get("venue") or "").strip(),
         str(leg.get("symbol") or "").strip().upper(),
@@ -290,6 +336,9 @@ def _fmt_leg(row: Dict[str, Any]) -> Dict[str, Any]:
 
 def _fmt_strategy(row: Dict[str, Any], legs: List[Dict[str, Any]]) -> Dict[str, Any]:
     r = dict(row)
+    mode = str(r.get("mode") or r.get("state") or "Stop").strip() or "Stop"
+    r["mode"] = mode
+    r["state"] = mode
     r["input_json"] = _parse_json(r.get("input_json"))
     r["legs"] = [_fmt_leg(lg) for lg in legs]
     return r
@@ -344,9 +393,9 @@ def create_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not name:
         raise ValueError("strategy_name is required")
     code = str(payload.get("strategy_code") or "").strip()
-    state = str(payload.get("state") or "Stop").strip()
-    if state not in _VALID_STATES:
-        raise ValueError(f"state must be one of {_VALID_STATES}")
+    mode = str(payload.get("mode") or payload.get("state") or "Stop").strip()
+    if mode not in _VALID_MODES:
+        raise ValueError(f"mode must be one of {_VALID_MODES}")
 
     input_raw = payload.get("input_json")
     if isinstance(input_raw, str):
@@ -360,6 +409,7 @@ def create_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
             "condition_id": str(payload.get("condition_id") or "").strip(),
             "yes_token": payload.get("yes_token"),
             "no_token": payload.get("no_token"),
+            "leg_kind": payload.get("leg_kind") or payload.get("kind") or "",
             "asset_class": payload.get("asset_class") or "polymarket_binary",
             "venue": payload.get("venue") or "polymarket",
             "symbol": payload.get("symbol") or "",
@@ -373,14 +423,15 @@ def create_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
     uid = f"stg_{uuid.uuid4().hex[:16]}"
     conn = _connect()
     try:
+        registry_cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(strategy_registry)").fetchall()}
         conn.execute(
             """INSERT INTO strategy_registry(
-                strategy_uid, strategy_name, strategy_code, state,
+                strategy_uid, strategy_name, strategy_code, mode,
                 initial_capital, strategy_bankroll, profit_roll_ratio, realized_profit,
                 input_json, created_at_utc, updated_at_utc
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                uid, name, code, state,
+                uid, name, code, mode,
                 _safe_float(payload.get("initial_capital")),
                 _safe_float(payload.get("strategy_bankroll")),
                 _safe_float(payload.get("profit_roll_ratio")),
@@ -389,16 +440,18 @@ def create_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
             ),
         )
         sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        if "state" in registry_cols:
+            conn.execute("UPDATE strategy_registry SET state = ? WHERE strategy_id = ?", (mode, sid))
         for i, raw_leg in enumerate(legs_payload):
             leg = _normalize_leg_payload(raw_leg, i)
             leg["leg_uid"] = leg["leg_uid"] or _new_leg_uid(sid)
             conn.execute(
                 """INSERT INTO strategy_legs(
                     strategy_id, leg_uid, leg_index, condition_id, yes_token, no_token,
-                    asset_class, venue, symbol, instrument_id, instrument_json,
+                    leg_kind, asset_class, venue, symbol, instrument_id, instrument_json,
                     budget_cap, params_json,
                     created_at_utc, updated_at_utc
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     sid,
                     leg["leg_uid"],
@@ -406,6 +459,7 @@ def create_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
                     leg["condition_id"],
                     leg["yes_token"],
                     leg["no_token"],
+                    leg["leg_kind"],
                     leg["asset_class"],
                     leg["venue"],
                     leg["symbol"],
@@ -430,8 +484,12 @@ def create_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def update_strategy(strategy_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    payload = dict(payload or {})
+    if "mode" not in payload and "state" in payload:
+        payload["mode"] = payload["state"]
     conn = _connect()
     try:
+        registry_cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(strategy_registry)").fetchall()}
         existing = conn.execute(
             "SELECT * FROM strategy_registry WHERE strategy_id = ?", (strategy_id,)
         ).fetchone()
@@ -445,17 +503,20 @@ def update_strategy(strategy_id: int, payload: Dict[str, Any]) -> Dict[str, Any]
 
         sets: List[str] = []
         vals: List[Any] = []
-        for col in ("strategy_name", "strategy_code", "state",
+        for col in ("strategy_name", "strategy_code", "mode",
                      "initial_capital", "strategy_bankroll",
                      "profit_roll_ratio", "realized_profit"):
             if col not in payload:
                 continue
-            if col == "state":
+            if col == "mode":
                 v = str(payload[col]).strip()
-                if v not in _VALID_STATES:
-                    raise ValueError(f"state must be one of {_VALID_STATES}")
+                if v not in _VALID_MODES:
+                    raise ValueError(f"mode must be one of {_VALID_MODES}")
                 sets.append(f"{col} = ?")
                 vals.append(v)
+                if "state" in registry_cols:
+                    sets.append("state = ?")
+                    vals.append(v)
             elif col in ("initial_capital", "strategy_bankroll",
                          "profit_roll_ratio", "realized_profit"):
                 sets.append(f"{col} = ?")
@@ -500,12 +561,12 @@ def update_strategy(strategy_id: int, payload: Dict[str, Any]) -> Dict[str, Any]
                 leg = _normalize_leg_payload(raw_leg, i)
                 leg["leg_uid"] = _leg_uid_for_payload(existing_legs, leg, i, strategy_id)
                 conn.execute(
-                    """INSERT INTO strategy_legs(
+                """INSERT INTO strategy_legs(
                         strategy_id, leg_uid, leg_index, condition_id, yes_token, no_token,
-                        asset_class, venue, symbol, instrument_id, instrument_json,
+                        leg_kind, asset_class, venue, symbol, instrument_id, instrument_json,
                         budget_cap, params_json,
                         created_at_utc, updated_at_utc
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         strategy_id,
                         leg["leg_uid"],
@@ -513,6 +574,7 @@ def update_strategy(strategy_id: int, payload: Dict[str, Any]) -> Dict[str, Any]
                         leg["condition_id"],
                         leg["yes_token"],
                         leg["no_token"],
+                        leg["leg_kind"],
                         leg["asset_class"],
                         leg["venue"],
                         leg["symbol"],
@@ -541,11 +603,16 @@ def update_strategy(strategy_id: int, payload: Dict[str, Any]) -> Dict[str, Any]
     return result
 
 
-# All state transitions are allowed; confirmation is handled on the frontend.
+# All mode transitions are allowed; confirmation is handled on the frontend.
+def update_strategy_mode(strategy_id: int, new_mode: str) -> Dict[str, Any]:
+    if new_mode not in _VALID_MODES:
+        raise ValueError(f"mode must be one of {_VALID_MODES}")
+    return update_strategy(strategy_id, {"mode": new_mode})
+
+
 def update_strategy_state(strategy_id: int, new_state: str) -> Dict[str, Any]:
-    if new_state not in _VALID_STATES:
-        raise ValueError(f"state must be one of {_VALID_STATES}")
-    return update_strategy(strategy_id, {"state": new_state})
+    """Compatibility alias for the old Stop/Virtual/Real route."""
+    return update_strategy_mode(strategy_id, new_state)
 
 
 def update_strategy_legs(strategy_id: int, legs: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -577,10 +644,10 @@ def update_strategy_legs(strategy_id: int, legs: List[Dict[str, Any]]) -> Dict[s
             conn.execute(
                 """INSERT INTO strategy_legs(
                     strategy_id, leg_uid, leg_index, condition_id, yes_token, no_token,
-                    asset_class, venue, symbol, instrument_id, instrument_json,
+                    leg_kind, asset_class, venue, symbol, instrument_id, instrument_json,
                     budget_cap, params_json,
                     created_at_utc, updated_at_utc
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     strategy_id,
                     leg["leg_uid"],
@@ -588,6 +655,7 @@ def update_strategy_legs(strategy_id: int, legs: List[Dict[str, Any]]) -> Dict[s
                     leg["condition_id"],
                     leg["yes_token"],
                     leg["no_token"],
+                    leg["leg_kind"],
                     leg["asset_class"],
                     leg["venue"],
                     leg["symbol"],

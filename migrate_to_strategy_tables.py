@@ -37,7 +37,7 @@ def build_input_json(row: dict) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def resolve_state(row: dict) -> str:
+def resolve_mode(row: dict) -> str:
     raw = str(row.get("State") or row.get("IsVirtual") or "").strip().lower()
     if raw in ("true", "1", "yes", "virtual"):
         return "Virtual"
@@ -46,14 +46,25 @@ def resolve_state(row: dict) -> str:
     return "Stop"
 
 
+def polymarket_instrument_id(condition_id: str, yes_token: str | None, no_token: str | None) -> str:
+    condition_id = str(condition_id or "").strip()
+    if condition_id:
+        return f"poly:condition:{condition_id}"
+    yes_token = str(yes_token or "").strip()
+    no_token = str(no_token or "").strip()
+    if yes_token or no_token:
+        return f"poly:tokens:{yes_token}:{no_token}"
+    return "polymarket_binary:polymarket:leg0"
+
+
 DDL_REGISTRY = """
 CREATE TABLE IF NOT EXISTS strategy_registry (
     strategy_id       INTEGER PRIMARY KEY AUTOINCREMENT,
     strategy_uid      TEXT    NOT NULL UNIQUE,
     strategy_name     TEXT    NOT NULL,
     strategy_code     TEXT    NOT NULL DEFAULT '',
-    state             TEXT    NOT NULL DEFAULT 'Stop'
-                      CHECK (state IN ('Stop', 'Virtual', 'Real')),
+    mode              TEXT    NOT NULL DEFAULT 'Stop'
+                      CHECK (mode IN ('Stop', 'Virtual', 'Real')),
     initial_capital   REAL    NOT NULL DEFAULT 0,
     strategy_bankroll REAL    NOT NULL DEFAULT 0,
     profit_roll_ratio REAL    NOT NULL DEFAULT 0,
@@ -68,10 +79,17 @@ DDL_LEGS = """
 CREATE TABLE IF NOT EXISTS strategy_legs (
     leg_id          INTEGER PRIMARY KEY AUTOINCREMENT,
     strategy_id     INTEGER NOT NULL,
+    leg_uid         TEXT    NOT NULL DEFAULT '',
     leg_index       INTEGER NOT NULL DEFAULT 0,
     condition_id    TEXT    NOT NULL DEFAULT '',
     yes_token       TEXT,
     no_token        TEXT,
+    leg_kind        TEXT    NOT NULL DEFAULT 'binary_market',
+    asset_class     TEXT    NOT NULL DEFAULT 'polymarket_binary',
+    venue           TEXT    NOT NULL DEFAULT 'polymarket',
+    symbol          TEXT    NOT NULL DEFAULT '',
+    instrument_id   TEXT    NOT NULL DEFAULT '',
+    instrument_json TEXT    NOT NULL DEFAULT '{}',
     budget_cap      REAL    NOT NULL DEFAULT 0,
     params_json     TEXT    NOT NULL DEFAULT '{}',
     created_at_utc  TEXT    NOT NULL,
@@ -82,11 +100,14 @@ CREATE TABLE IF NOT EXISTS strategy_legs (
 """
 
 DDL_INDEXES = """
-CREATE INDEX IF NOT EXISTS idx_strategy_registry_state ON strategy_registry(state);
+CREATE INDEX IF NOT EXISTS idx_strategy_registry_mode ON strategy_registry(mode);
 CREATE INDEX IF NOT EXISTS idx_strategy_legs_strategy_id ON strategy_legs(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_strategy_legs_condition_id ON strategy_legs(condition_id);
 CREATE INDEX IF NOT EXISTS idx_strategy_legs_yes_token ON strategy_legs(yes_token);
 CREATE INDEX IF NOT EXISTS idx_strategy_legs_no_token ON strategy_legs(no_token);
+CREATE INDEX IF NOT EXISTS idx_strategy_legs_instrument_id ON strategy_legs(instrument_id);
+CREATE INDEX IF NOT EXISTS idx_strategy_legs_asset_class ON strategy_legs(asset_class);
+CREATE INDEX IF NOT EXISTS idx_strategy_legs_leg_kind ON strategy_legs(leg_kind);
 """
 
 DDL_COMPAT_VIEW = """
@@ -95,7 +116,8 @@ SELECT
     s.strategy_id                AS row_id,
     s.strategy_name              AS "Strategy",
     s.strategy_code              AS "Code",
-    s.state                      AS "State",
+    s.mode                       AS "Mode",
+    s.mode                       AS "State",
     s.initial_capital            AS "initial_capital",
     s.strategy_bankroll          AS "strategy_bankroll",
     s.profit_roll_ratio          AS "profit_roll_ratio",
@@ -104,6 +126,11 @@ SELECT
     l.condition_id               AS "condition_id",
     l.yes_token                  AS "yes_token",
     l.no_token                   AS "no_token",
+    l.leg_kind                   AS "leg_kind",
+    l.asset_class                AS "asset_class",
+    l.venue                      AS "venue",
+    l.symbol                     AS "symbol",
+    l.instrument_id              AS "instrument_id",
     l.budget_cap                 AS "budget_cap"
 FROM strategy_registry s
 LEFT JOIN strategy_legs l
@@ -154,11 +181,11 @@ def migrate():
         strategy_uid = f"stg_{uuid.uuid4().hex[:16]}"
         strategy_name = d.get("Strategy") or d.get("Code") or f"strategy_{rid}"
         strategy_code = d.get("Strategy") or d.get("Code") or ""
-        state = resolve_state(d)
+        mode = resolve_mode(d)
 
         conn.execute(
             """INSERT INTO strategy_registry(
-                strategy_uid, strategy_name, strategy_code, state,
+                strategy_uid, strategy_name, strategy_code, mode,
                 initial_capital, strategy_bankroll, profit_roll_ratio, realized_profit,
                 input_json, created_at_utc, updated_at_utc
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
@@ -166,7 +193,7 @@ def migrate():
                 strategy_uid,
                 strategy_name,
                 strategy_code,
-                state,
+                mode,
                 safe_float(d.get("initial_capital")),
                 safe_float(d.get("strategy_bankroll")),
                 safe_float(d.get("profit_roll_ratio")),
@@ -181,26 +208,38 @@ def migrate():
         yes_cap = safe_float(d.get("Yes_Max_BudgetCap"))
         no_cap = safe_float(d.get("No_Max_BudgetCap"))
         budget_cap = max(yes_cap, no_cap)
+        condition_id = d.get("condition_id") or ""
+        yes_token = d.get("yes_token") or None
+        no_token = d.get("no_token") or None
+        instrument_id = polymarket_instrument_id(condition_id, yes_token, no_token)
 
         conn.execute(
             """INSERT INTO strategy_legs(
-                strategy_id, leg_index, condition_id, yes_token, no_token,
+                strategy_id, leg_uid, leg_index, condition_id, yes_token, no_token,
+                leg_kind, asset_class, venue, symbol, instrument_id, instrument_json,
                 budget_cap, params_json,
                 created_at_utc, updated_at_utc
-            ) VALUES (?,?,?,?,?,?,?,?,?)""",
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 strategy_id,
+                f"leg_{strategy_id}_0_{uuid.uuid4().hex[:8]}",
                 0,
-                d.get("condition_id") or "",
-                d.get("yes_token") or None,
-                d.get("no_token") or None,
+                condition_id,
+                yes_token,
+                no_token,
+                "binary_market",
+                "polymarket_binary",
+                "polymarket",
+                "",
+                instrument_id,
+                "{}",
                 budget_cap,
                 "{}",
                 ts,
                 ts,
             ),
         )
-        print(f"  rowid={rid} -> strategy_id={strategy_id} uid={strategy_uid} state={state}")
+        print(f"  rowid={rid} -> strategy_id={strategy_id} uid={strategy_uid} mode={mode}")
 
     conn.commit()
     # Verify

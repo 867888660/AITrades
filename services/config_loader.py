@@ -29,6 +29,63 @@ UI_PATH_KEYS = tuple(DEFAULT_DB_FILES.keys()) + ("strategy_metrics_db_dir",)
 DEFAULT_DIR_SETTINGS = {
     "strategy_metrics_db_dir": "strategy_metrics_dbs",
 }
+DEFAULT_AGENT_POLICY = {
+    "enabled": True,
+    "permissions": {
+        "market_read": True,
+        "market_search": True,
+        "market_scan": True,
+        "strategy_read_all": True,
+        "strategy_detail_read": True,
+        "strategy_workspace_read": True,
+        "strategy_events_read": True,
+        "strategy_state_read": True,
+        "strategy_draft_create": True,
+        "strategy_draft_update": True,
+        "strategy_draft_delete": True,
+        "strategy_batch_propose": True,
+        "risk_check": True,
+        "strategy_simulate": True,
+        "strategy_submit": True,
+        "order_read": True,
+        "pnl_read": True,
+        "audit_read": True,
+        "event_read": True,
+        "event_news_refresh": True,
+        "event_news_search": True,
+    },
+    "limits": {
+        "max_strategy_budget_usdc": 100.0,
+        "max_single_order_usdc": 20.0,
+        "max_daily_spend_usdc": 150.0,
+        "max_market_exposure_usdc": 50.0,
+        "max_global_exposure_usdc": 300.0,
+        "max_slippage_bps": 100.0,
+        "allowed_market_ids": [],
+        "allowed_venues": ["polymarket"],
+        "allow_market_order": False,
+        "require_human_approval": True,
+        "approval_expires_minutes": 1440,
+    },
+    "defaults": {
+        "scan_categories": ["Elections Politics", "World", "Geopolitics"],
+        "scan_sorts": ["volume24h", "volume", "liquidity", "spread"],
+        "proposal_budget_usdc": 20.0,
+        "proposal_single_order_usdc": 5.0,
+        "max_batch_drafts": 5,
+        "selection_mode": "yes",
+    },
+}
+
+DEFAULT_LLM_SETTINGS = {
+    "enabled": False,
+    "provider": "dashscope_openai_compatible",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "model": "qwen-plus",
+    "temperature": 0.2,
+    "max_tokens": 2048,
+    "timeout_sec": 60,
+}
 
 
 def load_config() -> Dict[str, Any]:
@@ -68,6 +125,117 @@ def _to_clean_list(raw: Any, uppercase: bool = False) -> list[str]:
             out.append(value)
             seen.add(value)
     return out
+
+
+def _clone_json(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+def _to_setting_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on", "enable", "enabled", "是", "启用"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "disable", "disabled", "否", "禁用"}:
+        return False
+    return default
+
+
+def _to_setting_float(value: Any, default: float, min_value: float = 0.0, max_value: float | None = None) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        result = float(default)
+    result = max(min_value, result)
+    if max_value is not None:
+        result = min(max_value, result)
+    return result
+
+
+def _to_setting_int(value: Any, default: int, min_value: int = 0, max_value: int | None = None) -> int:
+    try:
+        result = int(float(value))
+    except (TypeError, ValueError):
+        result = int(default)
+    result = max(min_value, result)
+    if max_value is not None:
+        result = min(max_value, result)
+    return result
+
+
+def _normalize_agent_policy(policy: Any) -> Dict[str, Any]:
+    normalized = _clone_json(DEFAULT_AGENT_POLICY)
+    incoming = policy if isinstance(policy, dict) else {}
+
+    normalized["enabled"] = _to_setting_bool(incoming.get("enabled"), normalized["enabled"])
+
+    incoming_permissions = incoming.get("permissions") if isinstance(incoming.get("permissions"), dict) else {}
+    for key, default_value in normalized["permissions"].items():
+        normalized["permissions"][key] = _to_setting_bool(incoming_permissions.get(key), bool(default_value))
+
+    incoming_limits = incoming.get("limits") if isinstance(incoming.get("limits"), dict) else {}
+    limit_defaults = normalized["limits"]
+    normalized["limits"].update({
+        "max_strategy_budget_usdc": _to_setting_float(incoming_limits.get("max_strategy_budget_usdc"), limit_defaults["max_strategy_budget_usdc"]),
+        "max_single_order_usdc": _to_setting_float(incoming_limits.get("max_single_order_usdc"), limit_defaults["max_single_order_usdc"]),
+        "max_daily_spend_usdc": _to_setting_float(incoming_limits.get("max_daily_spend_usdc"), limit_defaults["max_daily_spend_usdc"]),
+        "max_market_exposure_usdc": _to_setting_float(incoming_limits.get("max_market_exposure_usdc"), limit_defaults["max_market_exposure_usdc"]),
+        "max_global_exposure_usdc": _to_setting_float(incoming_limits.get("max_global_exposure_usdc"), limit_defaults["max_global_exposure_usdc"]),
+        "max_slippage_bps": _to_setting_float(incoming_limits.get("max_slippage_bps"), limit_defaults["max_slippage_bps"], 0.0, 10000.0),
+        "allowed_market_ids": _to_clean_list(incoming_limits.get("allowed_market_ids", limit_defaults["allowed_market_ids"])),
+        "allowed_venues": [item.lower() for item in _to_clean_list(incoming_limits.get("allowed_venues", limit_defaults["allowed_venues"]))],
+        "allow_market_order": _to_setting_bool(incoming_limits.get("allow_market_order"), bool(limit_defaults["allow_market_order"])),
+        "require_human_approval": _to_setting_bool(incoming_limits.get("require_human_approval"), bool(limit_defaults["require_human_approval"])),
+        "approval_expires_minutes": _to_setting_int(incoming_limits.get("approval_expires_minutes"), int(limit_defaults["approval_expires_minutes"]), 1, 43200),
+    })
+
+    incoming_defaults = incoming.get("defaults") if isinstance(incoming.get("defaults"), dict) else {}
+    default_values = normalized["defaults"]
+    selection_mode = str(incoming_defaults.get("selection_mode", default_values["selection_mode"]) or "yes").strip().lower()
+    if selection_mode not in {"yes", "no", "cheaper", "balanced"}:
+        selection_mode = "yes"
+    normalized["defaults"].update({
+        "scan_categories": _to_clean_list(incoming_defaults.get("scan_categories", default_values["scan_categories"])),
+        "scan_sorts": _to_clean_list(incoming_defaults.get("scan_sorts", default_values["scan_sorts"])),
+        "proposal_budget_usdc": _to_setting_float(incoming_defaults.get("proposal_budget_usdc"), default_values["proposal_budget_usdc"]),
+        "proposal_single_order_usdc": _to_setting_float(incoming_defaults.get("proposal_single_order_usdc"), default_values["proposal_single_order_usdc"]),
+        "max_batch_drafts": _to_setting_int(incoming_defaults.get("max_batch_drafts"), int(default_values["max_batch_drafts"]), 1, 50),
+        "selection_mode": selection_mode,
+    })
+    if not normalized["limits"]["allowed_venues"]:
+        normalized["limits"]["allowed_venues"] = ["polymarket"]
+    if not normalized["defaults"]["scan_categories"]:
+        normalized["defaults"]["scan_categories"] = list(DEFAULT_AGENT_POLICY["defaults"]["scan_categories"])
+    if not normalized["defaults"]["scan_sorts"]:
+        normalized["defaults"]["scan_sorts"] = list(DEFAULT_AGENT_POLICY["defaults"]["scan_sorts"])
+    return normalized
+
+
+def _normalize_llm_settings(settings: Any) -> Dict[str, Any]:
+    normalized = _clone_json(DEFAULT_LLM_SETTINGS)
+    incoming = settings if isinstance(settings, dict) else {}
+    provider = str(incoming.get("provider") or normalized["provider"]).strip() or normalized["provider"]
+    if provider != "dashscope_openai_compatible":
+        provider = "dashscope_openai_compatible"
+    base_url = str(incoming.get("base_url") or normalized["base_url"]).strip().rstrip("/")
+    if not base_url:
+        base_url = normalized["base_url"]
+    model = str(incoming.get("model") or normalized["model"]).strip() or normalized["model"]
+    normalized.update({
+        "enabled": _to_setting_bool(incoming.get("enabled"), bool(normalized["enabled"])),
+        "provider": provider,
+        "base_url": base_url,
+        "model": model,
+        "temperature": _to_setting_float(incoming.get("temperature"), float(normalized["temperature"]), 0.0, 2.0),
+        "max_tokens": _to_setting_int(incoming.get("max_tokens"), int(normalized["max_tokens"]), 1, 32768),
+        "timeout_sec": _to_setting_int(incoming.get("timeout_sec"), int(normalized["timeout_sec"]), 5, 300),
+    })
+    return normalized
 
 
 def _looks_like_sqlite_path(value: Any) -> bool:
@@ -177,6 +345,9 @@ def get_default_web_settings() -> Dict[str, Any]:
         "include_crypto_fundamentals": True,
         "coingecko_api_key": "",
         "coingecko_api_key_header": "x-cg-demo-api-key",
+        "agent_policy": _normalize_agent_policy({}),
+        "llm_settings": _normalize_llm_settings({}),
+        "llm_api_key": "",
     }
 
 
@@ -191,6 +362,8 @@ def _load_web_settings_uncached() -> Dict[str, Any]:
     defaults["finnhub_api_keys"] = _to_clean_list(defaults.get("finnhub_api_keys", []))
     defaults["crypto_symbols"] = _to_clean_list(defaults.get("crypto_symbols", []), uppercase=True)
     defaults["finance_symbols"] = _to_clean_list(defaults.get("finance_symbols", []), uppercase=True)
+    defaults["agent_policy"] = _normalize_agent_policy(defaults.get("agent_policy", {}))
+    defaults["llm_settings"] = _normalize_llm_settings(defaults.get("llm_settings", {}))
     defaults = _normalize_strategy_storage_settings(defaults)
     defaults = _normalize_db_paths(defaults)
     return _normalize_dir_paths(defaults)
@@ -265,6 +438,9 @@ def save_web_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     current["coingecko_api_key"] = str(payload.get("coingecko_api_key", current.get("coingecko_api_key", ""))).strip()
     current["coingecko_api_key_header"] = str(payload.get("coingecko_api_key_header", current.get("coingecko_api_key_header", "x-cg-demo-api-key"))).strip() or "x-cg-demo-api-key"
     current["include_crypto_fundamentals"] = bool(payload.get("include_crypto_fundamentals", current.get("include_crypto_fundamentals", True)))
+    current["agent_policy"] = _normalize_agent_policy(payload.get("agent_policy", current.get("agent_policy", {})))
+    current["llm_settings"] = _normalize_llm_settings(payload.get("llm_settings", current.get("llm_settings", {})))
+    current["llm_api_key"] = str(payload.get("llm_api_key", current.get("llm_api_key", ""))).strip()
     current = _normalize_strategy_storage_settings(current)
     current = _normalize_db_paths(current)
     current = _normalize_dir_paths(current)

@@ -50,11 +50,14 @@ CREATE TABLE strategy_state (
 
 | 字段 | 含义 |
 |---|---|
+| `leg_kind` | 腿的标的/合约形态，例如 `binary_market`、`spot`、`equity`、`tokenized_equity`、`option`、`perp`、`future`。未显式填写时按 `asset_class` 自动推导。 |
 | `asset_class` | `polymarket_binary` / `crypto_spot` / `equity` / `equity_option` 等 |
 | `venue` | 交易或行情来源，例如 `polymarket`、`binance`、`finnhub`、`opra` |
 | `symbol` | 标准代码，例如 `BTCUSDT`、`NVDA` |
 | `instrument_id` | 稳定标的 ID，例如 `crypto:binance:BTCUSDT` |
 | `instrument_json` | 资产类别专用 metadata |
+
+`asset_class` 表示资产域，`leg_kind` 表示执行/合约形态。示例：`asset_class=crypto_spot` 通常推导出 `leg_kind=spot`；`asset_class=polymarket_binary` 推导出 `leg_kind=binary_market`。策略代码推荐同时读取二者，避免只靠 Polymarket Yes/No 字段判断腿类型。
 
 旧 Polymarket 字段 `condition_id`、`yes_token`、`no_token` 继续保留。旧策略仍然可以读 `L0_Yes_AskPrice` 等 legacy 字段。
 
@@ -79,7 +82,10 @@ CREATE TABLE strategy_state (
     {
       "index": 0,
       "instrument_id": "poly:condition:0x...",
+      "leg_kind": "binary_market",
       "asset_class": "polymarket_binary",
+      "budget_cap": 100,
+      "configured_budget_cap": 100,
       "quote": {
         "yes_bid": 0.41,
         "yes_ask": 0.43,
@@ -92,6 +98,7 @@ CREATE TABLE strategy_state (
       }
     }
   ],
+  "L0_LegKind": "binary_market",
   "L0_Yes_AskPrice": 0.43
 }
 ```
@@ -100,6 +107,7 @@ CREATE TABLE strategy_state (
 
 ```python
 instrument = usedata["Instruments"][0]
+leg_kind = instrument.get("leg_kind")
 state = usedata.get("State", {})
 params = usedata.get("Params", {})
 ```
@@ -137,6 +145,8 @@ usedata["Yes_now_ask"]
 
 `SET_TARGET` 当前按 `budget_cap * target` 计算目标名义金额。非 Polymarket 虚拟成交会写入 v2 虚拟账本。
 
+预算字段分为两层：`configured_budget_cap` 是用户在 leg 上配置的值；`budget_cap` 是运行时有效预算。单腿策略和 L0 为了兼容旧策略，`configured_budget_cap=0` 时仍可动态使用虚拟账户权益；多腿策略的非 L0 leg 若配置为 0，则表示该 leg 没有交易预算，运行时 `budget_cap` 保持 0。
+
 ## v2 虚拟账本
 
 新增三张表：
@@ -145,7 +155,7 @@ usedata["Yes_now_ask"]
 |---|---|
 | `strategy_virtual_positions_v2` | 按 `strategy_id + instrument_id + side` 记录多资产持仓 |
 | `strategy_virtual_orders_v2` | 记录多资产虚拟订单 |
-| `strategy_cash_ledger` | 预留现金流水账本 |
+| `strategy_cash_ledger` | 虚拟账户现金变化的基础流水账本 |
 
 旧 Polymarket 虚拟盘仍写入 `strategy_virtual_positions` / `strategy_virtual_orders`，以保持工作台和图表兼容。多资产动作先写 v2 表。
 
@@ -180,18 +190,25 @@ Strategy / Leg / Leg UID / Asset / Venue / Symbol / Instrument / Polymarket Toke
 已经落地：
 
 - `strategy_state` 表和读写服务。
-- `strategy_legs` 通用标的字段。
+- `strategy_legs` 通用标的字段，包括 `leg_kind`、`asset_class`、`venue`、`symbol`、`instrument_id`、`instrument_json`。
 - `UseData` v2 结构：`Params`、`State`、`Portfolio`、`Instruments`。
+- `UseData` 已注入 `L{n}_LegKind`、`LegKind` 兼容别名以及 `Instruments[n].leg_kind` / `Instruments[n].configured_budget_cap`。
 - `FunctionJson.state_updates` 写回。
 - `SET_BINARY_TARGET`、`SET_TARGET`、`ORDER` 动作解析。
 - 非 Polymarket 虚拟订单与持仓写入 v2 表。
 - `/api/virtual/strategies/<id>/positions` 与 `/orders` 返回 `data_v2`。
-- `/ledger` 与 `/api/ledger` 已按多资产口径聚合 Virtual / Real / Unassigned 账本。
+- `/ledger` 与 `/api/ledger` 已按多资产口径聚合 Virtual / Real / Unassigned 账本，并展示 leg 归属。
+- `strategy_cash_ledger` 不再只是预留表，虚拟账户现金变化会写入基础流水。
+- 新增策略草稿 UseData 会按 `legs[]` 构造多腿上下文，不再只取第一条 `condition_id`。
+- 修改 leg 身份时已把 `leg_index` 纳入比较；旧行缺失 `instrument_id` 时会按当前 leg 内容回填。
 - Dashboard `平仓` 按钮当前可对 Virtual 策略执行多资产 force-flat：Polymarket 用 `CLOSE_ALL`，非 Polymarket 用 `SET_TARGET target=0`。
 
 仍需后续完成：
 
-- Dashboard / Workspace 的多资产标的编辑 UI。
+- v2 虚拟持仓 / 订单需要继续补 `leg_uid + leg_index` 级归因。目前 v2 主键仍偏 `strategy_id + instrument_id + side`，同一策略内两个腿复用同一标的时会合并仓位。
+- Dashboard / Workspace / Chart 的非 Polymarket v2 仓位与 PnL 需要统一接入；当前摘要和图表仍主要是 Polymarket Yes/No 口径。
+- 非 Polymarket 执行模型还只是 long-only 虚拟账本，需要补交易单位、tick size、最小数量、做空/衍生品、滑点和真实 adapter。
+- Dashboard / Workspace 的多资产标的编辑 UI 还需要继续打磨。
 - 股票期权真实行情 adapter 与 greeks 字段。
 - 实盘执行 adapter 的多资产路由。
 - 回测引擎统一读取 v2 ledger。

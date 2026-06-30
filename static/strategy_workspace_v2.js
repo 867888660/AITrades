@@ -35,6 +35,7 @@ const workspacePresetStatus = document.getElementById("workspacePresetStatus");
 const workspaceAutoRefreshBadge = document.getElementById("workspaceAutoRefreshBadge");
 const workspaceAutoRefreshText = document.getElementById("workspaceAutoRefreshText");
 const workspaceStateSelect = document.getElementById("workspaceStateSelect");
+const workspaceMachineStateSelect = document.getElementById("workspaceMachineStateSelect");
 const workspaceDebugMeta = document.getElementById("workspaceDebugMeta");
 const workspaceDebugLog = document.getElementById("workspaceDebugLog");
 const workspaceDebugClearBtn = document.getElementById("workspaceDebugClearBtn");
@@ -55,6 +56,99 @@ function saveEventCategoryColor(key, color) {
   const stored = loadEventCategoryColors();
   stored[key] = color;
   localStorage.setItem(EVENT_CATEGORY_COLORS_KEY, JSON.stringify(stored));
+}
+const STATE_LANE_COLORS_KEY = "workspaceStateLaneColors";
+function loadStateLaneColors() {
+  return loadJsonStorage(STATE_LANE_COLORS_KEY, {});
+}
+function stateLaneIdentity(lane = {}) {
+  return String(lane.key || lane.label || `lane_${lane.lane ?? 0}`);
+}
+function isTemporalStateLaneKey(key) {
+  const text = String(key || "").trim().toLowerCase();
+  return text === "now" || text === "ts" || text === "timestamp" || text === "time"
+    || text.endsWith("_until") || text.endsWith("_at") || text.endsWith("_time");
+}
+function looksLikeDateTimeText(value) {
+  const text = String(value || "").trim();
+  return text.length >= 16 && text.includes("T") && (text.endsWith("Z") || text.slice(10).includes("+") || (text.match(/-/g) || []).length >= 2);
+}
+function isStateLaneMetricDisplayable(item = {}) {
+  return !isTemporalStateLaneKey(item.key) && !looksLikeDateTimeText(item.latest_value);
+}
+function isStateLaneDisplayable(lane = {}) {
+  return !isTemporalStateLaneKey(stateLaneIdentity(lane));
+}
+function stateLaneDisplayName(lane = {}) {
+  const label = String(lane.label || lane.key || "State Lane");
+  const key = String(lane.key || "");
+  return key && key !== label ? `${label} (${key})` : label;
+}
+function stateLanePanelId(lane = {}) {
+  return `metric_state_lane:${Number(lane.lane ?? 0)}:${stableHash(stateLaneIdentity(lane))}`;
+}
+function isStateLanePanel(panel = {}) {
+  return String(panel.id || "").startsWith("metric_state_lane:");
+}
+function stateLaneSegmentValue(segment = {}) {
+  return String(segment.value ?? segment.label ?? "");
+}
+const BOOL_STATE_LABELS = {
+  cooldown_active: { true: "Cooldown active", false: "Cooldown inactive" },
+  shock_cooldown_active: { true: "Shock cooldown active", false: "Shock cooldown inactive" },
+  shock_block_active: { true: "Shock block active", false: "Shock block inactive" },
+  manual_pause_open: { true: "Manual pause open", false: "Manual pause closed" },
+  stop_loss_locked: { true: "Stop loss locked", false: "Stop loss unlocked" },
+  force_flat: { true: "Force flat", false: "Force flat off" },
+  rank_ok: { true: "Rank OK", false: "Rank not OK" },
+};
+function boolStateValue(value) {
+  const text = String(value ?? "").trim().toLowerCase();
+  if (text === "true") return true;
+  if (text === "false") return false;
+  return null;
+}
+function boolStateLabel(laneKey, value) {
+  const mapped = BOOL_STATE_LABELS[String(laneKey || "")];
+  if (mapped) return mapped[value ? "true" : "false"];
+  const words = String(laneKey || "").replaceAll("_", " ").trim();
+  if (words.endsWith(" active")) {
+    const base = words.slice(0, -" active".length).trim();
+    return `${base.replace(/\b\w/g, (ch) => ch.toUpperCase())} ${value ? "active" : "inactive"}`;
+  }
+  if (words.endsWith(" open")) {
+    const base = words.slice(0, -" open".length).trim();
+    return `${base.replace(/\b\w/g, (ch) => ch.toUpperCase())} ${value ? "open" : "closed"}`;
+  }
+  if (words.endsWith(" locked")) {
+    const base = words.slice(0, -" locked".length).trim();
+    return `${base.replace(/\b\w/g, (ch) => ch.toUpperCase())} ${value ? "locked" : "unlocked"}`;
+  }
+  return value ? "True" : "False";
+}
+function stateLaneSegmentLabel(segment = {}, lane = {}) {
+  const rawValue = stateLaneSegmentValue(segment);
+  const label = String(segment.label ?? "").trim();
+  const boolValue = boolStateValue(rawValue);
+  if (boolValue !== null && (!label || label.toLowerCase() === String(boolValue))) {
+    return boolStateLabel(stateLaneIdentity(lane), boolValue);
+  }
+  return String(segment.label || segment.value || "-");
+}
+function stateLaneColorKey(laneKey, stateValue) {
+  return `${String(laneKey || "lane")}::${String(stateValue ?? "")}`;
+}
+function saveStateLaneColor(laneKey, stateValue, color) {
+  const stored = loadStateLaneColors();
+  stored[stateLaneColorKey(laneKey, stateValue)] = color;
+  localStorage.setItem(STATE_LANE_COLORS_KEY, JSON.stringify(stored));
+}
+function stateLaneSegmentColor(lane = {}, segment = {}, overrideColors = loadStateLaneColors()) {
+  const valueKey = stateLaneSegmentValue(segment);
+  return overrideColors[stateLaneColorKey(stateLaneIdentity(lane), valueKey)]
+    || overrideColors[stateLaneColorKey(lane.key, valueKey)]
+    || segment.color
+    || colorForSeries(`metric_state:${stateLaneIdentity(lane)}:${valueKey}`);
 }
 
 const SUB_METRIC_GROUPS = [
@@ -139,7 +233,8 @@ const PANEL_WEIGHTS = {
   indicator_macd: 14,
   metric_values: 14,
   metric_states: 10,
-  event_timeline: 10,
+  metric_state_lane: 8,
+  event_timeline: 16,
 };
 const DELTA_STREAM_INTERVALS = {
   price: 2000,
@@ -489,20 +584,62 @@ function formatTime(value) {
 }
 
 function workspaceStrategyMode(strategy = {}) {
+  const validModes = ["Stop", "Virtual", "Real"];
   const isVirtual = String(strategy.is_virtual ?? strategy.editable?.IsVirtual ?? "").trim().toLowerCase() === "true";
-  const state = strategy.state || (isVirtual ? "Virtual" : "Stop");
-  return ["Stop", "Virtual", "Real"].includes(state) ? state : "Stop";
+  const legacyState = validModes.includes(strategy.state) ? strategy.state : "";
+  const mode = strategy.mode || legacyState || (isVirtual ? "Virtual" : "Stop");
+  return validModes.includes(mode) ? mode : "Stop";
 }
 
 function syncWorkspaceStateControl(strategy = {}) {
   if (!workspaceStateSelect) return;
-  const state = workspaceStrategyMode(strategy);
-  workspaceStateSelect.value = state;
-  workspaceStateSelect.dataset.prev = state;
-  workspaceStateSelect.className = `state-select workspace-state-select state-${state}`;
+  const mode = workspaceStrategyMode(strategy);
+  workspaceStateSelect.value = mode;
+  workspaceStateSelect.dataset.prev = mode;
+  workspaceStateSelect.className = `state-select workspace-state-select state-${mode}`;
 }
 
 window.syncWorkspaceStateControl = syncWorkspaceStateControl;
+
+function defaultWorkspaceStateOptions() {
+  return [
+    { value: "auto", label: "Auto" },
+    { value: "idle", label: "Idle" },
+    { value: "holding", label: "Holding" },
+    { value: "cooldown", label: "Cooldown" },
+    { value: "manual_review", label: "Manual Review" },
+    { value: "stop_loss_locked", label: "Stop Loss Locked" },
+  ];
+}
+
+function workspaceMachineState(strategy = {}, stateStore = null) {
+  const validModes = ["Stop", "Virtual", "Real"];
+  const storeState = stateStore?.machine_state || stateStore?.state || stateStore?.machine?.state;
+  const strategyState = strategy.machine_state || (!validModes.includes(strategy.state) ? strategy.state : "");
+  return String(storeState || strategyState || "auto");
+}
+
+function workspaceStateOptions(strategy = {}, stateStore = null) {
+  const raw = stateStore?.state_options || strategy.state_options || stateStore?.state_machine_schema?.states || [];
+  const options = Array.isArray(raw) && raw.length ? raw : defaultWorkspaceStateOptions();
+  const current = workspaceMachineState(strategy, stateStore);
+  const hasCurrent = options.some((item) => String(item.value ?? item) === current);
+  return hasCurrent ? options : [{ value: current, label: current }, ...options];
+}
+
+function syncWorkspaceMachineStateControl(strategy = {}, stateStore = null) {
+  if (!workspaceMachineStateSelect) return;
+  const current = workspaceMachineState(strategy, stateStore);
+  workspaceMachineStateSelect.innerHTML = workspaceStateOptions(strategy, stateStore).map((item) => {
+    const value = String(item.value ?? item);
+    const label = String(item.label ?? value);
+    return `<option value="${escapeHtml(value)}"${value === current ? " selected" : ""}>${escapeHtml(label)}</option>`;
+  }).join("");
+  workspaceMachineStateSelect.value = current;
+  workspaceMachineStateSelect.dataset.prev = current;
+}
+
+window.syncWorkspaceMachineStateControl = syncWorkspaceMachineStateControl;
 
 function stateTransitionConfirmMessage(prev, next) {
   return {
@@ -796,37 +933,46 @@ function persistLegendSelectedState() {
   localStorage.setItem("workspaceLegendSelectedState", JSON.stringify(chartLegendSelectedState));
 }
 
-function buildSeriesControlsSignature(series) {
+function buildSeriesControlsSignature(series, payload = {}) {
   return JSON.stringify(
-    (series || []).map((item) => {
-      const style = seriesStyleState[item.key] || {};
-      return {
-        key: item.key,
-        label: item.label,
-        render: item.render,
-        panel: item.panel,
-        removable: Boolean(item.removable),
-        visible: style.visible !== false,
-        macd: Boolean(style.macd?.enabled),
-      };
-    })
+    {
+      series: (series || []).map((item) => {
+        const style = seriesStyleState[item.key] || {};
+        return {
+          key: item.key,
+          label: item.label,
+          render: item.render,
+          panel: item.panel,
+          removable: Boolean(item.removable),
+          visible: style.visible !== false,
+          macd: Boolean(style.macd?.enabled),
+        };
+      }),
+      state_lanes: (payload.metric_state_lanes || []).filter(isStateLaneDisplayable).map((lane) => ({
+        key: stateLaneIdentity(lane),
+        label: lane.label || lane.key,
+        states: [...new Set((lane.segments || []).map((segment) => stateLaneSegmentValue(segment)))],
+      })),
+    }
   );
 }
 
 function buildChartStructureSignature(payload) {
   const hasEventTimeline = (payload.events || []).some((event) => event?.ts);
+  const expandedPanels = expandChartPanels(payload.panels || [], payload.metric_state_lanes || [], payload.events || []);
   return JSON.stringify({
-    panels: [
-      ...(payload.panels || []).map((p) => p.id),
-      ...(hasEventTimeline ? ["event_timeline"] : []),
-    ],
+    panels: expandedPanels.map((p) => p.id),
     series: (payload.series || []).map((s) => ({
       key: s.key,
       panel: s.panel,
       render: s.render,
       label: s.label,
     })),
-    state_lanes: (payload.metric_state_lanes || []).map((lane) => lane.key),
+    state_lanes: (payload.metric_state_lanes || []).filter(isStateLaneDisplayable).map((lane) => ({
+      key: stateLaneIdentity(lane),
+      segment_count: (lane.segments || []).length,
+    })),
+    has_event_timeline: hasEventTimeline,
     height: workspaceChartHeight,
   });
 }
@@ -1074,10 +1220,12 @@ function renderHeader(strategy) {
   workspaceTitle.textContent = strategy.display_name || strategy.strategy || "Unnamed";
   workspaceSubtitle.textContent = `${strategy.question || "-"} | Row ${strategy.row_id || "-"} | Condition ${strategy.condition_id || "-"}`;
   syncWorkspaceStateControl(strategy || {});
+  syncWorkspaceMachineStateControl(strategy || {}, workspaceStateStore);
 }
 
 function renderSummary(strategy) {
   syncWorkspaceStateControl(strategy || {});
+  syncWorkspaceMachineStateControl(strategy || {}, workspaceStateStore);
   const primary = trackedMarkets[0];
   workspaceSummary.innerHTML = [
     summaryCard("Yes Bid / Ask", `${formatNumber(strategy.yes_bid, 4)} / ${formatNumber(strategy.yes_ask, 4)}`, `Price Source: ${strategy.price_source || "-"}`),
@@ -1326,7 +1474,7 @@ function renderSettings(schema, strategy) {
     inputs: schema.filter((field) => field.group === "inputs"),
     capital: schema.filter((field) => field.group === "capital"),
   };
-  const mode = stateStore.mode || strategy.state || "Stop";
+  const mode = stateStore.mode || workspaceStrategyMode(strategy);
   const runtimeEditable = mode === "Stop";
   settingsForm.innerHTML = `
     <div class="settings-param-paste">
@@ -1340,6 +1488,7 @@ function renderSettings(schema, strategy) {
       <h3>Inputs</h3>
       <div class="grid two">${groups.inputs.map((field) => buildFieldControl(field, editable)).join("")}</div>
     </div>
+    ${renderWorkspaceMachineStateSection(stateStore, strategy)}
     ${renderWorkspaceControlsSection(stateStore)}
     ${renderWorkspaceRuntimeSection(stateStore, runtimeEditable)}
     <div class="workspace-settings-group">
@@ -1420,6 +1569,30 @@ function buildWorkspaceStateField(key, meta, values, namespace, options = {}) {
   `;
 }
 
+function renderWorkspaceMachineStateSection(stateStore, strategy) {
+  const schema = stateStore?.state_machine_schema || {};
+  const current = workspaceMachineState(strategy || workspaceState?.strategy || {}, stateStore);
+  const options = workspaceStateOptions(strategy || workspaceState?.strategy || {}, stateStore);
+  return `
+    <div class="workspace-settings-group">
+      <h3>Strategy State</h3>
+      <div class="grid two">
+        <label class="settings-field">
+          <span class="settings-label-text">${escapeHtml(schema.label || "State")}</span>
+          <select data-machine-state-key="state">
+            ${options.map((item) => {
+              const value = String(item.value ?? item);
+              const label = String(item.label ?? value);
+              return `<option value="${escapeHtml(value)}"${value === current ? " selected" : ""}>${escapeHtml(label)}</option>`;
+            }).join("")}
+          </select>
+          <span class="state-field-comment">${escapeHtml(schema.description || "Independent from Stop / Virtual / Real mode.")}</span>
+        </label>
+      </div>
+    </div>
+  `;
+}
+
 function renderWorkspaceControlsSection(stateStore) {
   const schema = stateStore.controls_schema || {};
   const values = stateStore.controls || stateStore.user || stateStore.user_overrides || {};
@@ -1476,7 +1649,7 @@ function renderMetricPicker(capabilities, defaults) {
   const selected = new Set(defaults?.sub_series || []);
   const metricCatalog = capabilities?.metric_catalog || {};
   const numericMetrics = metricCatalog.numeric || [];
-  const stateMetrics = metricCatalog.state || [];
+  const stateMetrics = (metricCatalog.state || []).filter(isStateLaneMetricDisplayable);
   chartMetricPicker.innerHTML = `
     <div class="metric-picker-title">副图组</div>
     <div class="metric-picker-groups">
@@ -1699,7 +1872,8 @@ function isEventTimelineSelected() {
 function selectedSubMetrics() {
   return [...chartMetricPicker.querySelectorAll("[data-sub-metric]:checked")]
     .map((el) => el.dataset.subMetric)
-    .filter((k) => k !== "__event_timeline");
+    .filter((k) => k !== "__event_timeline")
+    .filter((k) => !String(k || "").startsWith("metric_state:") || !isTemporalStateLaneKey(String(k).slice("metric_state:".length)));
 }
 
 function revealSelectedSubMetricSeries(keys = selectedSubMetrics()) {
@@ -2071,6 +2245,43 @@ function setupChartResizeHandle() {
   });
 }
 
+function setupEventTimelineHover(chart) {
+  if (!chart || chart.__workspaceEventTimelineHoverBound) return;
+  chart.__workspaceEventTimelineHoverBound = true;
+  chart.getZr().on("mousemove", (event) => {
+    const point = [event.offsetX, event.offsetY];
+    const option = chart.getOption?.() || {};
+    const yAxis = option.yAxis || [];
+    const eventGridIndex = yAxis.findIndex((axis) => axis?.name === "Events");
+    if (eventGridIndex < 0 || !chart.containPixel({ gridIndex: eventGridIndex }, point)) {
+      return;
+    }
+    const eventSeries = (option.series || [])
+      .map((series, index) => ({ series, index }))
+      .filter((item) => String(item.series?.id || "").startsWith("__event_timeline:"));
+    let best = null;
+    eventSeries.forEach(({ series, index }) => {
+      (series.data || []).forEach((data, dataIndex) => {
+        const value = data?.value || data;
+        if (!Array.isArray(value)) return;
+        const pixel = chart.convertToPixel({ seriesIndex: index }, [value[0], value[1]]);
+        if (!Array.isArray(pixel)) return;
+        const dx = pixel[0] - point[0];
+        const dy = pixel[1] - point[1];
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        if (!best || distance < best.distance) {
+          best = { seriesIndex: index, dataIndex, distance };
+        }
+      });
+    });
+    if (best && best.distance <= 18) {
+      chart.dispatchAction({ type: "showTip", seriesIndex: best.seriesIndex, dataIndex: best.dataIndex });
+    } else {
+      chart.dispatchAction({ type: "hideTip" });
+    }
+  });
+}
+
 function ensureChartInstance() {
   if (!window.echarts) throw new Error("ECharts 未加载");
   const canvas = ensureChartShell();
@@ -2100,6 +2311,7 @@ function ensureChartInstance() {
       closeCustomTimelinePanel();
       scheduleChartReload();
     });
+    setupEventTimelineHover(workspaceChartInstance);
   }
   return workspaceChartInstance;
 }
@@ -2114,12 +2326,19 @@ function getChartLayoutConfig() {
   return CHART_MODE_CONFIG.standard;
 }
 
+function chartPanelWeight(panel) {
+  if (isStateLanePanel(panel)) {
+    return PANEL_WEIGHTS.metric_state_lane;
+  }
+  return PANEL_WEIGHTS[panel.id] || 12;
+}
+
 function buildPanelLayout(panels) {
   const mode = getChartLayoutConfig();
   const panelCount = panels.length || 1;
   const totalGap = mode.gap * Math.max(0, panelCount - 1);
   const available = mode.usable - totalGap;
-  const weights = panels.map((panel) => PANEL_WEIGHTS[panel.id] || 12);
+  const weights = panels.map((panel) => chartPanelWeight(panel));
   const weightSum = weights.reduce((sum, item) => sum + item, 0) || 1;
   let top = mode.topStart;
   return panels.map((panel, index) => {
@@ -2243,17 +2462,107 @@ function recomputeMacdOverlayColumns(rows, seriesList) {
   });
 }
 
-function buildTooltipFormatter(seriesMap) {
+function parseChartTime(value) {
+  if (value instanceof Date) {
+    const t = value.getTime();
+    return Number.isFinite(t) ? t : null;
+  }
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 1000000000) {
+    return numeric;
+  }
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function tooltipMarker(color) {
+  return `<span style="display:inline-block;margin-right:4px;border-radius:50%;width:8px;height:8px;background:${escapeHtml(color || "#94a3b8")}"></span>`;
+}
+
+function isBidAskReferenceSeries(item = {}) {
+  const key = String(item.key || "");
+  return item.panel === "main" && /_(yes|no)_(bid|ask)$/.test(key);
+}
+
+function prepareTooltipRows(payload = {}) {
+  return (payload.rows || [])
+    .map((row) => ({ row, ts: parseChartTime(row.ts) }))
+    .filter((item) => item.ts !== null)
+    .sort((a, b) => a.ts - b.ts);
+}
+
+function nearestChartRow(rows = [], rawTs) {
+  if (!rows.length) return null;
+  const target = parseChartTime(rawTs);
+  if (target === null) return rows[rows.length - 1].row;
+  let best = rows[0];
+  let bestDelta = Math.abs(best.ts - target);
+  for (let i = 1; i < rows.length; i += 1) {
+    const delta = Math.abs(rows[i].ts - target);
+    if (delta <= bestDelta) {
+      best = rows[i];
+      bestDelta = delta;
+    } else if (rows[i].ts > target) {
+      break;
+    }
+  }
+  return best.row;
+}
+
+function buildReferenceTooltipLines(payload = {}, rawTs, seenSeriesIds = new Set(), rows = null, referenceSeries = null) {
+  const preparedRows = rows || prepareTooltipRows(payload);
+  const references = referenceSeries || (payload.series || []).filter(isBidAskReferenceSeries);
+  const row = nearestChartRow(preparedRows, rawTs);
+  if (!row || !references.length) return [];
+  return references.map((item) => {
+    if (seenSeriesIds.has(item.key)) return null;
+    const value = Number(row[item.key]);
+    if (!Number.isFinite(value)) return null;
+    const color = colorForSeries(item.key);
+    return `${tooltipMarker(color)}${escapeHtml(item.label || item.key)}: ${escapeHtml(formatChartValue(value, item.unit))} <span style="color:#90a5c3">(ref)</span>`;
+  }).filter(Boolean);
+}
+
+function eventStatusParts(data = {}) {
+  return [data.type, data.subtype, data.source, data.severity]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+}
+
+function formatEventTooltipLine(data = {}, summaryLimit = 160) {
+  const summary = String(data.summary || data.label || "-");
+  const status = eventStatusParts(data).join(" · ");
+  const head = `${tooltipMarker(data.color)}<span style="color:${escapeHtml(data.color || "#94a3b8")}">${escapeHtml(data.category || "Event")}</span>`;
+  const main = `${head}: ${escapeHtml(summary.slice(0, summaryLimit))}`;
+  return status
+    ? `${main}<br><span style="color:#90a5c3;margin-left:12px">${escapeHtml(status)}</span>`
+    : main;
+}
+
+function buildTooltipFormatter(seriesMap, payload = {}) {
+  const rows = prepareTooltipRows(payload);
+  const referenceSeries = (payload.series || []).filter(isBidAskReferenceSeries);
   return function formatter(params) {
-    if (!params || !params.length) return "";
-    const rawTs = Array.isArray(params[0].value) ? params[0].value[0] : (params[0].axisValue || "");
+    const items = Array.isArray(params) ? params : (params ? [params] : []);
+    if (!items.length) return "";
+    const rawTs = Array.isArray(items[0].value) ? items[0].value[0] : (items[0].axisValue || "");
     const lines = [escapeHtml(formatTime(rawTs))];
-    params.forEach((param) => {
-      if (param.seriesId === "__event_timeline" || param.seriesName === "Events") {
+    const seenSeriesIds = new Set();
+    items.forEach((param) => {
+      if (param.seriesId) seenSeriesIds.add(param.seriesId);
+      if (String(param.seriesId || "").startsWith("__event_timeline")) {
         const d = param.data || {};
-        const text = Array.isArray(param.value) ? param.value[2] : "";
-        if (text) {
-          lines.push(`${param.marker}<span style="color:${escapeHtml(d.color || "#94a3b8")}">${escapeHtml(d.category || "Event")}</span>: ${escapeHtml(String(text).slice(0, 120))}`);
+        lines.push(formatEventTooltipLine(d, 180));
+        return;
+      }
+      if (String(param.seriesId || "").startsWith("__metric_state_lane:")) {
+        const d = param.data || {};
+        const state = d.state || (Array.isArray(param.value) ? param.value[4] : "");
+        if (state) {
+          const from = d.from ? formatTime(d.from) : "";
+          const to = d.to ? formatTime(d.to) : "";
+          const range = from || to ? ` <span style="color:#90a5c3">(${escapeHtml(from)} - ${escapeHtml(to)})</span>` : "";
+          lines.push(`${param.marker}${escapeHtml(d.lane || param.seriesName || "State Lane")}: ${escapeHtml(state)}${range}`);
         }
         return;
       }
@@ -2263,6 +2572,7 @@ function buildTooltipFormatter(seriesMap) {
       if (rawValue === null || rawValue === undefined || rawValue === "") return;
       lines.push(`${param.marker}${escapeHtml(meta?.label || param.seriesName)}: ${escapeHtml(formatChartValue(rawValue, meta?.unit))}`);
     });
+    lines.push(...buildReferenceTooltipLines(payload, rawTs, seenSeriesIds, rows, referenceSeries));
     return lines.join("<br>");
   };
 }
@@ -2287,20 +2597,49 @@ function applyChartViewStateToDataZoom(dataZoom) {
   }));
 }
 
-function buildChartCoordinateState(payload) {
-  let panels = payload.panels || [];
-  const events = payload.events || [];
-  if (events.length && !panels.find((p) => p.id === "event_timeline")) {
-    panels = [...panels, { id: "event_timeline", title: "Events" }];
+function expandChartPanels(basePanels = [], stateLanes = [], events = []) {
+  const lanePanels = (stateLanes || [])
+    .filter((lane) => isStateLaneDisplayable(lane) && (lane.segments || []).length)
+    .map((lane) => ({
+      id: stateLanePanelId(lane),
+      title: stateLaneDisplayName(lane),
+      state_lane_key: stateLaneIdentity(lane),
+      state_lane_index: Number(lane.lane ?? 0),
+      is_state_lane: true,
+    }));
+  let panels = [];
+  let insertedStateLanes = false;
+  (basePanels || []).forEach((panel) => {
+    if (panel.id === "metric_states") {
+      panels.push(...lanePanels);
+      insertedStateLanes = true;
+      return;
+    }
+    panels.push(panel);
+  });
+  if (lanePanels.length && !insertedStateLanes) {
+    panels.push(...lanePanels);
   }
+  if ((events || []).some((event) => event?.ts) && !panels.find((p) => p.id === "event_timeline")) {
+    panels.push({ id: "event_timeline", title: "Events" });
+  }
+  return panels;
+}
+
+function buildChartCoordinateState(payload) {
+  let panels = expandChartPanels(payload.panels || [], payload.metric_state_lanes || [], payload.events || []);
   const series = payload.series || [];
   const rows = payload.rows || [];
   const layout = buildPanelLayout(panels);
   const { minTs, maxTs, rangeMs } = getTimeExtent(rows, payload.meta || {});
   const panelIndex = new Map(layout.map((item, index) => [item.panel.id, index]));
-  const stateLaneCount = (payload.metric_state_lanes || []).length;
-  const stateLaneLabels = new Map((payload.metric_state_lanes || []).map((lane) => [Number(lane.lane), lane.label || lane.key]));
-  const grid = layout.map((item) => ({ left: 76, right: 26, top: item.top, height: item.height, containLabel: false }));
+  const grid = layout.map((item) => ({
+    left: item.panel.id === "event_timeline" ? 92 : 76,
+    right: 26,
+    top: item.top,
+    height: item.height,
+    containLabel: false,
+  }));
   const xAxis = layout.map((_, index) => ({
     type: "time",
     gridIndex: index,
@@ -2313,7 +2652,7 @@ function buildChartCoordinateState(payload) {
     splitLine: { show: false },
   }));
   const yAxis = layout.map((item, index) => {
-    const isStatePanel = item.panel.id === "metric_states";
+    const isStatePanel = isStateLanePanel(item.panel);
     const isEventPanel = item.panel.id === "event_timeline";
     const eventLaneCount = EVENT_TIMELINE_CATEGORIES.length;
     const eventLaneLabels = new Map(EVENT_TIMELINE_CATEGORIES.map((cat) => [cat.lane, cat.label]));
@@ -2322,17 +2661,16 @@ function buildChartCoordinateState(payload) {
       gridIndex: index,
       scale: !isStatePanel && !isEventPanel,
       min: isStatePanel ? 0 : (isEventPanel ? -0.5 : undefined),
-      max: isStatePanel ? Math.max(1, stateLaneCount) : (isEventPanel ? eventLaneCount - 0.5 : undefined),
-      inverse: isStatePanel,
+      max: isStatePanel ? 1 : (isEventPanel ? eventLaneCount - 0.5 : undefined),
       name: item.panel.title,
-      nameTextStyle: { color: "#90a5c3", padding: [0, 0, 0, 8] },
+      nameTextStyle: { color: "#90a5c3", padding: [0, 0, 0, 8], width: 64, overflow: "truncate" },
       axisLabel: {
-        show: true,
+        show: !isStatePanel,
         color: "#90a5c3",
+        fontSize: isEventPanel ? 11 : undefined,
+        margin: isEventPanel ? 10 : 8,
+        lineHeight: isEventPanel ? 18 : undefined,
         formatter(value) {
-          if (isStatePanel) {
-            return stateLaneLabels.get(Math.floor(Number(value))) || "";
-          }
           if (isEventPanel) {
             return eventLaneLabels.get(Math.round(Number(value))) || "";
           }
@@ -2342,7 +2680,7 @@ function buildChartCoordinateState(payload) {
       },
       axisTick: { show: !isStatePanel && !isEventPanel },
       axisLine: { show: true, lineStyle: { color: "rgba(148, 163, 184, 0.28)" } },
-      splitLine: { show: !isStatePanel && !isEventPanel, lineStyle: { color: "rgba(148, 163, 184, 0.10)" } },
+      splitLine: { show: isEventPanel ? true : (!isStatePanel && !isEventPanel), lineStyle: { color: isEventPanel ? "rgba(148, 163, 184, 0.08)" : "rgba(148, 163, 184, 0.10)" } },
     };
   });
   const dataZoom = applyChartViewStateToDataZoom(buildChartDataZoom(layout));
@@ -2442,60 +2780,110 @@ function buildEventMarkLines(events = []) {
   }).filter((item) => item.xAxis);
 }
 
-function buildMetricStateSeries(payload, panelIndex) {
-  const lanes = payload.metric_state_lanes || [];
-  const statePanelIndex = panelIndex.get("metric_states");
-  if (!lanes.length || statePanelIndex === undefined) return [];
-  const segments = [];
-  lanes.forEach((lane) => {
-    (lane.segments || []).forEach((segment) => {
-      segments.push({
-        value: [segment.from, Number(lane.lane || 0), segment.to, segment.color || "#60a5fa"],
-        lane: lane.label || lane.key,
-        state: segment.label || segment.value,
-        color: segment.color || "#60a5fa",
-      });
-    });
-  });
-  if (!segments.length) return [];
+function buildEventMarkLineSeries(payload, panelIndex) {
+  const eventLines = buildEventMarkLines(payload.events || []);
+  if (!eventLines.length) return [];
+  const mainPanelIndex = panelIndex.get("main") ?? 0;
+  const rows = payload.rows || [];
+  const firstTs = rows[0]?.ts || payload.meta?.from || eventLines[0]?.xAxis;
+  const lastTs = rows[rows.length - 1]?.ts || payload.meta?.to || firstTs;
   return [{
-    id: "__metric_state_lanes",
-    name: "State Lanes",
-    type: "custom",
-    xAxisIndex: statePanelIndex,
-    yAxisIndex: statePanelIndex,
-    silent: false,
-    encode: { x: [0, 2], y: 1 },
-    data: segments,
-    renderItem(params, api) {
-      const start = api.coord([api.value(0), api.value(1) + 0.16]);
-      const end = api.coord([api.value(2), api.value(1) + 0.84]);
-      const rect = {
-        x: Math.min(start[0], end[0]),
-        y: Math.min(start[1], end[1]),
-        width: Math.max(1, Math.abs(end[0] - start[0])),
-        height: Math.max(4, Math.abs(end[1] - start[1])),
-      };
-      const clipped = window.echarts.graphic.clipRectByRect(rect, {
-        x: params.coordSys.x,
-        y: params.coordSys.y,
-        width: params.coordSys.width,
-        height: params.coordSys.height,
-      });
-      if (!clipped) return null;
-      return {
-        type: "rect",
-        shape: clipped,
-        style: api.style({ fill: api.value(3) || "#60a5fa", opacity: 0.58 }),
-      };
-    },
-    tooltip: {
-      formatter(param) {
-        const data = param.data || {};
-        return `${escapeHtml(data.lane || "State")}<br>${escapeHtml(data.state || "-")}`;
-      },
+    id: "__event_mark_lines",
+    name: "Events",
+    type: "line",
+    xAxisIndex: mainPanelIndex,
+    yAxisIndex: mainPanelIndex,
+    data: [[firstTs, 0], [lastTs, 0]],
+    showSymbol: false,
+    lineStyle: { opacity: 0, width: 0 },
+    itemStyle: { opacity: 0 },
+    tooltip: { show: false },
+    z: 2,
+    markLine: {
+      symbol: ["none", "none"],
+      silent: false,
+      data: eventLines,
     },
   }];
+}
+
+function buildMetricStateSeries(payload, panelIndex) {
+  const lanes = (payload.metric_state_lanes || []).filter(isStateLaneDisplayable);
+  if (!lanes.length) return [];
+  const overrideColors = loadStateLaneColors();
+  return lanes.map((lane) => {
+    const statePanelIndex = panelIndex.get(stateLanePanelId(lane));
+    if (statePanelIndex === undefined) return null;
+    const laneName = stateLaneDisplayName(lane);
+    const segments = (lane.segments || []).map((segment) => {
+      const color = stateLaneSegmentColor(lane, segment, overrideColors);
+      const state = stateLaneSegmentLabel(segment, lane);
+      return {
+        value: [segment.from, 0.5, segment.to, color, state],
+        lane: laneName,
+        laneKey: stateLaneIdentity(lane),
+        rawState: stateLaneSegmentValue(segment),
+        state,
+        from: segment.from,
+        to: segment.to,
+        color,
+        itemStyle: { color },
+      };
+    }).filter((segment) => segment.from && segment.to);
+    if (!segments.length) return null;
+    return {
+      id: `__metric_state_lane:${stateLanePanelId(lane)}`,
+      name: laneName,
+      type: "custom",
+      xAxisIndex: statePanelIndex,
+      yAxisIndex: statePanelIndex,
+      silent: false,
+      encode: { x: [0, 2], y: 1 },
+      data: segments,
+      renderItem(params, api) {
+        const start = api.coord([api.value(0), 0.15]);
+        const end = api.coord([api.value(2), 0.85]);
+        const rect = {
+          x: Math.min(start[0], end[0]),
+          y: Math.min(start[1], end[1]),
+          width: Math.max(1, Math.abs(end[0] - start[0])),
+          height: Math.max(6, Math.abs(end[1] - start[1])),
+        };
+        const clipped = window.echarts.graphic.clipRectByRect(rect, {
+          x: params.coordSys.x,
+          y: params.coordSys.y,
+          width: params.coordSys.width,
+          height: params.coordSys.height,
+        });
+        if (!clipped) return null;
+        return {
+          type: "rect",
+          shape: clipped,
+          style: api.style({ fill: api.value(3) || "#60a5fa", opacity: 0.7 }),
+          emphasis: {
+            style: {
+              opacity: 0.92,
+              shadowBlur: 8,
+              shadowColor: "rgba(148, 163, 184, 0.22)",
+            },
+          },
+        };
+      },
+      tooltip: {
+        trigger: "item",
+        formatter(param) {
+          const data = param.data || {};
+          const from = data.from ? formatTime(data.from) : "-";
+          const to = data.to ? formatTime(data.to) : "-";
+          return [
+            `<strong>${escapeHtml(data.lane || "State Lane")}</strong>`,
+            `${escapeHtml(data.state || "-")}`,
+            `<span style="color:#90a5c3">${escapeHtml(from)} - ${escapeHtml(to)}</span>`,
+          ].join("<br>");
+        },
+      },
+    };
+  }).filter(Boolean);
 }
 
 function classifyEventCategory(event) {
@@ -2513,37 +2901,60 @@ function buildEventTimelineSeries(payload, panelIndex) {
   if (eventPanelIndex === undefined || !events.length) return [];
   const overrideColors = loadEventCategoryColors();
   const categoryMap = new Map(EVENT_TIMELINE_CATEGORIES.map((cat) => [cat.key, cat]));
-  const data = events.map((event) => {
+  const dataByCategory = new Map(EVENT_TIMELINE_CATEGORIES.map((cat) => [cat.key, []]));
+  events.forEach((event) => {
     const cat = classifyEventCategory(event);
     const info = categoryMap.get(cat) || categoryMap.get("print");
     const ts = new Date(event.ts).getTime();
-    if (!Number.isFinite(ts)) return null;
+    if (!Number.isFinite(ts)) return;
     const color = overrideColors[info.key] || info.color;
-    return {
-      value: [ts, info.lane, event.summary || event.label || event.event_type || "-"],
+    const summary = event.summary || event.label || event.event_type || event.type || "-";
+    dataByCategory.get(info.key)?.push({
+      value: [ts, info.lane, summary],
       itemStyle: { color },
       category: info.label,
+      categoryKey: info.key,
       color,
+      summary,
+      label: event.label || event.summary || "",
+      type: event.event_type || event.type || "",
+      subtype: event.event_subtype || event.subtype || "",
+      source: event.source || event.env || "",
+      severity: event.severity || "",
+      ts: event.ts,
+    });
+  });
+  return EVENT_TIMELINE_CATEGORIES.map((cat) => {
+    const data = dataByCategory.get(cat.key) || [];
+    if (!data.length) return null;
+    return {
+      id: `__event_timeline:${cat.key}`,
+      name: "Events",
+      type: "scatter",
+      xAxisIndex: eventPanelIndex,
+      yAxisIndex: eventPanelIndex,
+      symbolSize: 12,
+      symbol: cat.key === "action" ? "diamond" : "circle",
+      data,
+      z: 12,
+      emphasis: { scale: 1.45, focus: "self" },
+      tooltip: {
+        trigger: "item",
+        formatter(param) {
+          const d = param.data || {};
+          const ts = new Date(Array.isArray(param.value) ? param.value[0] : "");
+          const timeStr = Number.isFinite(ts.getTime()) ? `${formatTime(d.ts || ts.toISOString())}` : "-";
+          const rawTs = d.ts || (Array.isArray(param.value) ? param.value[0] : null);
+          const lines = [
+            `<strong>${escapeHtml(d.category || "Event")}</strong> <span style="color:#90a5c3">${escapeHtml(timeStr)}</span>`,
+            formatEventTooltipLine(d, 220),
+          ];
+          lines.push(...buildReferenceTooltipLines(payload, rawTs));
+          return lines.join("<br>");
+        },
+      },
     };
   }).filter(Boolean);
-  if (!data.length) return [];
-  return [{
-    id: "__event_timeline",
-    name: "Events",
-    type: "scatter",
-    xAxisIndex: eventPanelIndex,
-    yAxisIndex: eventPanelIndex,
-    symbolSize: 10,
-    data,
-    tooltip: {
-      formatter(param) {
-        const d = param.data || {};
-        const ts = new Date(Array.isArray(param.value) ? param.value[0] : "");
-        const timeStr = Number.isFinite(ts.getTime()) ? `${pad2(ts.getUTCHours())}:${pad2(ts.getUTCMinutes())}:${pad2(ts.getUTCSeconds())}` : "-";
-        return `<span style="color:${escapeHtml(d.color || "#fff")}">\u25CF</span> ${escapeHtml(d.category || "Event")} <span style="color:#90a5c3">${escapeHtml(timeStr)}</span><br>${escapeHtml(String(Array.isArray(param.value) ? param.value[2] : "-").slice(0, 100))}`;
-      },
-    },
-  }];
 }
 
 function buildChartOption(payload) {
@@ -2551,25 +2962,18 @@ function buildChartOption(payload) {
   const { chartSeries, seriesMetaById } = buildChartSeriesOption(payload);
   const stateSeries = buildMetricStateSeries(payload, panelIndex);
   const eventTimelineSeries = buildEventTimelineSeries(payload, panelIndex);
-  const eventLines = buildEventMarkLines(payload.events || []);
-  if (eventLines.length && chartSeries.length) {
-    chartSeries[0] = {
-      ...chartSeries[0],
-      markLine: {
-        symbol: ["none", "none"],
-        silent: false,
-        data: eventLines,
-      },
-    };
-  }
+  const eventMarkerSeries = buildEventMarkLineSeries(payload, panelIndex);
+  const legendSeries = [...chartSeries, ...stateSeries, ...eventTimelineSeries];
+  const allSeries = [...legendSeries, ...eventMarkerSeries];
   currentLegendNameToKey = new Map();
-  [...chartSeries, ...stateSeries, ...eventTimelineSeries].forEach((item) => {
+  legendSeries.forEach((item) => {
     currentLegendNameToKey.set(item.name, item.id);
   });
   const legendSelected = {};
-  [...chartSeries, ...stateSeries, ...eventTimelineSeries].forEach((item) => {
+  legendSeries.forEach((item) => {
     legendSelected[item.name] = chartLegendSelectedState[item.name] !== false;
   });
+  const legendNames = [...new Set(legendSeries.map((item) => item.name))];
   return {
     backgroundColor: "transparent",
     animation: false,
@@ -2586,16 +2990,16 @@ function buildChartOption(payload) {
       textStyle: { color: "#cbd5e1", fontSize: 11 },
       itemWidth: 12,
       itemHeight: 8,
-      data: [...chartSeries, ...stateSeries, ...eventTimelineSeries].map((item) => ({ name: item.name, icon: "roundRect" })),
+      data: legendNames.map((name) => ({ name, icon: "roundRect" })),
       selected: legendSelected,
     },
-    tooltip: { trigger: "axis", axisPointer: { type: "cross", link: [{ xAxisIndex: "all" }], lineStyle: { color: "rgba(226, 232, 240, 0.45)" } }, confine: true, backgroundColor: "rgba(2, 6, 23, 0.96)", borderColor: "rgba(148, 163, 184, 0.22)", borderWidth: 1, padding: [8, 10], textStyle: { color: "#e5eefc", fontSize: 12 }, formatter: buildTooltipFormatter(seriesMetaById) },
+    tooltip: { trigger: "axis", axisPointer: { type: "cross", link: [{ xAxisIndex: "all" }], lineStyle: { color: "rgba(226, 232, 240, 0.45)" } }, confine: true, backgroundColor: "rgba(2, 6, 23, 0.96)", borderColor: "rgba(148, 163, 184, 0.22)", borderWidth: 1, padding: [8, 10], textStyle: { color: "#e5eefc", fontSize: 12, lineHeight: 18 }, formatter: buildTooltipFormatter(seriesMetaById, payload) },
     axisPointer: { link: [{ xAxisIndex: "all" }], label: { backgroundColor: "#1e293b" } },
     dataZoom,
     grid,
     xAxis,
     yAxis,
-    series: [...chartSeries, ...stateSeries, ...eventTimelineSeries],
+    series: allSeries,
   };
 }
 
@@ -2688,7 +3092,79 @@ function clampText(value, limit = 120) {
   return `${text.slice(0, limit - 1).trimEnd()}...`;
 }
 
-function renderSeriesControls(series) {
+function stateLaneColorEntries(lane, overrideColors = loadStateLaneColors()) {
+  const seen = new Map();
+  (lane.segments || []).forEach((segment) => {
+    const value = stateLaneSegmentValue(segment);
+    if (seen.has(value)) return;
+    seen.set(value, {
+      value,
+      label: stateLaneSegmentLabel(segment, lane),
+      color: stateLaneSegmentColor(lane, segment, overrideColors),
+    });
+  });
+  return [...seen.values()];
+}
+
+function renderStateLaneColorControls(container, payload = {}) {
+  const lanes = (payload.metric_state_lanes || []).filter((lane) => isStateLaneDisplayable(lane) && (lane.segments || []).length);
+  if (!lanes.length) return;
+  const title = document.createElement("div");
+  title.className = "series-controls-title";
+  title.textContent = "State Lane Colors";
+  container.appendChild(title);
+
+  const row = document.createElement("div");
+  row.className = "series-control-row";
+  const overrideColors = loadStateLaneColors();
+  lanes.forEach((lane) => {
+    const laneKey = stateLaneIdentity(lane);
+    const entries = stateLaneColorEntries(lane, overrideColors);
+    if (!entries.length) return;
+    const card = document.createElement("div");
+    card.className = "series-control-chip state-lane-control-chip";
+    card.innerHTML = [
+      '<div class="series-control-head">',
+      '<div class="series-control-titlebox"><span class="series-control-dot"></span><div class="series-control-titlecopy"><strong></strong><div class="series-control-badge">State lane</div><div class="series-control-subtitle"></div></div></div>',
+      '<div class="series-control-actions"></div>',
+      '</div>',
+      '<div class="series-control-block">',
+      '<div class="series-control-fields state-lane-color-grid"></div>',
+      '</div>',
+    ].join("");
+    card.querySelector(".series-control-dot").style.background = entries[0].color;
+    card.querySelector("strong").textContent = stateLaneDisplayName(lane);
+    const subtitle = card.querySelector(".series-control-subtitle");
+    subtitle.textContent = clampText(laneKey, 96);
+    subtitle.title = laneKey;
+    const grid = card.querySelector(".state-lane-color-grid");
+    entries.forEach((entry) => {
+      const label = document.createElement("label");
+      label.title = entry.label;
+      const text = document.createElement("span");
+      text.textContent = entry.label;
+      const input = document.createElement("input");
+      input.type = "color";
+      input.value = entry.color;
+      input.dataset.stateLaneKey = laneKey;
+      input.dataset.stateLaneValue = entry.value;
+      input.addEventListener("input", (event) => {
+        const newColor = event.target.value;
+        saveStateLaneColor(laneKey, entry.value, newColor);
+        if (entry === entries[0]) {
+          card.querySelector(".series-control-dot").style.background = newColor;
+        }
+        if (currentChartPayload) renderCharts(currentChartPayload);
+      });
+      label.append(text, input);
+      grid.appendChild(label);
+    });
+    row.appendChild(card);
+  });
+  container.appendChild(row);
+}
+
+function renderSeriesControls(series, payload = {}) {
   const container = document.getElementById("workspaceSeriesControls");
   if (!container) return;
   ensureSeriesStyleState(series);
@@ -2806,6 +3282,8 @@ function renderSeriesControls(series) {
   });
   container.appendChild(row);
 
+  renderStateLaneColorControls(container, payload);
+
   // Event Timeline dot color editor
   const etTitle = document.createElement("div");
   etTitle.className = "series-controls-title";
@@ -2859,9 +3337,9 @@ function renderCharts(payload) {
 
   ensureChartShell();
 
-  const controlsSignature = buildSeriesControlsSignature(series);
+  const controlsSignature = buildSeriesControlsSignature(series, payload);
   if (controlsSignature !== lastSeriesControlsSignature) {
-    renderSeriesControls(series);
+    renderSeriesControls(series, payload);
     lastSeriesControlsSignature = controlsSignature;
   }
 
@@ -3501,6 +3979,7 @@ async function loadWorkspace(forceResetOverlay = false, silent = false) {
   const t1 = performance.now();
   workspaceState = payload.data || {};
   workspaceStateStore = statePayload?.data || null;
+  window.workspaceStateStore = workspaceStateStore;
   renderHeader(workspaceState.strategy || {});
   renderSources(workspaceState.source_statuses || {});
   renderSettings(workspaceState.settings_schema || [], workspaceState.strategy || {});
@@ -3859,6 +4338,13 @@ function collectWorkspaceUserState() {
   return values;
 }
 
+function collectWorkspaceMachineState() {
+  const value = settingsForm?.querySelector("[data-machine-state-key='state']")?.value
+    || workspaceMachineStateSelect?.value
+    || "auto";
+  return { state: value };
+}
+
 function parseWorkspaceRuntimeState() {
   const values = {};
   settingsForm.querySelectorAll("[data-runtime-state-key]").forEach((field) => {
@@ -3870,7 +4356,16 @@ function parseWorkspaceRuntimeState() {
 async function saveWorkspaceStateNamespaces() {
   if (!workspaceStateStore) return;
   const stateStore = workspaceStateStore || {};
-  const mode = stateStore.mode || workspaceState?.strategy?.state || "Stop";
+  const mode = stateStore.mode || workspaceStrategyMode(workspaceState?.strategy || {});
+  await fetchJson(`/api/registry/strategies/${rowId}/state-store/machine`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      values: collectWorkspaceMachineState(),
+      replace: false,
+      reason: "workspace settings edit",
+    }),
+  });
   await fetchJson(`/api/registry/strategies/${rowId}/state-store/user`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
@@ -3984,6 +4479,47 @@ document.addEventListener("input", (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  const machineStateSelect = event.target.closest("#workspaceMachineStateSelect, [data-machine-state-key='state']");
+  if (machineStateSelect) {
+    const prev = machineStateSelect.dataset.prev || workspaceMachineState(workspaceState?.strategy || {}, workspaceStateStore);
+    const next = machineStateSelect.value || "auto";
+    if (next === prev && machineStateSelect.id === "workspaceMachineStateSelect") return;
+    machineStateSelect.disabled = true;
+    fetchJson(`/api/registry/strategies/${rowId}/state-store/machine`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        values: { state: next },
+        replace: false,
+        reason: "workspace state switch",
+      }),
+    }).then((payload) => {
+      workspaceStateStore = {
+        ...(workspaceStateStore || {}),
+        ...(payload.data || {}),
+        state: next,
+        machine_state: next,
+        machine: { ...((payload.data || {}).machine || {}), state: next },
+      };
+      window.workspaceStateStore = workspaceStateStore;
+      if (!workspaceState) workspaceState = {};
+      workspaceState.strategy = {
+        ...(workspaceState.strategy || {}),
+        state: next,
+        machine_state: next,
+      };
+      syncWorkspaceMachineStateControl(workspaceState.strategy || {}, workspaceStateStore);
+      renderSummary(workspaceState.strategy || {});
+      renderSettings(workspaceState.settings_schema || [], workspaceState.strategy || {});
+    }).catch((error) => {
+      machineStateSelect.value = prev;
+      alert("State switch failed: " + (error?.message || error));
+    }).finally(() => {
+      machineStateSelect.disabled = false;
+    });
+    return;
+  }
+
   const stateSelect = event.target.closest("#workspaceStateSelect");
   if (stateSelect) {
     const prev = stateSelect.dataset.prev || workspaceStrategyMode(workspaceState?.strategy || {});
@@ -3998,16 +4534,19 @@ document.addEventListener("change", (event) => {
     }
 
     stateSelect.disabled = true;
-    fetchJson(`/api/registry/strategies/${rowId}/state`, {
+    fetchJson(`/api/registry/strategies/${rowId}/mode`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ state: next }),
+      body: JSON.stringify({ mode: next }),
     }).then((payload) => {
       if (!workspaceState) workspaceState = {};
+      const machineState = workspaceMachineState(workspaceState.strategy || {}, workspaceStateStore);
       workspaceState.strategy = {
         ...(workspaceState.strategy || {}),
         ...(payload.data || {}),
-        state: next,
+        mode: next,
+        state: machineState,
+        machine_state: machineState,
       };
       syncWorkspaceStateControl(workspaceState.strategy || {});
       renderSummary(workspaceState.strategy || {});

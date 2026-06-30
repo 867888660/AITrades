@@ -24,6 +24,7 @@ from services.config_loader import BASE_DIR, load_web_settings
 
 RUNTIME_STATE_NAMESPACE = "runtime"
 USER_STATE_NAMESPACE = "user"
+MACHINE_STATE_NAMESPACE = "machine"
 LEGACY_STATE_NAMESPACE = "default"
 
 # ---------------------------------------------------------------------------
@@ -43,6 +44,7 @@ _POSITION_COLUMNS = [
 ]
 
 _INSTRUMENT_COLUMNS = [
+    ("leg_kind", "TEXT NOT NULL DEFAULT 'binary_market'"),
     ("asset_class", "TEXT NOT NULL DEFAULT 'polymarket_binary'"),
     ("venue", "TEXT NOT NULL DEFAULT 'polymarket'"),
     ("symbol", "TEXT NOT NULL DEFAULT ''"),
@@ -60,8 +62,8 @@ CREATE TABLE IF NOT EXISTS strategy_registry (
     strategy_uid      TEXT    NOT NULL UNIQUE,
     strategy_name     TEXT    NOT NULL,
     strategy_code     TEXT    NOT NULL DEFAULT '',
-    state             TEXT    NOT NULL DEFAULT 'Stop'
-                      CHECK (state IN ('Stop', 'Virtual', 'Real')),
+    mode              TEXT    NOT NULL DEFAULT 'Stop'
+                      CHECK (mode IN ('Stop', 'Virtual', 'Real')),
     initial_capital   REAL    NOT NULL DEFAULT 0,
     strategy_bankroll REAL    NOT NULL DEFAULT 0,
     profit_roll_ratio REAL    NOT NULL DEFAULT 0,
@@ -81,6 +83,7 @@ CREATE TABLE IF NOT EXISTS strategy_legs (
     condition_id      TEXT    NOT NULL DEFAULT '',
     yes_token         TEXT,
     no_token          TEXT,
+    leg_kind          TEXT    NOT NULL DEFAULT 'binary_market',
     asset_class       TEXT    NOT NULL DEFAULT 'polymarket_binary',
     venue             TEXT    NOT NULL DEFAULT 'polymarket',
     symbol            TEXT    NOT NULL DEFAULT '',
@@ -105,7 +108,7 @@ CREATE TABLE IF NOT EXISTS strategy_legs (
 """
 
 _DDL_INDEXES = """
-CREATE INDEX IF NOT EXISTS idx_strategy_registry_state ON strategy_registry(state);
+CREATE INDEX IF NOT EXISTS idx_strategy_registry_mode ON strategy_registry(mode);
 CREATE INDEX IF NOT EXISTS idx_strategy_legs_strategy_id ON strategy_legs(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_strategy_legs_uid ON strategy_legs(strategy_id, leg_uid);
 CREATE INDEX IF NOT EXISTS idx_strategy_legs_condition_id ON strategy_legs(condition_id);
@@ -113,6 +116,7 @@ CREATE INDEX IF NOT EXISTS idx_strategy_legs_yes_token ON strategy_legs(yes_toke
 CREATE INDEX IF NOT EXISTS idx_strategy_legs_no_token ON strategy_legs(no_token);
 CREATE INDEX IF NOT EXISTS idx_strategy_legs_instrument_id ON strategy_legs(instrument_id);
 CREATE INDEX IF NOT EXISTS idx_strategy_legs_asset_class ON strategy_legs(asset_class);
+CREATE INDEX IF NOT EXISTS idx_strategy_legs_leg_kind ON strategy_legs(leg_kind);
 """
 
 _DDL_STATE = """
@@ -410,6 +414,16 @@ def connect(*, readonly: bool = False) -> sqlite3.Connection:
     global _schema_ensured
     path = _db_path()
     _ensure_db_file(path)
+    if readonly and not _schema_ensured:
+        bootstrap = sqlite3.connect(str(path), timeout=5.0)
+        bootstrap.row_factory = sqlite3.Row
+        try:
+            bootstrap.execute("PRAGMA foreign_keys=ON;")
+            bootstrap.execute("PRAGMA busy_timeout=5000;")
+            _ensure_schema(bootstrap)
+            _schema_ensured = True
+        finally:
+            bootstrap.close()
     if readonly:
         uri = f"file:{path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=5.0)
@@ -432,6 +446,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     ).fetchall()}
     if "strategy_registry" not in existing:
         conn.executescript(_DDL_REGISTRY)
+    else:
+        _migrate_registry_mode_column(conn)
     if "strategy_legs" not in existing:
         conn.executescript(_DDL_LEGS)
     else:
@@ -451,6 +467,35 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         "ON strategy_virtual_events(strategy_id, event_type, last_seen_utc DESC, id DESC)"
     )
     conn.commit()
+
+
+def _migrate_registry_mode_column(conn: sqlite3.Connection) -> None:
+    """Add `mode` for Stop/Virtual/Real while keeping legacy `state` readable."""
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(strategy_registry)").fetchall()}
+    added_mode = False
+    if "mode" not in cols:
+        conn.execute("ALTER TABLE strategy_registry ADD COLUMN mode TEXT NOT NULL DEFAULT 'Stop'")
+        cols.add("mode")
+        added_mode = True
+    if "state" in cols:
+        if added_mode:
+            conn.execute(
+                """UPDATE strategy_registry
+                   SET mode = CASE
+                       WHEN state IN ('Stop', 'Virtual', 'Real') THEN state
+                       ELSE 'Stop'
+                   END
+                   WHERE mode = 'Stop' OR COALESCE(mode, '') = ''"""
+            )
+        else:
+            conn.execute(
+                """UPDATE strategy_registry
+                   SET mode = CASE
+                       WHEN state IN ('Stop', 'Virtual', 'Real') THEN state
+                       ELSE 'Stop'
+                   END
+                   WHERE COALESCE(mode, '') = ''"""
+            )
 
 
 def _migrate_virtual_events_columns(conn: sqlite3.Connection) -> None:
@@ -474,6 +519,7 @@ def _migrate_leg_columns(conn: sqlite3.Connection) -> None:
         if col_name not in cols:
             conn.execute(f"ALTER TABLE strategy_legs ADD COLUMN {col_name} {col_def}")
     _backfill_leg_uids(conn)
+    _backfill_leg_instruments(conn)
 
 
 def _backfill_leg_uids(conn: sqlite3.Connection) -> None:
@@ -487,6 +533,33 @@ def _backfill_leg_uids(conn: sqlite3.Connection) -> None:
         leg_index = int(row["leg_index"] or 0)
         leg_uid = f"leg_{strategy_id}_{leg_id or leg_index}_{uuid.uuid4().hex[:8]}"
         conn.execute("UPDATE strategy_legs SET leg_uid = ? WHERE leg_id = ?", (leg_uid, leg_id))
+
+
+def _backfill_leg_instruments(conn: sqlite3.Connection) -> None:
+    """Fill derived instrument fields for rows created before multi-asset columns."""
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(strategy_legs)").fetchall()}
+    if not {"leg_kind", "instrument_id"}.issubset(cols):
+        return
+    rows = conn.execute(
+        """SELECT *
+           FROM strategy_legs
+           WHERE COALESCE(instrument_id, '') = ''
+              OR COALESCE(leg_kind, '') = ''
+              OR leg_kind = 'binary_market'"""
+    ).fetchall()
+    for row in rows:
+        leg = dict(row)
+        next_instrument_id = str(leg.get("instrument_id") or "").strip() or derive_instrument_id(leg)
+        next_leg_kind = derive_leg_kind(leg)
+        if (
+            next_instrument_id == str(leg.get("instrument_id") or "").strip()
+            and next_leg_kind == str(leg.get("leg_kind") or "").strip()
+        ):
+            continue
+        conn.execute(
+            "UPDATE strategy_legs SET instrument_id = ?, leg_kind = ? WHERE leg_id = ?",
+            (next_instrument_id, next_leg_kind, leg.get("leg_id")),
+        )
 
 
 def _migrate_legacy_strategy_state(conn: sqlite3.Connection) -> None:
@@ -537,6 +610,49 @@ def _safe_json_dict(raw: Any) -> Dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+_LEG_KIND_BY_ASSET_CLASS = {
+    "polymarket_binary": "binary_market",
+    "crypto_spot": "spot",
+    "crypto_perp": "perp",
+    "crypto_future": "future",
+    "crypto_option": "option",
+    "equity": "equity",
+    "equity_option": "option",
+    "index": "index",
+    "cash": "cash",
+    "rwa_stock_token": "tokenized_equity",
+}
+
+
+def derive_leg_kind(leg: Dict[str, Any]) -> str:
+    """Return the execution/instrument shape for a strategy leg."""
+    explicit = str(leg.get("leg_kind") or leg.get("kind") or "").strip().lower()
+    if explicit:
+        return explicit
+    asset_class = str(leg.get("asset_class") or "polymarket_binary").strip().lower() or "polymarket_binary"
+    return _LEG_KIND_BY_ASSET_CLASS.get(asset_class, asset_class or "unknown")
+
+
+def _registry_columns(conn: sqlite3.Connection) -> set[str]:
+    return {str(row[1]) for row in conn.execute("PRAGMA table_info(strategy_registry)").fetchall()}
+
+
+def _registry_mode_column(conn: sqlite3.Connection) -> str:
+    cols = _registry_columns(conn)
+    if "mode" in cols:
+        return "mode"
+    return "state" if "state" in cols else "mode"
+
+
+def _normalize_strategy_mode(strategy: Dict[str, Any]) -> Dict[str, Any]:
+    mode = str(strategy.get("mode") or strategy.get("state") or "Stop").strip() or "Stop"
+    strategy["mode"] = mode
+    # Legacy alias for callers that have not yet been migrated. New UI/API code
+    # should use `mode`; true strategy-machine state lives in strategy_state.
+    strategy["state"] = mode
+    return strategy
+
+
 def derive_instrument_id(leg: Dict[str, Any]) -> str:
     """Return a stable instrument id for a strategy leg.
 
@@ -572,6 +688,7 @@ def normalize_leg_instrument(leg: Dict[str, Any]) -> Dict[str, Any]:
     result = dict(leg)
     result["leg_uid"] = str(result.get("leg_uid") or "").strip()
     result["asset_class"] = str(result.get("asset_class") or "polymarket_binary").strip() or "polymarket_binary"
+    result["leg_kind"] = derive_leg_kind(result)
     result["venue"] = str(result.get("venue") or ("polymarket" if result["asset_class"] == "polymarket_binary" else "")).strip()
     result["symbol"] = str(result.get("symbol") or "").strip()
     result["instrument_json"] = _safe_json_dict(result.get("instrument_json"))
@@ -580,14 +697,16 @@ def normalize_leg_instrument(leg: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def list_strategies(*, state_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_strategies(*, mode_filter: Optional[str] = None, state_filter: Optional[str] = None) -> List[Dict[str, Any]]:
     """Return all strategies with their legs (primary leg = leg_index 0)."""
     conn = connect(readonly=True)
     try:
-        if state_filter:
+        mode_col = _registry_mode_column(conn)
+        selected_mode = mode_filter if mode_filter is not None else state_filter
+        if selected_mode:
             strats = [_row_to_dict(r) for r in conn.execute(
-                "SELECT * FROM strategy_registry WHERE state = ? ORDER BY strategy_id",
-                (state_filter,),
+                f"SELECT * FROM strategy_registry WHERE {mode_col} = ? ORDER BY strategy_id",
+                (selected_mode,),
             ).fetchall()]
         else:
             strats = [_row_to_dict(r) for r in conn.execute(
@@ -603,6 +722,7 @@ def list_strategies(*, state_filter: Optional[str] = None) -> List[Dict[str, Any
         legs_by_sid.setdefault(lg["strategy_id"], []).append(lg)
     results = []
     for s in strats:
+        _normalize_strategy_mode(s)
         sid = s["strategy_id"]
         legs = legs_by_sid.get(sid, [])
         s["legs"] = legs
@@ -619,7 +739,7 @@ def get_strategy(strategy_id: int) -> Optional[Dict[str, Any]]:
         ).fetchone()
         if not row:
             return None
-        result = _row_to_dict(row)
+        result = _normalize_strategy_mode(_row_to_dict(row))
         legs = [normalize_leg_instrument(_row_to_dict(r)) for r in conn.execute(
             "SELECT * FROM strategy_legs WHERE strategy_id = ? ORDER BY leg_index",
             (strategy_id,),
@@ -648,13 +768,14 @@ def get_all_tokens() -> List[Dict[str, Any]]:
     Used by WS subscription logic to know which tokens to monitor."""
     conn = connect(readonly=True)
     try:
+        mode_col = _registry_mode_column(conn)
         rows = conn.execute(
-            """SELECT l.strategy_id, l.leg_uid, l.leg_index, l.yes_token, l.no_token, l.condition_id,
+            f"""SELECT l.strategy_id, l.leg_uid, l.leg_index, l.yes_token, l.no_token, l.condition_id,
                       l.asset_class, l.venue, l.symbol, l.instrument_id, l.instrument_json,
-                      r.state, r.strategy_name
+                      r.{mode_col} AS mode, r.strategy_name
                FROM strategy_legs l
                JOIN strategy_registry r ON r.strategy_id = l.strategy_id
-               WHERE r.state IN ('Virtual', 'Real')
+               WHERE r.{mode_col} IN ('Virtual', 'Real')
                ORDER BY l.strategy_id, l.leg_index"""
         ).fetchall()
         return [normalize_leg_instrument(_row_to_dict(r)) for r in rows]
@@ -782,6 +903,8 @@ def _normalize_state_namespace(namespace: str = RUNTIME_STATE_NAMESPACE) -> str:
         return RUNTIME_STATE_NAMESPACE
     if ns in {"user", "manual"}:
         return USER_STATE_NAMESPACE
+    if ns in {"machine", "state", "fsm", "strategy_state"}:
+        return MACHINE_STATE_NAMESPACE
     if ns in {"system"}:
         return "system"
     return ns or RUNTIME_STATE_NAMESPACE
@@ -860,6 +983,7 @@ def read_strategy_state_bundle(strategy_id: int) -> Dict[str, Any]:
         return {
             "runtime": {},
             "user": {},
+            "machine": {},
             "system": {},
             "legacy": {},
         }
@@ -870,6 +994,7 @@ def read_strategy_state_bundle(strategy_id: int) -> Dict[str, Any]:
         return {
             "runtime": runtime,
             "user": _read_strategy_state_with_conn(conn, strategy_id, USER_STATE_NAMESPACE),
+            "machine": _read_strategy_state_with_conn(conn, strategy_id, MACHINE_STATE_NAMESPACE),
             "system": _read_strategy_state_with_conn(conn, strategy_id, "system"),
             "legacy": legacy,
         }
@@ -877,6 +1002,7 @@ def read_strategy_state_bundle(strategy_id: int) -> Dict[str, Any]:
         return {
             "runtime": {},
             "user": {},
+            "machine": {},
             "system": {},
             "legacy": {},
         }
@@ -1047,11 +1173,13 @@ def strategy_to_flat_dict(strategy: Dict[str, Any], leg_index: int = 0) -> Dict[
             break
     if leg is None and legs:
         leg = legs[0]
+    mode = str(strategy.get("mode") or strategy.get("state") or "Stop").strip() or "Stop"
     flat: Dict[str, Any] = {
         "row_id": strategy["strategy_id"],
         "Strategy": strategy.get("strategy_name", ""),
         "Code": strategy.get("strategy_code", ""),
-        "state": strategy.get("state", "Stop"),
+        "mode": mode,
+        "state": mode,
         "initial_capital": strategy.get("initial_capital", 0),
         "strategy_bankroll": strategy.get("strategy_bankroll", 0),
         "profit_roll_ratio": strategy.get("profit_roll_ratio", 0),
@@ -1071,6 +1199,7 @@ def strategy_to_flat_dict(strategy: Dict[str, Any], leg_index: int = 0) -> Dict[
         flat["condition_id"] = leg.get("condition_id", "")
         flat["yes_token"] = leg.get("yes_token") or ""
         flat["no_token"] = leg.get("no_token") or ""
+        flat["leg_kind"] = leg.get("leg_kind") or derive_leg_kind(leg)
         flat["asset_class"] = leg.get("asset_class") or "polymarket_binary"
         flat["venue"] = leg.get("venue") or ""
         flat["symbol"] = leg.get("symbol") or ""
@@ -1087,6 +1216,7 @@ def strategy_to_flat_dict(strategy: Dict[str, Any], leg_index: int = 0) -> Dict[
         flat["condition_id"] = ""
         flat["yes_token"] = ""
         flat["no_token"] = ""
+        flat["leg_kind"] = "binary_market"
         flat["asset_class"] = "polymarket_binary"
         flat["venue"] = "polymarket"
         flat["symbol"] = ""
@@ -1102,9 +1232,9 @@ def strategy_to_flat_dict(strategy: Dict[str, Any], leg_index: int = 0) -> Dict[
     return flat
 
 
-def list_strategies_flat(*, state_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_strategies_flat(*, mode_filter: Optional[str] = None, state_filter: Optional[str] = None) -> List[Dict[str, Any]]:
     """Return strategies as flat dicts compatible with old _build_strategy_item()."""
-    strategies = list_strategies(state_filter=state_filter)
+    strategies = list_strategies(mode_filter=mode_filter, state_filter=state_filter)
     return [strategy_to_flat_dict(s) for s in strategies]
 
 

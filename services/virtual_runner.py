@@ -1,7 +1,7 @@
 """
 VirtualRunner — 虚拟盘调度循环。
 
-每隔 N 秒读取 state=Virtual 的策略，依次：
+每隔 N 秒读取 mode=Virtual 的策略，依次：
   1. VirtualContextBuilder 构造 UseData
   2. 调用 SandboxRun.run_node() 获取 FunctionJson
   3. VirtualExecution 执行 actions，写五张虚拟盘表
@@ -28,7 +28,12 @@ from services.strategy_audit_store import (
     write_run_event,
     write_run_events,
 )
-from services.strategy_data_source import connect as ds_connect, list_strategies, write_strategy_state_updates
+from services.strategy_data_source import (
+    connect as ds_connect,
+    list_strategies,
+    write_strategy_state_updates,
+    write_strategy_state_values,
+)
 from services.strategy_metric_store import write_metric_events
 from services.virtual_context_builder import build_use_data
 from services.virtual_execution import (
@@ -178,11 +183,11 @@ def _build_sandbox_node(strategy: Dict[str, Any], use_data: Dict[str, Any]) -> D
 def _parse_function_json(raw: Optional[str]) -> Dict[str, Any]:
     """解析 FunctionJson 字符串，返回 {actions, print, wake_reason}。"""
     if not raw:
-        return {"actions": [], "print": [], "wake_reason": None, "metrics": {}, "metrics_meta": {}, "state_updates": {}}
+        return {"actions": [], "print": [], "wake_reason": None, "metrics": {}, "metrics_meta": {}, "state_updates": {}, "machine_state_updates": {}}
     try:
         data = json.loads(raw)
         if not isinstance(data, dict):
-            return {"actions": [], "print": [str(data)], "wake_reason": None, "metrics": {}, "metrics_meta": {}, "state_updates": {}}
+            return {"actions": [], "print": [str(data)], "wake_reason": None, "metrics": {}, "metrics_meta": {}, "state_updates": {}, "machine_state_updates": {}}
         return {
             "actions": data.get("actions") or [],
             "print": data.get("print") or [],
@@ -190,9 +195,40 @@ def _parse_function_json(raw: Optional[str]) -> Dict[str, Any]:
             "metrics": data.get("metrics") if isinstance(data.get("metrics"), dict) else {},
             "metrics_meta": data.get("metrics_meta") if isinstance(data.get("metrics_meta"), dict) else {},
             "state_updates": data.get("state_updates") if isinstance(data.get("state_updates"), dict) else {},
+            "machine_state_updates": data.get("machine_state_updates") if isinstance(data.get("machine_state_updates"), dict) else {},
         }
     except Exception as e:
-        return {"actions": [], "print": [f"[ParseError] {e}"], "wake_reason": None, "metrics": {}, "metrics_meta": {}, "state_updates": {}}
+        return {"actions": [], "print": [f"[ParseError] {e}"], "wake_reason": None, "metrics": {}, "metrics_meta": {}, "state_updates": {}, "machine_state_updates": {}}
+
+
+def _is_stop_loss_exit_action(action: Any) -> bool:
+    if not isinstance(action, dict):
+        return False
+    reason = str(action.get("reason") or action.get("signal") or "").strip().lower()
+    if reason != "stop_loss":
+        return False
+    action_type = str(action.get("type") or "").strip().upper()
+    if action_type in {"SELL", "SELL_NOTIONAL", "CLOSE", "CLOSE_ALL"}:
+        return True
+    if action_type in {"SETPOS", "SET_BINARY_TARGET", "SET_TARGET"}:
+        try:
+            target = float(action.get("target_pct", action.get("pct", action.get("target", 0.0))) or 0.0)
+        except (TypeError, ValueError):
+            target = 0.0
+        return target <= 0.0
+    return False
+
+
+def _should_lock_after_stop_loss(parsed: Dict[str, Any], orders_placed: int) -> bool:
+    if orders_placed <= 0:
+        return False
+    machine_updates = parsed.get("machine_state_updates")
+    if isinstance(machine_updates, dict) and str(machine_updates.get("state") or "").strip():
+        return False
+    metrics = parsed.get("metrics") if isinstance(parsed.get("metrics"), dict) else {}
+    if str(metrics.get("signal") or "").strip().lower() == "stop_loss":
+        return True
+    return any(_is_stop_loss_exit_action(action) for action in (parsed.get("actions") or []))
 
 
 def _price_snapshot_from_use_data(use_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -328,6 +364,11 @@ def _run_one_strategy(strategy: Dict[str, Any], collector_state: Optional[Dict[s
                 if exec_errors:
                     error_msg = "; ".join(exec_errors)
 
+            if _should_lock_after_stop_loss(parsed, orders_placed):
+                machine_updates = dict(parsed.get("machine_state_updates") or {})
+                machine_updates["state"] = "stop_loss_locked"
+                parsed["machine_state_updates"] = machine_updates
+
         except Exception as e:
             error_msg = f"{type(e).__name__}: {e}"
 
@@ -336,6 +377,7 @@ def _run_one_strategy(strategy: Dict[str, Any], collector_state: Optional[Dict[s
             {
                 "actions": parsed["actions"] or [],
                 "state_updates": parsed.get("state_updates") or {},
+                "machine_state_updates": parsed.get("machine_state_updates") or {},
                 "price_snapshot": _price_snapshot_from_use_data(use_data),
             },
             ensure_ascii=False,
@@ -381,6 +423,22 @@ def _run_one_strategy(strategy: Dict[str, Any], collector_state: Optional[Dict[s
             write_strategy_state_updates(
                 strategy_id,
                 state_updates,
+                conn=conn,
+            )
+            conn.commit()
+
+        machine_state_updates = dict(parsed.get("machine_state_updates") or {})
+        if machine_state_updates and parsed.get("actions") and orders_placed <= 0:
+            machine_state_updates = {}
+
+        if machine_state_updates:
+            write_strategy_state_values(
+                strategy_id,
+                machine_state_updates,
+                namespace="machine",
+                replace=False,
+                actor="strategy",
+                reason="machine_state_updates",
                 conn=conn,
             )
             conn.commit()
@@ -437,7 +495,7 @@ class VirtualRunner:
             self._stop_event.wait(self._interval)
 
     def _tick(self, collector_state: Optional[Dict[str, Any]]) -> None:
-        strategies = list_strategies(state_filter="Virtual")
+        strategies = list_strategies(mode_filter="Virtual")
         for strategy in strategies:
             try:
                 _run_one_strategy(strategy, collector_state)

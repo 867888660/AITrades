@@ -14,12 +14,15 @@ import json
 import sqlite3
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from services.clob_orderbook_service import fetch_orderbook_quote
+from services.config_loader import BASE_DIR, load_web_settings
 from services.strategy_data_source import (
     connect as ds_connect,
     derive_instrument_id,
+    derive_leg_kind,
     normalize_leg_instrument,
     read_strategy_state_bundle,
 )
@@ -28,6 +31,8 @@ from services.strategy_schema_service import get_strategy_code_schemas, merge_sc
 
 _MARKET_META_CACHE: Dict[str, Dict[str, Any]] = {}
 _MARKET_META_TTL_SECONDS = 300.0
+_DICTIONARY_META_CACHE: Dict[str, Dict[str, Any]] = {}
+_END_DATE_INPUT_KEYS = ("Enddate", "EndDate", "end_date", "endDate", "EndTime", "L0_EndTime")
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +104,12 @@ def _read_live_orderbook_quote(token: str) -> Dict[str, Any]:
         "best_ask": quote.get("ask"),
         "best_bid_qty": quote.get("bid_size"),
         "best_ask_qty": quote.get("ask_size"),
+        "bid_levels": quote.get("bids") or [],
+        "ask_levels": quote.get("asks") or [],
+        "bid_depth_qty": quote.get("bid_depth_qty"),
+        "ask_depth_qty": quote.get("ask_depth_qty"),
+        "bid_depth_notional": quote.get("bid_depth_notional"),
+        "ask_depth_notional": quote.get("ask_depth_notional"),
         "ts": quote.get("updated_at"),
         "source": "clob_book",
     }
@@ -113,6 +124,140 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _valid_binary_price(value: Any) -> Optional[float]:
+    price = _safe_float(value, 0.0)
+    if 0.0 < price < 1.0:
+        return price
+    return None
+
+
+def _normalize_book_levels(value: Any, *, side: str) -> List[Dict[str, float]]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value) if value.strip() else []
+        except Exception:
+            value = []
+    if not isinstance(value, list):
+        return []
+    by_price: Dict[float, float] = {}
+    for level in value:
+        if not isinstance(level, dict):
+            continue
+        price = _safe_float(level.get("price"), 0.0)
+        qty = _safe_float(level.get("qty", level.get("size")), 0.0)
+        if price <= 0 or qty <= 0:
+            continue
+        by_price[price] = by_price.get(price, 0.0) + qty
+    return [
+        {"price": price, "qty": qty}
+        for price, qty in sorted(by_price.items(), key=lambda item: item[0], reverse=(side == "bid"))
+    ]
+
+
+def _levels_qty(levels: List[Dict[str, float]]) -> float:
+    return sum(_safe_float(level.get("qty"), 0.0) for level in levels)
+
+
+def _levels_notional(levels: List[Dict[str, float]]) -> float:
+    return sum(_safe_float(level.get("price"), 0.0) * _safe_float(level.get("qty"), 0.0) for level in levels)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or str(value).strip() == "":
+            return int(default)
+        return int(float(value))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _ema_values(values: List[float], period: int) -> List[float]:
+    if not values:
+        return []
+    period = max(1, int(period))
+    alpha = 2.0 / (period + 1.0)
+    out: List[float] = []
+    ema = float(values[0])
+    for value in values:
+        ema = alpha * float(value) + (1.0 - alpha) * ema
+        out.append(ema)
+    return out
+
+
+def _compute_macd(values: List[float], fast: int, slow: int, signal: int) -> Dict[str, Any]:
+    values = [float(v) for v in values if _valid_binary_price(v) is not None]
+    if len(values) < max(2, slow):
+        return {}
+    ema_fast = _ema_values(values, fast)
+    ema_slow = _ema_values(values, slow)
+    macd_values = [f - s for f, s in zip(ema_fast, ema_slow)]
+    signal_values = _ema_values(macd_values, signal)
+    hist_values = [m - s for m, s in zip(macd_values, signal_values)]
+    if not hist_values:
+        return {}
+    hist_prev = hist_values[-2] if len(hist_values) >= 2 else hist_values[-1]
+    return {
+        "macd": macd_values[-1],
+        "macd_signal": signal_values[-1],
+        "macd_hist": hist_values[-1],
+        "macd_hist_prev": hist_prev,
+        "macd_hist_slope": hist_values[-1] - hist_prev,
+        "macd_sample_count": len(values),
+    }
+
+
+def _history_price_from_row(row: sqlite3.Row) -> Optional[float]:
+    bid = _valid_binary_price(row["now_bid"] if "now_bid" in row.keys() else None)
+    if bid is None:
+        bid = _valid_binary_price(row["best_bid"] if "best_bid" in row.keys() else None)
+    if bid is not None:
+        return bid
+    last_price = _valid_binary_price(row["last_price"] if "last_price" in row.keys() else None)
+    if last_price is not None:
+        return last_price
+    return None
+
+
+def _read_market_macd(
+    realtime_db_path: str,
+    token: str,
+    fast: int,
+    slow: int,
+    signal: int,
+    current_price: Any = None,
+    limit: int = 240,
+) -> Dict[str, Any]:
+    """Compute a lightweight MACD snapshot from recent sellable bid history."""
+    if not realtime_db_path or not token:
+        return {}
+    try:
+        conn = sqlite3.connect(realtime_db_path, timeout=3.0)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT timestamp, now_bid, now_ask, best_bid, best_ask, last_price
+               FROM market_deltas
+               WHERE clobTokenId = ?
+               ORDER BY id DESC LIMIT ?""",
+            (token, max(20, int(limit))),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return {}
+
+    values: List[float] = []
+    for row in reversed(rows):
+        price = _history_price_from_row(row)
+        if price is not None:
+            values.append(price)
+    current = _valid_binary_price(current_price)
+    if current is not None and (not values or abs(values[-1] - current) > 1e-9):
+        values.append(current)
+    out = _compute_macd(values, fast, slow, signal)
+    if out:
+        out["macd_source"] = "market_deltas_bid"
+    return out
 
 
 def _parse_input_json(raw_input: Any) -> Dict[str, Any]:
@@ -342,6 +487,8 @@ def _days_hours_to_end(end_date_iso: Optional[str]) -> tuple[float, float]:
     try:
         from datetime import datetime, timezone
         end = datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
         delta = (end - now).total_seconds()
         if delta < 0:
@@ -351,25 +498,95 @@ def _days_hours_to_end(end_date_iso: Optional[str]) -> tuple[float, float]:
         return 0.0, 0.0
 
 
-def _resolve_market_meta(strategy_id: int) -> Dict[str, Any]:
-    cache_key = str(strategy_id)
+def _normalize_end_date_iso(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    except Exception:
+        return text
+
+
+def _manual_end_date_from_inputs(input_params: Dict[str, Any]) -> str:
+    for key in _END_DATE_INPUT_KEYS:
+        value = input_params.get(key)
+        if value is not None and str(value).strip():
+            return _normalize_end_date_iso(value)
+    return ""
+
+
+def _resolve_market_meta(strategy: Dict[str, Any]) -> Dict[str, Any]:
+    strategy_id = int(strategy.get("strategy_id") or 0)
+    data = {
+        "end_date": strategy.get("end_date") or "",
+        "question": strategy.get("question") or strategy.get("display_name") or strategy.get("strategy_name") or "",
+        "market_updated_at": strategy.get("market_updated_at") or "",
+    }
+    if strategy_id <= 0:
+        return data
+    cache_key = f"{strategy_id}:{strategy.get('updated_at_utc') or ''}"
     now = time.monotonic()
     cached = _MARKET_META_CACHE.get(cache_key)
     if cached and (now - float(cached.get("ts") or 0.0)) < _MARKET_META_TTL_SECONDS:
         return dict(cached.get("data") or {})
-    try:
-        from services.polymarket_service import fetch_strategy_detail
-
-        detail = fetch_strategy_detail(strategy_id, allow_remote_positions=False)
-    except Exception:
-        detail = {}
-    data = {
-        "end_date": detail.get("end_date") or "",
-        "question": detail.get("question") or detail.get("display_name") or "",
-        "market_updated_at": detail.get("market_updated_at") or "",
-    }
     _MARKET_META_CACHE[cache_key] = {"ts": now, "data": data}
     return data
+
+
+def _dictionary_db_path() -> Path:
+    try:
+        settings = load_web_settings()
+        raw = str(settings.get("polymarket_dictionary_db_path") or "").strip()
+        if raw:
+            path = Path(raw).expanduser()
+            return path if path.is_absolute() else BASE_DIR / path
+    except Exception:
+        pass
+    return BASE_DIR / "Data" / "PolyMarketDictionary.db"
+
+
+def _read_dictionary_market_meta(condition_id: str) -> Dict[str, Any]:
+    condition_id = str(condition_id or "").strip()
+    if not condition_id:
+        return {}
+    now = time.monotonic()
+    cached = _DICTIONARY_META_CACHE.get(condition_id)
+    if cached and (now - float(cached.get("ts") or 0.0)) < _MARKET_META_TTL_SECONDS:
+        return dict(cached.get("data") or {})
+
+    data: Dict[str, Any] = {}
+    path = _dictionary_db_path()
+    if path.exists():
+        try:
+            conn = sqlite3.connect(str(path), timeout=3.0)
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """SELECT question, Subject, endDate, url, yes_token, no_token
+                   FROM polyMarket_Dictionary
+                   WHERE condition_id = ?
+                   LIMIT 1""",
+                (condition_id,),
+            ).fetchone()
+            conn.close()
+            if row:
+                d = dict(row)
+                data = {
+                    "question": d.get("question") or "",
+                    "category": d.get("Subject") or "",
+                    "end_date": d.get("endDate") or "",
+                    "url": d.get("url") or "",
+                    "yes_token": d.get("yes_token") or "",
+                    "no_token": d.get("no_token") or "",
+                }
+        except Exception:
+            data = {}
+
+    _DICTIONARY_META_CACHE[condition_id] = {"ts": now, "data": data}
+    return dict(data)
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +597,7 @@ def build_use_data(
     strategy: Dict[str, Any],
     realtime_db_path: str,
     collector_state: Optional[Dict[str, Any]] = None,
+    include_live_orderbook: bool = True,
 ) -> Dict[str, Any]:
     """
     组装 UseData 字典。
@@ -395,8 +613,17 @@ def build_use_data(
     state_bundle = read_strategy_state_bundle(strategy_id) if strategy_id else {}
     schemas = get_strategy_code_schemas(strategy.get("strategy_code") or "")
     input_params = merge_schema_defaults(schemas.get("params") or {}, input_params)
+    manual_end_date = _manual_end_date_from_inputs(input_params)
+    macd_fast = min(60, max(2, _safe_int(input_params.get("macd_fast"), 6)))
+    macd_slow = min(120, max(macd_fast + 1, _safe_int(input_params.get("macd_slow"), 13)))
+    macd_signal = min(60, max(2, _safe_int(input_params.get("macd_signal"), 5)))
     runtime_state = merge_schema_defaults(schemas.get("runtime") or {}, state_bundle.get("runtime") or {})
     user_state = merge_schema_defaults(schemas.get("controls") or {}, state_bundle.get("user") or {})
+    machine_state = str(
+        (state_bundle.get("machine") or {}).get("state")
+        or (schemas.get("state_machine") or {}).get("default")
+        or "auto"
+    ).strip() or "auto"
     system_state = state_bundle.get("system") or {}
 
     # 读取虚拟持仓
@@ -421,7 +648,7 @@ def build_use_data(
     use_data["SchemaVersion"] = "2.0"
     use_data["LegacySchemaVersion"] = "1.0"
     use_data["NowTime"] = now_utc
-    use_data["RunMode"] = str(strategy.get("state") or "Virtual")
+    use_data["RunMode"] = str(strategy.get("mode") or strategy.get("state") or "Virtual")
     use_data["StrategyId"] = strategy_id
     use_data["StrategyName"] = strategy.get("strategy_name") or ""
     use_data["StrategyBankroll"] = strategy_bankroll
@@ -430,7 +657,11 @@ def build_use_data(
     use_data["Controls"] = user_state
     use_data["RuntimeState"] = runtime_state
     use_data["UserState"] = user_state
+    use_data["StrategyState"] = {"state": machine_state}
+    use_data["MachineState"] = machine_state
     use_data["SystemState"] = system_state
+    # Compatibility alias for older strategies. New strategies should read
+    # RuntimeState or StrategyState explicitly.
     use_data["State"] = runtime_state
     use_data["Portfolio"] = {
         "cash": account_cash,
@@ -439,7 +670,7 @@ def build_use_data(
         "unrealized_pnl": _safe_float(virtual_account.get("unrealized_pnl"), 0.0),
         "total_fees_paid": _safe_float(virtual_account.get("total_fees_paid"), 0.0),
     }
-    market_meta = _resolve_market_meta(strategy_id)
+    market_meta = _resolve_market_meta(strategy)
 
     # -----------------------------------------------------------------------
     # Tier 1 — 盘口（per-leg）
@@ -447,16 +678,19 @@ def build_use_data(
     for leg in legs:
         leg = normalize_leg_instrument(leg)
         n = leg.get("leg_index", 0)
+        leg_index_num = int(_safe_float(n, 0.0))
         leg_uid = str(leg.get("leg_uid") or f"legacy:{n}").strip()
         yes_token = leg.get("yes_token") or ""
         no_token = leg.get("no_token") or ""
         condition_id = leg.get("condition_id") or ""
         asset_class = str(leg.get("asset_class") or "polymarket_binary").strip() or "polymarket_binary"
+        leg_kind = derive_leg_kind(leg)
         venue = str(leg.get("venue") or "").strip()
         symbol = str(leg.get("symbol") or "").strip().upper()
         instrument_id = derive_instrument_id(leg)
         instrument_params = _parse_json_dict(leg.get("params_json"))
         instrument_meta = _parse_json_dict(leg.get("instrument_json"))
+        dictionary_meta = _read_dictionary_market_meta(condition_id)
 
         # 自动补全：有 condition_id 但缺 token 时，从 markets_state 反查
         if condition_id and (not yes_token or not no_token):
@@ -465,11 +699,15 @@ def build_use_data(
                 yes_token = resolved["yes"]
             if not no_token and "no" in resolved:
                 no_token = resolved["no"]
+        if not yes_token:
+            yes_token = str(dictionary_meta.get("yes_token") or "").strip()
+        if not no_token:
+            no_token = str(dictionary_meta.get("no_token") or "").strip()
 
         yes_snap = _read_market_snapshot(realtime_db_path, yes_token)
         no_snap = _read_market_snapshot(realtime_db_path, no_token)
-        yes_live = _read_live_orderbook_quote(yes_token)
-        no_live = _read_live_orderbook_quote(no_token)
+        yes_live = _read_live_orderbook_quote(yes_token) if include_live_orderbook else {}
+        no_live = _read_live_orderbook_quote(no_token) if include_live_orderbook else {}
         if yes_live:
             yes_snap = {**yes_snap, **yes_live}
         if no_live:
@@ -482,6 +720,8 @@ def build_use_data(
         no_bid  = _safe_float(no_snap.get("now_bid")  or no_snap.get("best_bid"), 0.0)
         yes_last = _safe_float(yes_snap.get("last_price"), 0.0)
         no_last = _safe_float(no_snap.get("last_price"), 0.0)
+        yes_macd = _read_market_macd(realtime_db_path, yes_token, macd_fast, macd_slow, macd_signal, yes_bid)
+        no_macd = _read_market_macd(realtime_db_path, no_token, macd_fast, macd_slow, macd_signal, no_bid)
 
         # 虚拟持仓
         yes_pos = vpos.get((n, "YES"), {})
@@ -492,24 +732,28 @@ def build_use_data(
         no_avg  = _safe_float(no_pos.get("avg_price"), 0.0)
 
         end_date_iso = (
-            state_snap.get("end_date_iso")
+            manual_end_date
+            or state_snap.get("end_date_iso")
             or state_snap.get("end_date")
             or leg.get("end_date")
             or strategy.get("end_date")
             or market_meta.get("end_date")
+            or dictionary_meta.get("end_date")
             or ""
         )
         day_to_end, hour_to_end = _days_hours_to_end(end_date_iso)
         budget_cap = _safe_float(leg.get("budget_cap"), 0.0)
         configured_budget_cap = budget_cap
-        # budget_cap 为 0 时使用虚拟账户当前权益，避免亏损后继续按初始本金 sizing。
+        # Preserve legacy dynamic sizing for single-leg strategies and L0.
+        # In multi-leg strategies, non-primary budget_cap=0 means no budget.
         if budget_cap <= 0:
-            budget_cap = dynamic_budget_cap
+            budget_cap = dynamic_budget_cap if len(legs) <= 1 or leg_index_num == 0 else 0.0
         market_status = _market_status(state_snap)
         market_title = (
             state_snap.get("market_title")
             or state_snap.get("question")
             or state_snap.get("title")
+            or dictionary_meta.get("question")
             or market_meta.get("question")
             or symbol
             or ""
@@ -521,29 +765,40 @@ def build_use_data(
         generic_pos = vpos_v2.get(instrument_id, {})
         generic_qty = _safe_float(generic_pos.get("qty"), 0.0)
         generic_avg = _safe_float(generic_pos.get("avg_price"), 0.0)
+        yes_bid_levels = _normalize_book_levels(yes_snap.get("bid_levels") or yes_snap.get("bids"), side="bid")
+        yes_ask_levels = _normalize_book_levels(yes_snap.get("ask_levels") or yes_snap.get("asks"), side="ask")
+        no_bid_levels = _normalize_book_levels(no_snap.get("bid_levels") or no_snap.get("bids"), side="bid")
+        no_ask_levels = _normalize_book_levels(no_snap.get("ask_levels") or no_snap.get("asks"), side="ask")
         side_rows = {
             "Yes": {
                 "token": yes_token,
                 "snap": yes_snap,
+                "macd": yes_macd,
                 "ask": yes_ask,
                 "bid": yes_bid,
                 "last": yes_last,
                 "qty": yes_qty,
                 "avg": yes_avg,
+                "bid_levels": yes_bid_levels,
+                "ask_levels": yes_ask_levels,
             },
             "No": {
                 "token": no_token,
                 "snap": no_snap,
+                "macd": no_macd,
                 "ask": no_ask,
                 "bid": no_bid,
                 "last": no_last,
                 "qty": no_qty,
                 "avg": no_avg,
+                "bid_levels": no_bid_levels,
+                "ask_levels": no_ask_levels,
             },
         }
 
         use_data[f"L{n}_ConditionId"] = leg.get("condition_id") or ""
         use_data[f"L{n}_LegUid"] = leg_uid
+        use_data[f"L{n}_LegKind"] = leg_kind
         use_data[f"L{n}_AssetClass"] = asset_class
         use_data[f"L{n}_Venue"] = venue
         use_data[f"L{n}_Symbol"] = symbol
@@ -571,6 +826,13 @@ def build_use_data(
             side_bid = _safe_float(side_data["bid"], 0.0)
             side_ask = _safe_float(side_data["ask"], 0.0)
             side_snap = side_data["snap"]
+            bid_levels = side_data.get("bid_levels") if isinstance(side_data.get("bid_levels"), list) else []
+            ask_levels = side_data.get("ask_levels") if isinstance(side_data.get("ask_levels"), list) else []
+            bid_depth_qty = _safe_float(side_snap.get("bid_depth_qty"), _levels_qty(bid_levels))
+            ask_depth_qty = _safe_float(side_snap.get("ask_depth_qty"), _levels_qty(ask_levels))
+            bid_depth_notional = _safe_float(side_snap.get("bid_depth_notional"), _levels_notional(bid_levels))
+            ask_depth_notional = _safe_float(side_snap.get("ask_depth_notional"), _levels_notional(ask_levels))
+            side_macd = side_data["macd"] if isinstance(side_data.get("macd"), dict) else {}
             position_cost = side_qty * side_avg
             open_info = open_orders.get((leg_uid, int(n), side_name.upper()), {})
             open_buy_qty = _safe_float(open_info.get("open_buy_qty"), 0.0)
@@ -582,6 +844,12 @@ def build_use_data(
             use_data[f"{prefix}_LastPrice"] = _safe_float(side_data["last"], 0.0)
             use_data[f"{prefix}_BestAskQty"] = _safe_float(side_snap.get("best_ask_qty"), 0.0)
             use_data[f"{prefix}_BestBidQty"] = _safe_float(side_snap.get("best_bid_qty"), 0.0)
+            use_data[f"{prefix}_AskLevels"] = ask_levels
+            use_data[f"{prefix}_BidLevels"] = bid_levels
+            use_data[f"{prefix}_AskDepthQty"] = ask_depth_qty
+            use_data[f"{prefix}_BidDepthQty"] = bid_depth_qty
+            use_data[f"{prefix}_AskDepthNotional"] = ask_depth_notional
+            use_data[f"{prefix}_BidDepthNotional"] = bid_depth_notional
             use_data[f"{prefix}_PositionQty"] = side_qty
             use_data[f"{prefix}_PositionAvgPrice"] = side_avg
             use_data[f"{prefix}_PositionCost"] = position_cost
@@ -595,6 +863,12 @@ def build_use_data(
             use_data[f"{prefix}_TakeProfitOrderStatus"] = str(open_info.get("take_profit_order_status") or "")
             use_data[f"{prefix}_DataStatus"] = _data_status(side_ask, side_bid, side_snap)
             use_data[f"{prefix}_LastUpdateAgeSec"] = _snapshot_age_seconds(side_snap, now_dt)
+            use_data[f"{prefix}_MACD"] = side_macd.get("macd")
+            use_data[f"{prefix}_MACDSignal"] = side_macd.get("macd_signal")
+            use_data[f"{prefix}_MACDHist"] = side_macd.get("macd_hist")
+            use_data[f"{prefix}_MACDHistPrev"] = side_macd.get("macd_hist_prev")
+            use_data[f"{prefix}_MACDHistSlope"] = side_macd.get("macd_hist_slope")
+            use_data[f"{prefix}_MACDSampleCount"] = side_macd.get("macd_sample_count", 0)
 
         suffix = f"_L{n}"
         use_data[f"Yes_now_ask{suffix}"]           = yes_ask
@@ -611,6 +885,14 @@ def build_use_data(
         use_data[f"Yes_OpenSellOrdersQty{suffix}"] = _safe_float(yes_open.get("open_sell_qty"), 0.0)
         use_data[f"No_OpenBuyOrdersQty{suffix}"]   = _safe_float(no_open.get("open_buy_qty"), 0.0)
         use_data[f"No_OpenSellOrdersQty{suffix}"]  = _safe_float(no_open.get("open_sell_qty"), 0.0)
+        use_data[f"Yes_AskLevels{suffix}"]          = yes_ask_levels
+        use_data[f"Yes_BidLevels{suffix}"]          = yes_bid_levels
+        use_data[f"No_AskLevels{suffix}"]           = no_ask_levels
+        use_data[f"No_BidLevels{suffix}"]           = no_bid_levels
+        use_data[f"Yes_AskDepthQty{suffix}"]        = _levels_qty(yes_ask_levels)
+        use_data[f"Yes_BidDepthQty{suffix}"]        = _levels_qty(yes_bid_levels)
+        use_data[f"No_AskDepthQty{suffix}"]         = _levels_qty(no_ask_levels)
+        use_data[f"No_BidDepthQty{suffix}"]         = _levels_qty(no_bid_levels)
         use_data[f"Yes_depth_ask_1c_usd{suffix}"]  = 0.0
         use_data[f"Yes_depth_bid_1c_usd{suffix}"]  = 0.0
         use_data[f"No_depth_ask_1c_usd{suffix}"]   = 0.0
@@ -627,16 +909,28 @@ def build_use_data(
         use_data[f"Enddate{suffix}"]               = end_date_iso
         use_data[f"day_to_end{suffix}"]            = day_to_end
         use_data[f"hour_to_end{suffix}"]           = hour_to_end
+        use_data[f"Yes_MACD{suffix}"]              = yes_macd.get("macd")
+        use_data[f"Yes_MACDSignal{suffix}"]        = yes_macd.get("macd_signal")
+        use_data[f"Yes_MACDHist{suffix}"]          = yes_macd.get("macd_hist")
+        use_data[f"Yes_MACDHistPrev{suffix}"]      = yes_macd.get("macd_hist_prev")
+        use_data[f"Yes_MACDHistSlope{suffix}"]     = yes_macd.get("macd_hist_slope")
+        use_data[f"No_MACD{suffix}"]               = no_macd.get("macd")
+        use_data[f"No_MACDSignal{suffix}"]         = no_macd.get("macd_signal")
+        use_data[f"No_MACDHist{suffix}"]           = no_macd.get("macd_hist")
+        use_data[f"No_MACDHistPrev{suffix}"]       = no_macd.get("macd_hist_prev")
+        use_data[f"No_MACDHistSlope{suffix}"]      = no_macd.get("macd_hist_slope")
 
         instruments.append({
             "index": int(n),
             "leg_index": int(n),
             "leg_uid": leg_uid,
             "instrument_id": instrument_id,
+            "leg_kind": leg_kind,
             "asset_class": asset_class,
             "venue": venue,
             "symbol": symbol,
             "budget_cap": budget_cap,
+            "configured_budget_cap": configured_budget_cap,
             "params": instrument_params,
             "instrument": instrument_meta,
             "market": {
@@ -659,6 +953,24 @@ def build_use_data(
                 "no_ask": no_ask,
                 "no_last": no_last,
             },
+            "orderbook": {
+                "yes": {
+                    "bids": yes_bid_levels,
+                    "asks": yes_ask_levels,
+                    "bid_depth_qty": _levels_qty(yes_bid_levels),
+                    "ask_depth_qty": _levels_qty(yes_ask_levels),
+                    "bid_depth_notional": _levels_notional(yes_bid_levels),
+                    "ask_depth_notional": _levels_notional(yes_ask_levels),
+                },
+                "no": {
+                    "bids": no_bid_levels,
+                    "asks": no_ask_levels,
+                    "bid_depth_qty": _levels_qty(no_bid_levels),
+                    "ask_depth_qty": _levels_qty(no_ask_levels),
+                    "bid_depth_notional": _levels_notional(no_bid_levels),
+                    "ask_depth_notional": _levels_notional(no_ask_levels),
+                },
+            },
             "position": {
                 "qty": generic_qty,
                 "avg_price": generic_avg,
@@ -677,6 +989,7 @@ def build_use_data(
         # L0 同时作为无后缀别名（向后兼容单腿策略）
         if n == 0:
             use_data["LegUid"] = leg_uid
+            use_data["LegKind"] = leg_kind
             use_data["Yes_AskPrice"]        = yes_ask
             use_data["Yes_BidPrice"]        = yes_bid
             use_data["No_AskPrice"]         = no_ask
@@ -697,6 +1010,14 @@ def build_use_data(
             use_data["Yes_OpenSellOrdersQty"] = _safe_float(yes_open.get("open_sell_qty"), 0.0)
             use_data["No_OpenBuyOrdersQty"]   = _safe_float(no_open.get("open_buy_qty"), 0.0)
             use_data["No_OpenSellOrdersQty"]  = _safe_float(no_open.get("open_sell_qty"), 0.0)
+            use_data["Yes_AskLevels"]          = yes_ask_levels
+            use_data["Yes_BidLevels"]          = yes_bid_levels
+            use_data["No_AskLevels"]           = no_ask_levels
+            use_data["No_BidLevels"]           = no_bid_levels
+            use_data["Yes_AskDepthQty"]        = _levels_qty(yes_ask_levels)
+            use_data["Yes_BidDepthQty"]        = _levels_qty(yes_bid_levels)
+            use_data["No_AskDepthQty"]         = _levels_qty(no_ask_levels)
+            use_data["No_BidDepthQty"]         = _levels_qty(no_bid_levels)
             use_data["Yes_Now_Pos"]           = yes_pos_pct
             use_data["No_Now_Pos"]            = no_pos_pct
             use_data["Yes_Now_CostPos"]       = yes_qty * yes_avg
@@ -706,6 +1027,16 @@ def build_use_data(
             use_data["Enddate"]               = end_date_iso
             use_data["day_to_end"]            = day_to_end
             use_data["hour_to_end"]           = hour_to_end
+            use_data["Yes_MACD"]              = yes_macd.get("macd")
+            use_data["Yes_MACDSignal"]        = yes_macd.get("macd_signal")
+            use_data["Yes_MACDHist"]          = yes_macd.get("macd_hist")
+            use_data["Yes_MACDHistPrev"]      = yes_macd.get("macd_hist_prev")
+            use_data["Yes_MACDHistSlope"]     = yes_macd.get("macd_hist_slope")
+            use_data["No_MACD"]               = no_macd.get("macd")
+            use_data["No_MACDSignal"]         = no_macd.get("macd_signal")
+            use_data["No_MACDHist"]           = no_macd.get("macd_hist")
+            use_data["No_MACDHistPrev"]       = no_macd.get("macd_hist_prev")
+            use_data["No_MACDHistSlope"]      = no_macd.get("macd_hist_slope")
 
     # -----------------------------------------------------------------------
     # Tier 2 — 预算派生（向后兼容旧策略代码，仅 L0）
