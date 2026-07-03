@@ -15,6 +15,7 @@ const eventGraphRankings = document.getElementById("eventGraphRankings");
 const showEventsToggle = document.getElementById("showEventsToggle");
 const showFinanceToggle = document.getElementById("showFinanceToggle");
 const showSignalsToggle = document.getElementById("showSignalsToggle");
+const eventGraphRelationMode = document.getElementById("eventGraphRelationMode");
 const eventGraphLocateBtn = document.getElementById("eventGraphLocateBtn");
 const eventGraphZoomInBtn = document.getElementById("eventGraphZoomInBtn");
 const eventGraphZoomOutBtn = document.getElementById("eventGraphZoomOutBtn");
@@ -84,6 +85,7 @@ function graphQueryString(forceRefresh = false) {
   params.set("sort", eventGraphSort?.value || "volume24h");
   params.set("order", "desc");
   params.set("limit", eventGraphLimit?.value || "80");
+  params.set("include_logic_candidates", "1");
   if (forceRefresh) params.set("refresh", "1");
   return params.toString();
 }
@@ -96,11 +98,32 @@ function visibleTypes() {
   return types;
 }
 
+function currentRelationMode() {
+  return eventGraphRelationMode?.value || "all";
+}
+
 function visibleGraph() {
   const types = visibleTypes();
   const nodes = (eventGraphData.nodes || []).filter((node) => types.has(node.type));
   const ids = new Set(nodes.map((node) => node.id));
-  const edges = (eventGraphData.edges || []).filter((edge) => ids.has(edge.source) && ids.has(edge.target));
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const mode = currentRelationMode();
+  const edges = (eventGraphData.edges || []).filter((edge) => {
+    if (!ids.has(edge.source) || !ids.has(edge.target)) return false;
+    const relationClass = String(edge.relation_class || "").toUpperCase();
+    if (mode === "logical") return relationClass === "LOGICAL";
+    if (mode === "reasoning") return ["IMPACT", "CAUSAL", "SCENARIO", "MARKET_MOVE"].includes(relationClass);
+    if (mode === "impact") return relationClass === "IMPACT";
+    if (mode === "causal") return relationClass === "CAUSAL";
+    if (mode === "scenario") return relationClass === "SCENARIO";
+    if (mode === "market_move") return relationClass === "MARKET_MOVE";
+    if (mode === "mapping") return relationClass === "MAPPING";
+    if (mode === "evidence") return relationClass === "EVIDENCE";
+    if (mode === "expression") {
+      return [nodeById.get(edge.source), nodeById.get(edge.target)].some((node) => node?.details?.signal_type === "GRAPH_EXPRESSION");
+    }
+    return true;
+  });
   return { nodes, edges };
 }
 
@@ -112,6 +135,27 @@ function stableHash(value) {
     hash = Math.imul(hash, 16777619);
   }
   return Math.abs(hash >>> 0);
+}
+
+function edgeClassStyle(edge = {}) {
+  const relationClass = String(edge.relation_class || "").toUpperCase();
+  const relationType = String(edge.relation_type || "").toUpperCase();
+  if (relationClass === "LOGICAL") {
+    return { width: 2.2, opacity: 0.68, color: "#d8b4fe" };
+  }
+  if (["IMPACT", "CAUSAL", "SCENARIO"].includes(relationClass)) {
+    return { width: 1.7, opacity: 0.52, color: "#fbbf24" };
+  }
+  if (relationClass === "MARKET_MOVE") {
+    return { width: 1.6, opacity: 0.5, color: "#38bdf8" };
+  }
+  if (relationClass === "EVIDENCE") {
+    return { width: 1.2, opacity: 0.36, color: "#86efac" };
+  }
+  if (relationClass === "MAPPING" || relationType === "DIRECTLY_PRICES") {
+    return { width: 1.8, opacity: 0.5, color: undefined };
+  }
+  return { width: 1, opacity: 0.22, color: undefined };
 }
 
 function buildStableNodePositions(nodes, edges) {
@@ -144,9 +188,26 @@ function buildStableNodePositions(nodes, edges) {
   const attached = new Map();
   const relationWeight = {
     DIRECTLY_PRICES: 5,
+    IMPLIES: 4,
+    DISJOINT: 4,
+    EQUAL: 4,
+    OVERLAP: 3,
     TRACKS: 4,
-    IMPACTS: 3,
-    RELATED_TO: 2,
+    POSITIVE_IMPACT: 3,
+    NEGATIVE_IMPACT: 3,
+    INCREASES_PROBABILITY: 3,
+    DECREASES_PROBABILITY: 3,
+    RISK_CHANNEL: 3,
+    CONTRIBUTES_TO: 3,
+    LEADS_TO: 3,
+    CONDITIONAL_ON: 3,
+    ASSUMES: 2,
+    SUPPORTED_BY: 2,
+    CONTRADICTED_BY: 2,
+    ODDS_MOVED_WITH: 2,
+    PRICE_MOVED_WITH: 2,
+    VOLUME_SPIKE_WITH: 2,
+    ASSOCIATED: 2,
   };
   edges.forEach((edge) => {
     const source = nodeById.get(edge.source);
@@ -214,6 +275,7 @@ function renderStats(summary = {}) {
     ["Markets", summary.markets ?? 0, "Polymarket markets scanned"],
     ["Finance", summary.finance_nodes ?? 0, "market and asset nodes"],
     ["Edges", summary.edges ?? 0, `max heat ${formatHeat(summary.max_heat)}`],
+    ["Logic", summary.logic_candidates ?? 0, `${summary.logical_edges ?? 0} candidate edges`],
   ];
   eventGraphStats.innerHTML = cards.map(([label, value, sub]) => `
     <article class="card event-graph-stat-card">
@@ -341,9 +403,10 @@ function renderChart() {
     target: edge.target,
     value: edge.confidence ?? 0.5,
     lineStyle: {
-      width: edge.relation_type === "DIRECTLY_PRICES" ? 1.8 : 1,
-      opacity: edge.relation_type === "DIRECTLY_PRICES" ? 0.5 : 0.22,
+      width: edgeClassStyle(edge).width,
+      opacity: edgeClassStyle(edge).opacity,
       curveness: 0.18,
+      color: edgeClassStyle(edge).color,
     },
     label: {
       show: false,
@@ -361,7 +424,7 @@ function renderChart() {
       formatter: (params) => {
         if (params.dataType === "edge") {
           const edge = params.data.raw || {};
-          return `<strong>${escapeHtml(edge.relation_type || "Edge")}</strong><br>${escapeHtml(edge.reason || "")}`;
+          return `<strong>${escapeHtml(edge.relation_type || "Edge")}</strong><br>${escapeHtml(edge.relation_class || "")} · ${escapeHtml(edge.verification_status || edge.source_type || "")}<br>${escapeHtml(edge.reason || "")}`;
         }
         const node = params.data.raw || {};
         return `<strong>${escapeHtml(node.label || "")}</strong><br>${escapeHtml(node.type || "")} · heat ${escapeHtml(formatHeat(node.heat))}`;
@@ -602,6 +665,37 @@ function renderMarkets(markets = []) {
   `;
 }
 
+function renderSemantic(semantic = {}) {
+  if (!semantic || typeof semantic !== "object") return "";
+  const fields = [
+    "subject",
+    "predicate",
+    "object",
+    "comparator",
+    "threshold",
+    "unit",
+    "time_window_start",
+    "time_window_end",
+    "jurisdiction",
+    "outcome_space_id",
+    "semantic_type",
+  ].filter((key) => semantic[key] !== undefined && semantic[key] !== null && semantic[key] !== "");
+  if (!fields.length) return "";
+  return `
+    <section class="event-detail-section">
+      <h3>Semantic</h3>
+      <div class="event-detail-metrics">
+        ${fields.map((key) => `
+          <div>
+            <span>${escapeHtml(key)}</span>
+            <strong>${escapeHtml(semantic[key])}</strong>
+          </div>
+        `).join("")}
+      </div>
+    </section>
+  `;
+}
+
 function renderDetails(node) {
   if (!eventGraphDetails) return;
   if (!node) {
@@ -654,6 +748,7 @@ function renderDetails(node) {
           <p>${escapeHtml(rules)}</p>
         </section>
       ` : ""}
+      ${renderSemantic(details.semantic)}
       ${renderMarkets(details.top_markets)}
       ${versionSection}
       <section class="event-detail-section">
@@ -666,7 +761,7 @@ function renderDetails(node) {
               <button class="event-detail-edge" type="button" data-node-id="${escapeHtml(otherId)}">
                 <span>${escapeHtml(edge.relation_type)}</span>
                 <strong>${escapeHtml(other?.label || otherId)}</strong>
-                <small>${escapeHtml(edge.strength || "")} · conf ${escapeHtml(edge.confidence ?? "-")}</small>
+                <small>${escapeHtml(edge.relation_class || "")} · ${escapeHtml(edge.verification_status || edge.source_type || "")} · conf ${escapeHtml(edge.confidence ?? "-")}</small>
               </button>
             `;
           }).join("") : statusHtml("暂无关系")}
@@ -755,6 +850,13 @@ eventGraphRefreshBtn?.addEventListener("click", () => {
       window.requestAnimationFrame(() => focusNodeInChart(selectedNodeId, { showTip: false }));
     }
   });
+});
+
+eventGraphRelationMode?.addEventListener("change", () => {
+  renderChart();
+  if (selectedNodeId && findNode(selectedNodeId)) {
+    window.requestAnimationFrame(() => focusNodeInChart(selectedNodeId, { showTip: false }));
+  }
 });
 
 eventGraphCategories?.addEventListener("click", (event) => {

@@ -7,6 +7,22 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from services.config_loader import load_web_settings
+from services.event_graph_logic import (
+    CAUSAL_RELATIONS,
+    EVIDENCE_RELATIONS,
+    IMPACT_RELATIONS,
+    LOGICAL_RELATIONS,
+    MAPPING_RELATIONS,
+    MARKET_MOVE_RELATIONS,
+    REASONING_RELATION_CLASSES,
+    SCENARIO_RELATIONS,
+    infer_relation_class,
+    relation_class_is_known,
+    relation_type_is_valid,
+    validate_expression_shape,
+    validate_logical_conflicts,
+    validate_reasoning_edges,
+)
 from services.event_graph_service import build_event_graph
 from services.event_news_service import (
     apply_change_request,
@@ -24,6 +40,16 @@ from services.event_news_service import (
     list_observations as list_news_observations,
     refresh_news,
     review_change_request,
+)
+from services.history_data_service import (
+    create_backtest_batch as history_create_backtest_batch,
+    create_backtest_case as history_create_backtest_case,
+    create_backtest_run as history_create_backtest_run,
+    get_backtest_batch as history_get_backtest_batch,
+    get_backtest_run as history_get_backtest_run,
+    list_backtest_batches as history_list_backtest_batches,
+    list_backtest_cases as history_list_backtest_cases,
+    list_backtest_runs as history_list_backtest_runs,
 )
 from services.polymarket_service import (
     fetch_strategy_detail,
@@ -122,6 +148,23 @@ STRATEGY_OBSERVATION_CAPABILITIES: Dict[str, Any] = {
     ],
 }
 
+BACKTEST_CAPABILITIES: Dict[str, Any] = {
+    "cases_endpoint": "/api/agent/backtests/cases",
+    "runs_endpoint": "/api/agent/backtests/runs",
+    "run_detail_endpoint": "/api/agent/backtests/runs/{run_id}",
+    "batch_create_endpoint": "/api/agent/backtests/batches",
+    "batch_detail_endpoint": "/api/agent/backtests/batches/{batch_id}",
+    "read_capability": "backtest.read",
+    "case_create_capability": "backtest.case.create",
+    "run_create_capability": "backtest.run.create",
+    "batch_create_capability": "backtest.batch.create",
+    "notes": [
+        "Backtest APIs create local historical replay runs only; they do not approve or execute live orders.",
+        "Batch requests select existing history cases by case_ids, collection_name, or strategy_id.",
+        "Mixed Binance/Polymarket source replay is reported as planned rather than executed.",
+    ],
+}
+
 EVENT_GRAPH_CAPABILITIES: Dict[str, Any] = {
     "graph_endpoint": "/api/agent/event-graph",
     "events_endpoint": "/api/agent/event-graph/events",
@@ -136,10 +179,20 @@ EVENT_GRAPH_CAPABILITIES: Dict[str, Any] = {
     "search_capability": "event.news.search",
     "patch_validate_capability": "event.graph.patch.validate",
     "change_request_capability": "event.graph.change_request",
+    "approval_modes": ["manual", "trusted_low_risk", "trusted_all"],
+    "relation_classes": {
+        "LOGICAL": sorted(LOGICAL_RELATIONS),
+        "IMPACT": sorted(IMPACT_RELATIONS),
+        "CAUSAL": sorted(CAUSAL_RELATIONS),
+        "SCENARIO": sorted(SCENARIO_RELATIONS),
+        "EVIDENCE": sorted(EVIDENCE_RELATIONS),
+        "MAPPING": sorted(MAPPING_RELATIONS),
+        "MARKET_MOVE": sorted(MARKET_MOVE_RELATIONS),
+    },
     "notes": [
         "EventGraph news data is stored as observations first, then grouped into derived events.",
         "News refresh/search writes observations and derived event records, but does not approve final human-verified facts.",
-        "External agents should submit EventGraph mutations as validated change requests; direct Graph Core writes are not exposed.",
+        "External agents submit EventGraph mutations as validated change requests; Settings may allow trusted system auto-apply.",
     ],
 }
 
@@ -184,6 +237,10 @@ DEFAULT_POLICY: Dict[str, Any] = {
         "risk.check",
         "strategy.simulate",
         "strategy.submit",
+        "backtest.read",
+        "backtest.case.create",
+        "backtest.run.create",
+        "backtest.batch.create",
         "approval.status",
         "order.read",
         "pnl.read",
@@ -212,6 +269,13 @@ DEFAULT_POLICY: Dict[str, Any] = {
         "require_human_approval": True,
         "approval_expires_minutes": 1440,
     },
+    "event_graph_approval": {
+        "mode": "manual",
+        "auto_apply_actor_id": "event_graph_trusted_rule",
+        "max_items_per_request": 100,
+        "min_confidence": 0.0,
+        "require_evidence_summary": False,
+    },
 }
 
 PERMISSION_CAPABILITIES: Dict[str, List[str]] = {
@@ -230,6 +294,10 @@ PERMISSION_CAPABILITIES: Dict[str, List[str]] = {
     "risk_check": ["risk.check"],
     "strategy_simulate": ["strategy.simulate"],
     "strategy_submit": ["strategy.submit"],
+    "backtest_read": ["backtest.read"],
+    "backtest_case_create": ["backtest.case.create"],
+    "backtest_run_create": ["backtest.run.create"],
+    "backtest_batch_create": ["backtest.batch.create"],
     "order_read": ["order.read"],
     "pnl_read": ["pnl.read"],
     "audit_read": ["audit.read"],
@@ -500,6 +568,10 @@ def _policy() -> Dict[str, Any]:
     if isinstance(limits, dict):
         policy["limits"].update(limits)
 
+    event_graph_approval = settings_policy.get("event_graph_approval")
+    if isinstance(event_graph_approval, dict):
+        policy["event_graph_approval"].update(event_graph_approval)
+
     permissions = settings_policy.get("permissions")
     if not isinstance(permissions, dict):
         permissions = {}
@@ -523,6 +595,23 @@ def _limits() -> Dict[str, Any]:
 def _agent_defaults() -> Dict[str, Any]:
     defaults = _policy().get("defaults", {})
     return defaults if isinstance(defaults, dict) else {}
+
+
+def _event_graph_approval_policy() -> Dict[str, Any]:
+    defaults = DEFAULT_POLICY.get("event_graph_approval", {})
+    policy = _policy().get("event_graph_approval", {})
+    if not isinstance(policy, dict):
+        policy = {}
+    merged = {**defaults, **policy}
+    mode = str(merged.get("mode") or "manual").strip().lower()
+    if mode not in {"manual", "trusted_low_risk", "trusted_all"}:
+        mode = "manual"
+    merged["mode"] = mode
+    merged["auto_apply_actor_id"] = str(merged.get("auto_apply_actor_id") or "event_graph_trusted_rule").strip() or "event_graph_trusted_rule"
+    merged["max_items_per_request"] = max(1, min(_safe_int(merged.get("max_items_per_request"), 100), 1000))
+    merged["min_confidence"] = max(0.0, min(_safe_float(merged.get("min_confidence"), 0.0), 1.0))
+    merged["require_evidence_summary"] = bool(merged.get("require_evidence_summary"))
+    return merged
 
 
 def _require_agent_capability(capability: str, actor_type: str = "agent") -> None:
@@ -1104,7 +1193,10 @@ def get_capabilities() -> Dict[str, Any]:
         query_capabilities["default_sorts"] = list(defaults["scan_sorts"])
     policy["market_query_capabilities"] = query_capabilities
     policy["strategy_observation_capabilities"] = STRATEGY_OBSERVATION_CAPABILITIES
-    policy["event_graph_capabilities"] = EVENT_GRAPH_CAPABILITIES
+    policy["backtest_capabilities"] = BACKTEST_CAPABILITIES
+    event_graph_capabilities = json.loads(json.dumps(EVENT_GRAPH_CAPABILITIES, ensure_ascii=False))
+    event_graph_capabilities["approval_policy"] = _event_graph_approval_policy()
+    policy["event_graph_capabilities"] = event_graph_capabilities
     return policy
 
 
@@ -1539,6 +1631,130 @@ def agent_get_strategy_state(strategy_id: int, payload: Optional[Dict[str, Any]]
     return result
 
 
+def agent_list_backtest_cases(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload, actor_type, actor_id, limit = _agent_read_payload(payload, default_limit=100, max_limit=500)
+    _require_agent_capability("backtest.read", actor_type)
+    data = history_list_backtest_cases()[:limit]
+    result = {
+        "actor": {"type": actor_type, "id": actor_id},
+        "read_only": True,
+        "data": data,
+    }
+    _audit_request(actor_type=actor_type, actor_id=actor_id, capability="backtest.read", target_type="backtest_case", input_data=payload, output_data={"count": len(data)})
+    return result
+
+
+def agent_create_backtest_case(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = payload or {}
+    actor_type, actor_id = _actor(payload)
+    _require_agent_capability("backtest.case.create", actor_type)
+    case = history_create_backtest_case(payload)
+    result = {
+        "actor": {"type": actor_type, "id": actor_id},
+        "read_only": False,
+        "data": case,
+    }
+    _audit_request(actor_type=actor_type, actor_id=actor_id, capability="backtest.case.create", target_type="backtest_case", target_id=str(case.get("case_id") or ""), input_data=payload, output_data=case)
+    return result
+
+
+def agent_list_backtest_runs(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload, actor_type, actor_id, limit = _agent_read_payload(payload, default_limit=100, max_limit=500)
+    _require_agent_capability("backtest.read", actor_type)
+    case_id = _safe_int(payload.get("case_id"), 0) or None
+    batch_id = str(payload.get("batch_id") or "").strip()
+    runs = history_list_backtest_runs(case_id=case_id, batch_id=batch_id)[:limit]
+    data = _maybe_strip_pnl(runs, actor_type)
+    result = {
+        "actor": {"type": actor_type, "id": actor_id},
+        "read_only": True,
+        "data": data,
+    }
+    _audit_request(actor_type=actor_type, actor_id=actor_id, capability="backtest.read", target_type="backtest_run", input_data=payload, output_data={"count": len(runs)})
+    return result
+
+
+def agent_create_backtest_run(case_id: int, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = payload or {}
+    actor_type, actor_id = _actor(payload)
+    _require_agent_capability("backtest.run.create", actor_type)
+    run = history_create_backtest_run(int(case_id), payload)
+    data = _maybe_strip_pnl(run, actor_type)
+    result = {
+        "actor": {"type": actor_type, "id": actor_id},
+        "read_only": False,
+        "data": data,
+    }
+    _audit_request(actor_type=actor_type, actor_id=actor_id, capability="backtest.run.create", target_type="backtest_run", target_id=str(run.get("run_id") or ""), input_data=payload, output_data={"run_id": run.get("run_id"), "status": run.get("status"), "batch_id": run.get("batch_id")})
+    return result
+
+
+def agent_get_backtest_run(run_id: int, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = payload or {}
+    actor_type, actor_id = _actor(payload)
+    _require_agent_capability("backtest.read", actor_type)
+    equity_limit = max(0, min(_safe_int(payload.get("equity_limit"), 1000), 10000))
+    orders_limit = max(0, min(_safe_int(payload.get("orders_limit"), 1000), 10000))
+    events_limit = max(0, min(_safe_int(payload.get("events_limit"), 300), 2000))
+    run = history_get_backtest_run(int(run_id), equity_limit=equity_limit, orders_limit=orders_limit, events_limit=events_limit)
+    if not run:
+        raise ValueError("backtest run not found")
+    data = _maybe_strip_pnl(run, actor_type)
+    result = {
+        "actor": {"type": actor_type, "id": actor_id},
+        "read_only": True,
+        "data": data,
+    }
+    _audit_request(actor_type=actor_type, actor_id=actor_id, capability="backtest.read", target_type="backtest_run", target_id=str(run_id), input_data=payload, output_data={"run_id": run_id, "status": run.get("status")})
+    return result
+
+
+def agent_list_backtest_batches(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload, actor_type, actor_id, limit = _agent_read_payload(payload, default_limit=50, max_limit=200)
+    _require_agent_capability("backtest.read", actor_type)
+    data = _maybe_strip_pnl(history_list_backtest_batches(limit=limit), actor_type)
+    result = {
+        "actor": {"type": actor_type, "id": actor_id},
+        "read_only": True,
+        "data": data,
+    }
+    _audit_request(actor_type=actor_type, actor_id=actor_id, capability="backtest.read", target_type="backtest_batch", input_data=payload, output_data={"count": len(data)})
+    return result
+
+
+def agent_create_backtest_batch(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = payload or {}
+    actor_type, actor_id = _actor(payload)
+    _require_agent_capability("backtest.batch.create", actor_type)
+    batch = history_create_backtest_batch(payload)
+    data = _maybe_strip_pnl(batch, actor_type)
+    result = {
+        "actor": {"type": actor_type, "id": actor_id},
+        "read_only": False,
+        "data": data,
+    }
+    _audit_request(actor_type=actor_type, actor_id=actor_id, capability="backtest.batch.create", target_type="backtest_batch", target_id=str(batch.get("batch_id") or ""), input_data=payload, output_data={"batch_id": batch.get("batch_id"), "case_count": batch.get("case_count"), "run_mode": batch.get("run_mode")})
+    return result
+
+
+def agent_get_backtest_batch(batch_id: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = payload or {}
+    actor_type, actor_id = _actor(payload)
+    _require_agent_capability("backtest.read", actor_type)
+    include_runs = _truthy(payload.get("include_runs"), True)
+    batch = history_get_backtest_batch(batch_id, include_runs=include_runs)
+    if not batch:
+        raise ValueError("backtest batch not found")
+    data = _maybe_strip_pnl(batch, actor_type)
+    result = {
+        "actor": {"type": actor_type, "id": actor_id},
+        "read_only": True,
+        "data": data,
+    }
+    _audit_request(actor_type=actor_type, actor_id=actor_id, capability="backtest.read", target_type="backtest_batch", target_id=str(batch_id), input_data=payload, output_data={"batch_id": batch_id, "run_count": (batch.get("summary") or {}).get("run_count")})
+    return result
+
+
 def agent_get_event_graph(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     payload = payload or {}
     actor_type, actor_id = _actor(payload)
@@ -1648,9 +1864,14 @@ def agent_search_event_news(payload: Optional[Dict[str, Any]] = None) -> Dict[st
     return result
 
 
-_LOGICAL_RELATIONS = {"EQUAL", "IMPLIES", "DISJOINT", "OVERLAP"}
-_IMPACT_RELATIONS = {"POSITIVE_IMPACT", "NEGATIVE_IMPACT", "ASSOCIATED"}
-_MAPPING_RELATIONS = {"DIRECTLY_PRICES", "TRACKS", "HEDGES", "EXPOSED_TO"}
+_LOGICAL_RELATIONS = LOGICAL_RELATIONS
+_IMPACT_RELATIONS = IMPACT_RELATIONS
+_CAUSAL_RELATIONS = CAUSAL_RELATIONS
+_SCENARIO_RELATIONS = SCENARIO_RELATIONS
+_EVIDENCE_RELATIONS = EVIDENCE_RELATIONS
+_MAPPING_RELATIONS = MAPPING_RELATIONS
+_MARKET_MOVE_RELATIONS = MARKET_MOVE_RELATIONS
+_REASONING_RELATION_CLASSES = REASONING_RELATION_CLASSES
 _LOW_RISK_ACTIONS = {
     "alias_create",
     "alias_update",
@@ -1674,6 +1895,22 @@ _HIGH_RISK_ACTIONS = {
     "expression_archive",
     "archive",
     "merge",
+}
+_EVENT_GRAPH_APPLY_ACTIONS = {
+    "event_create",
+    "event_update",
+    "event_archive",
+    "event_merge",
+    "finance_create",
+    "finance_update",
+    "finance_archive",
+    "edge_create",
+    "edge_update",
+    "edge_delete",
+    "finance_mapping_create",
+    "expression_create",
+    "expression_update",
+    "expression_archive",
 }
 
 
@@ -1767,12 +2004,14 @@ def _validate_event_graph_patch_payload(payload: Dict[str, Any]) -> Dict[str, An
 
         relation_class = str(item.get("relation_class") or "").strip().upper()
         relation_type = str(item.get("relation_type") or "").strip().upper()
+        if not relation_class and relation_type:
+            relation_class = infer_relation_class(relation_type)
         if relation_class:
             item["relation_class"] = relation_class
         if relation_type:
             item["relation_type"] = relation_type
 
-        if action_key in _HIGH_RISK_ACTIONS or relation_class in {"IMPACT", "MAPPING"} or relation_type in _MAPPING_RELATIONS:
+        if action_key in _HIGH_RISK_ACTIONS or relation_class in {"IMPACT", "MAPPING", "CAUSAL", "SCENARIO", "MARKET_MOVE"} or relation_type in _MAPPING_RELATIONS:
             risk_level = _highest_risk(risk_level, "high")
         elif action_key not in _LOW_RISK_ACTIONS:
             risk_level = _highest_risk(risk_level, "medium")
@@ -1799,6 +2038,19 @@ def _validate_event_graph_patch_payload(payload: Dict[str, Any]) -> Dict[str, An
             warnings.append({"code": "FINANCE_ID_RECOMMENDED", "index": index, "message": "finance create should include finance_id, label, or symbol"})
         if action_key == "expression_create" and not any(item.get(key) for key in ("expression", "formula", "condition")):
             errors.append({"code": "EXPRESSION_REQUIRED", "index": index, "message": "expression create requires expression, formula, or condition"})
+        if action_key in {"expression_create", "expression_update"}:
+            expression = item.get("expression") if isinstance(item.get("expression"), dict) else {}
+            if expression:
+                operator = str(expression.get("operator") or "").strip().upper()
+                if operator:
+                    expression = dict(expression)
+                    expression["operator"] = operator
+                    item["expression"] = expression
+                expression_errors, expression_warnings = validate_expression_shape(expression)
+                for error in expression_errors:
+                    errors.append({"index": index, **error})
+                for warning in expression_warnings:
+                    warnings.append({"index": index, **warning})
         if action_key in {"expression_update", "expression_archive"} and not str(item.get("expression_id") or "").strip():
             errors.append({"code": "EXPRESSION_ID_REQUIRED", "index": index, "message": "expression update/archive requires expression_id"})
 
@@ -1811,16 +2063,19 @@ def _validate_event_graph_patch_payload(payload: Dict[str, Any]) -> Dict[str, An
                 errors.append({"code": "EDGE_TARGET_REQUIRED", "index": index, "message": "edge item requires target_id"})
             if requires_edge_endpoints and not relation_type:
                 errors.append({"code": "RELATION_TYPE_REQUIRED", "index": index, "message": "edge item requires relation_type"})
-            if relation_class == "LOGICAL" and relation_type and relation_type not in _LOGICAL_RELATIONS:
-                errors.append({"code": "INVALID_LOGICAL_RELATION", "index": index, "relation_type": relation_type})
-            if relation_class == "IMPACT" and relation_type and relation_type not in _IMPACT_RELATIONS:
-                errors.append({"code": "INVALID_IMPACT_RELATION", "index": index, "relation_type": relation_type})
-            if relation_class == "MAPPING" and relation_type and relation_type not in _MAPPING_RELATIONS:
-                errors.append({"code": "INVALID_MAPPING_RELATION", "index": index, "relation_type": relation_type})
-            if relation_class in {"IMPACT", "MAPPING"} and not str(item.get("mechanism") or "").strip():
-                warnings.append({"code": "MECHANISM_RECOMMENDED", "index": index, "message": "impact/mapping edges should include mechanism"})
-            if relation_class in {"IMPACT", "MAPPING"} and not item.get("evidence_refs") and not payload.get("evidence_summary"):
-                warnings.append({"code": "EVIDENCE_RECOMMENDED", "index": index, "message": "impact/mapping edges should include evidence_refs or evidence_summary"})
+            if relation_class and not relation_class_is_known(relation_class):
+                errors.append({"code": "INVALID_RELATION_CLASS", "index": index, "relation_class": relation_class})
+            if relation_class and relation_type and not relation_type_is_valid(relation_class, relation_type):
+                errors.append({
+                    "code": f"INVALID_{relation_class}_RELATION",
+                    "index": index,
+                    "relation_class": relation_class,
+                    "relation_type": relation_type,
+                })
+            if relation_class in {"IMPACT", "MAPPING", "CAUSAL", "SCENARIO", "MARKET_MOVE"} and not str(item.get("mechanism") or item.get("reason") or "").strip():
+                warnings.append({"code": "MECHANISM_RECOMMENDED", "index": index, "message": "non-logical edges should include mechanism or reason"})
+            if relation_class in {"IMPACT", "MAPPING", "CAUSAL", "SCENARIO", "MARKET_MOVE"} and not item.get("evidence_refs") and not payload.get("evidence_summary") and not item.get("evidence_summary"):
+                warnings.append({"code": "EVIDENCE_RECOMMENDED", "index": index, "message": "non-logical edges should include evidence_refs or evidence_summary"})
 
         if item.get("confidence") not in (None, ""):
             confidence = _safe_float(item.get("confidence"), -1.0)
@@ -1830,6 +2085,13 @@ def _validate_event_graph_patch_payload(payload: Dict[str, Any]) -> Dict[str, An
                 item["confidence"] = round(confidence, 4)
 
         normalized_items.append(item)
+
+    conflict_errors, conflict_warnings = validate_logical_conflicts(normalized_items)
+    errors.extend(conflict_errors)
+    warnings.extend(conflict_warnings)
+    reasoning_errors, reasoning_warnings = validate_reasoning_edges(normalized_items, payload=payload)
+    errors.extend(reasoning_errors)
+    warnings.extend(reasoning_warnings)
 
     normalized_patch = dict(patch)
     normalized_patch["items"] = normalized_items
@@ -1845,11 +2107,174 @@ def _validate_event_graph_patch_payload(payload: Dict[str, Any]) -> Dict[str, An
     }
 
 
+def _event_graph_item_has_evidence(item: Dict[str, Any]) -> bool:
+    if item.get("evidence_summary") or item.get("reason") or item.get("source_url"):
+        return True
+    refs = item.get("evidence_refs")
+    return isinstance(refs, list) and bool(refs)
+
+
+def _event_graph_auto_apply_decision(validation: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = payload or {}
+    policy = _event_graph_approval_policy()
+    mode = str(policy.get("mode") or "manual")
+    decision: Dict[str, Any] = {
+        "mode": mode,
+        "enabled": False,
+        "reason": "manual approval mode",
+        "actor_type": "system",
+        "actor_id": policy.get("auto_apply_actor_id") or "event_graph_trusted_rule",
+        "policy": policy,
+    }
+    if mode == "manual":
+        return decision
+    if not validation.get("valid"):
+        decision["reason"] = "patch validation failed"
+        return decision
+    risk_level = str(validation.get("risk_level") or "medium").strip().lower()
+    if mode == "trusted_low_risk" and risk_level != "low":
+        decision["reason"] = f"risk level {risk_level} requires human review"
+        return decision
+
+    patch = validation.get("normalized_patch") if isinstance(validation.get("normalized_patch"), dict) else {}
+    items = patch.get("items") if isinstance(patch.get("items"), list) else []
+    max_items = int(policy.get("max_items_per_request") or 100)
+    if not items:
+        decision["reason"] = "patch has no items"
+        return decision
+    if len(items) > max_items:
+        decision["reason"] = f"patch has {len(items)} items, above auto limit {max_items}"
+        return decision
+
+    unsupported = sorted({
+        str(item.get("action") or "").strip().lower()
+        for item in items
+        if isinstance(item, dict) and str(item.get("action") or "").strip().lower() not in _EVENT_GRAPH_APPLY_ACTIONS
+    })
+    if unsupported:
+        decision["reason"] = "unsupported auto-apply action(s): " + ", ".join(unsupported)
+        return decision
+
+    logic_sensitive = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        action = str(item.get("action") or "").strip().lower()
+        relation_class = str(item.get("relation_class") or "").strip().upper()
+        relation_type = str(item.get("relation_type") or "").strip().upper()
+        if action.startswith("expression_"):
+            logic_sensitive.append(action)
+        if relation_class == "LOGICAL" or relation_type in _LOGICAL_RELATIONS:
+            logic_sensitive.append(relation_type or "LOGICAL")
+    if logic_sensitive:
+        decision["reason"] = "logic relations and expressions require manual review in this release"
+        decision["logic_sensitive_items"] = sorted(set(logic_sensitive))
+        return decision
+
+    min_confidence = float(policy.get("min_confidence") or 0.0)
+    if min_confidence > 0:
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            if "confidence" not in item or _safe_float(item.get("confidence"), -1.0) < min_confidence:
+                decision["reason"] = f"item {index} confidence below {min_confidence}"
+                return decision
+
+    evidence = str(payload.get("evidence_summary") or payload.get("rationale") or payload.get("reason") or "").strip()
+    if policy.get("require_evidence_summary") and not evidence and not any(
+        isinstance(item, dict) and _event_graph_item_has_evidence(item)
+        for item in items
+    ):
+        decision["reason"] = "evidence summary is required by EventGraph approval settings"
+        return decision
+
+    decision["enabled"] = True
+    decision["reason"] = f"auto-apply allowed by EventGraph approval mode {mode}"
+    decision["risk_level"] = risk_level
+    return decision
+
+
+def _apply_event_graph_approval_policy(validation: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    result = dict(validation or {})
+    base_requires_review = bool(result.get("requires_human_review"))
+    decision = _event_graph_auto_apply_decision(result, payload)
+    result["base_requires_human_review"] = base_requires_review
+    result["requires_human_review"] = not bool(decision.get("enabled"))
+    result["auto_apply_decision"] = decision
+    return result
+
+
+def _maybe_auto_apply_event_graph_change_request(
+    result: Dict[str, Any],
+    *,
+    validation: Dict[str, Any],
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    decision = validation.get("auto_apply_decision") if isinstance(validation.get("auto_apply_decision"), dict) else _event_graph_auto_apply_decision(validation, payload)
+    request_id = str(result.get("request_id") or "").strip()
+    if not request_id or not decision.get("enabled"):
+        result["auto_apply"] = decision
+        return result
+
+    actor_type = str(decision.get("actor_type") or "system")
+    actor_id = str(decision.get("actor_id") or "event_graph_trusted_rule")
+    review_note = f"Auto-approved by EventGraph approval mode {decision.get('mode')}"
+    try:
+        reviewed = review_change_request(
+            request_id,
+            decision="approve",
+            reviewer_type=actor_type,
+            reviewer_id=actor_id,
+            note=review_note,
+        )
+        _audit_request(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            capability="event.graph.review.auto_approve",
+            target_type="event_graph_change_request",
+            target_id=request_id,
+            input_data={"request_id": request_id, "decision": decision},
+            output_data={"request_id": request_id, "status": reviewed.get("status")},
+            policy_decision="auto_allow",
+            risk_decision="pass",
+        )
+        applied = apply_change_request(request_id, actor_type=actor_type, actor_id=actor_id)
+        _audit_request(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            capability="event.graph.apply.auto",
+            target_type="event_graph_change_request",
+            target_id=request_id,
+            input_data={"request_id": request_id, "decision": decision},
+            output_data=applied,
+            policy_decision="auto_allow",
+            risk_decision="pass",
+        )
+        final = get_change_request(request_id)
+        final["auto_apply"] = {**decision, "reviewed_status": reviewed.get("status"), "apply_result": applied}
+        return final
+    except Exception as exc:
+        final = get_change_request(request_id)
+        final["auto_apply"] = {**decision, "error": str(exc)}
+        _audit_request(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            capability="event.graph.apply.auto",
+            target_type="event_graph_change_request",
+            target_id=request_id,
+            input_data={"request_id": request_id, "decision": decision},
+            output_data={"error": str(exc), "status": final.get("status")},
+            policy_decision="auto_allow",
+            risk_decision="blocked",
+        )
+        return final
+
+
 def agent_validate_event_graph_patch(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     payload = payload or {}
     actor_type, actor_id = _actor(payload)
     _require_agent_capability("event.graph.patch.validate", actor_type)
-    result = _validate_event_graph_patch_payload(payload)
+    result = _apply_event_graph_approval_policy(_validate_event_graph_patch_payload(payload), payload)
     _audit_request(
         actor_type=actor_type,
         actor_id=actor_id,
@@ -1869,7 +2294,7 @@ def agent_submit_change_request(payload: Optional[Dict[str, Any]] = None) -> Dic
     change_type = str(payload.get("change_type") or payload.get("action") or "").strip()
     if not change_type:
         raise ValueError("change_type is required")
-    validation = _validate_event_graph_patch_payload(payload)
+    validation = _apply_event_graph_approval_policy(_validate_event_graph_patch_payload(payload), payload)
     proposed = payload.get("proposed_changes") or {}
     patch = validation.get("normalized_patch") if isinstance(validation.get("normalized_patch"), dict) else {}
     evidence = str(payload.get("evidence_summary") or payload.get("rationale") or payload.get("reason") or "").strip()
@@ -1906,7 +2331,7 @@ def agent_submit_change_request(payload: Optional[Dict[str, Any]] = None) -> Dic
         output_data=_compact_audit_value(result),
         risk_decision="blocked" if not validation.get("valid") else ("review_required" if validation.get("requires_human_review") else "not_required"),
     )
-    return result
+    return _maybe_auto_apply_event_graph_change_request(result, validation=validation, payload=payload)
 
 
 def agent_list_change_requests(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

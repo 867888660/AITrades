@@ -17,6 +17,12 @@ from urllib.parse import quote_plus
 from xml.etree import ElementTree
 
 from services.config_loader import BASE_DIR
+from services.event_graph_logic import (
+    STRUCTURED_EVENT_FIELDS,
+    derived_edges_from_expression,
+    infer_relation_class,
+    normalize_event_semantic,
+)
 from services.http_client import SESSION
 
 
@@ -226,6 +232,52 @@ CREATE TABLE IF NOT EXISTS graph_event_versions (
 
 CREATE INDEX IF NOT EXISTS idx_graph_event_versions_event
 ON graph_event_versions(event_id, version_number DESC);
+
+CREATE TABLE IF NOT EXISTS graph_event_semantics (
+    event_id            TEXT PRIMARY KEY,
+    subject             TEXT NOT NULL DEFAULT '',
+    predicate           TEXT NOT NULL DEFAULT '',
+    object              TEXT NOT NULL DEFAULT '',
+    comparator          TEXT NOT NULL DEFAULT '',
+    threshold           REAL,
+    unit                TEXT NOT NULL DEFAULT '',
+    time_window_start   TEXT NOT NULL DEFAULT '',
+    time_window_end     TEXT NOT NULL DEFAULT '',
+    jurisdiction        TEXT NOT NULL DEFAULT '',
+    resolution_rule     TEXT NOT NULL DEFAULT '',
+    resolution_source   TEXT NOT NULL DEFAULT '',
+    outcome_space_id    TEXT NOT NULL DEFAULT '',
+    semantic_type       TEXT NOT NULL DEFAULT '',
+    confidence          REAL,
+    source              TEXT NOT NULL DEFAULT '',
+    current_version     INTEGER NOT NULL DEFAULT 1,
+    payload_json        TEXT NOT NULL DEFAULT '{}',
+    created_at_utc      TEXT NOT NULL,
+    updated_at_utc      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_graph_event_semantics_family
+ON graph_event_semantics(subject, predicate, unit, time_window_start, time_window_end);
+
+CREATE INDEX IF NOT EXISTS idx_graph_event_semantics_outcome
+ON graph_event_semantics(outcome_space_id);
+
+CREATE TABLE IF NOT EXISTS graph_event_semantic_versions (
+    version_id          TEXT PRIMARY KEY,
+    event_id            TEXT NOT NULL,
+    version_number      INTEGER NOT NULL,
+    request_id          TEXT NOT NULL DEFAULT '',
+    run_id              TEXT NOT NULL DEFAULT '',
+    actor_type          TEXT NOT NULL DEFAULT '',
+    actor_id            TEXT NOT NULL DEFAULT '',
+    before_json         TEXT NOT NULL DEFAULT '{}',
+    after_json          TEXT NOT NULL DEFAULT '{}',
+    patch_item_json     TEXT NOT NULL DEFAULT '{}',
+    created_at_utc      TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_graph_event_semantic_versions_event
+ON graph_event_semantic_versions(event_id, version_number DESC);
 
 CREATE TABLE IF NOT EXISTS graph_finance_nodes (
     finance_id          TEXT PRIMARY KEY,
@@ -1038,6 +1090,171 @@ def _graph_event_from_row(row: sqlite3.Row | None) -> Dict[str, Any]:
     return item
 
 
+def _graph_event_semantic_from_row(row: sqlite3.Row | None) -> Dict[str, Any]:
+    if not row:
+        return {}
+    item = dict(row)
+    item["payload"] = _parse_json(item.pop("payload_json", "{}"), {})
+    return normalize_event_semantic(item, fallback=item.get("payload") if isinstance(item.get("payload"), dict) else {})
+
+
+def _event_semantic_raw_from_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    raw = item.get("semantic") if isinstance(item.get("semantic"), dict) else item.get("semantics")
+    if not isinstance(raw, dict):
+        raw = {}
+    direct = {field: item.get(field) for field in STRUCTURED_EVENT_FIELDS if item.get(field) not in (None, "")}
+    if item.get("semantic_type") not in (None, ""):
+        direct["semantic_type"] = item.get("semantic_type")
+    if item.get("semantic_confidence") not in (None, ""):
+        direct["confidence"] = item.get("semantic_confidence")
+    if item.get("semantic_source") not in (None, ""):
+        direct["source"] = item.get("semantic_source")
+    return {**raw, **direct}
+
+
+def _event_semantic_from_item(item: Dict[str, Any], *, existing: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    existing = dict(existing or {})
+    raw = _event_semantic_raw_from_item(item)
+    if raw:
+        return normalize_event_semantic(raw, fallback=existing)
+    if existing:
+        return normalize_event_semantic(existing)
+    return {}
+
+
+def _load_event_semantics(conn: sqlite3.Connection, event_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+    ids = [str(event_id or "").strip() for event_id in event_ids if str(event_id or "").strip()]
+    if not ids:
+        return {}
+    result: Dict[str, Dict[str, Any]] = {}
+    for start in range(0, len(ids), 200):
+        chunk = ids[start:start + 200]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT * FROM graph_event_semantics WHERE event_id IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        for row in rows:
+            item = _graph_event_semantic_from_row(row)
+            result[str(row["event_id"])] = item
+    return result
+
+
+def _write_graph_event_semantic_version(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    version_number: int,
+    request: Dict[str, Any],
+    actor_type: str,
+    actor_id: str,
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+    patch_item: Dict[str, Any],
+    now: str,
+) -> None:
+    conn.execute(
+        """INSERT INTO graph_event_semantic_versions(
+            version_id, event_id, version_number, request_id, run_id, actor_type, actor_id,
+            before_json, after_json, patch_item_json, created_at_utc
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            _new_id("gesv"),
+            event_id,
+            int(version_number),
+            request.get("request_id") or "",
+            request.get("run_id") or "",
+            actor_type,
+            actor_id,
+            _json_text(before),
+            _json_text(after),
+            _json_text(patch_item),
+            now,
+        ),
+    )
+
+
+def _upsert_graph_event_semantic(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    semantic: Dict[str, Any],
+    request: Dict[str, Any],
+    actor_type: str,
+    actor_id: str,
+    patch_item: Dict[str, Any],
+    now: str,
+) -> Dict[str, Any]:
+    semantic = normalize_event_semantic(semantic)
+    if not semantic or not any(str(semantic.get(field) or "").strip() for field in ("subject", "predicate", "outcome_space_id", "resolution_rule")):
+        return {}
+    existing_row = conn.execute("SELECT * FROM graph_event_semantics WHERE event_id = ?", (event_id,)).fetchone()
+    existing = _graph_event_semantic_from_row(existing_row)
+    version_number = int(existing.get("current_version") or 0) + 1 if existing else 1
+    payload = {
+        "family_key": semantic.get("family_key") or "",
+        "comparison_interval": semantic.get("comparison_interval") or {},
+        "structured": bool(semantic.get("structured")),
+    }
+    values = (
+        event_id,
+        str(semantic.get("subject") or ""),
+        str(semantic.get("predicate") or ""),
+        str(semantic.get("object") or ""),
+        str(semantic.get("comparator") or ""),
+        semantic.get("threshold") if semantic.get("threshold") not in ("", None) else None,
+        str(semantic.get("unit") or ""),
+        str(semantic.get("time_window_start") or ""),
+        str(semantic.get("time_window_end") or ""),
+        str(semantic.get("jurisdiction") or ""),
+        str(semantic.get("resolution_rule") or ""),
+        str(semantic.get("resolution_source") or ""),
+        str(semantic.get("outcome_space_id") or ""),
+        str(semantic.get("semantic_type") or ""),
+        semantic.get("confidence") if semantic.get("confidence") not in ("", None) else None,
+        str(semantic.get("source") or ""),
+        version_number,
+        _json_text(payload),
+        now,
+        now,
+    )
+    if existing:
+        conn.execute(
+            """UPDATE graph_event_semantics
+               SET subject = ?, predicate = ?, object = ?, comparator = ?, threshold = ?,
+                   unit = ?, time_window_start = ?, time_window_end = ?, jurisdiction = ?,
+                   resolution_rule = ?, resolution_source = ?, outcome_space_id = ?,
+                   semantic_type = ?, confidence = ?, source = ?, current_version = ?,
+                   payload_json = ?, updated_at_utc = ?
+               WHERE event_id = ?""",
+            (*values[1:18], values[19], event_id),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO graph_event_semantics(
+                event_id, subject, predicate, object, comparator, threshold, unit,
+                time_window_start, time_window_end, jurisdiction, resolution_rule,
+                resolution_source, outcome_space_id, semantic_type, confidence, source,
+                current_version, payload_json, created_at_utc, updated_at_utc
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            values,
+        )
+    after = {**semantic, "event_id": event_id, "current_version": version_number, "payload": payload}
+    _write_graph_event_semantic_version(
+        conn,
+        event_id=event_id,
+        version_number=version_number,
+        request=request,
+        actor_type=actor_type,
+        actor_id=actor_id,
+        before=existing,
+        after=after,
+        patch_item=patch_item,
+        now=now,
+    )
+    return after
+
+
 def _event_after_from_item(
     item: Dict[str, Any],
     *,
@@ -1062,6 +1279,12 @@ def _event_after_from_item(
             "time_window_end",
             "source_type",
             "payload",
+            "semantic",
+            "semantics",
+            "semantic_type",
+            "semantic_confidence",
+            "semantic_source",
+            *STRUCTURED_EVENT_FIELDS,
         }:
             payload.setdefault(key, value)
 
@@ -1069,6 +1292,7 @@ def _event_after_from_item(
     event_id = str(item.get("event_id") or existing.get("event_id") or "").strip()
     if not event_id:
         event_id = _hash_id("g_evt", title or request.get("request_id") or now, 18)
+    semantic = _event_semantic_from_item(item, existing=existing.get("semantic") if isinstance(existing.get("semantic"), dict) else {})
     return {
         "event_id": event_id,
         "title": title,
@@ -1082,6 +1306,7 @@ def _event_after_from_item(
         "origin_request_id": str(existing.get("origin_request_id") or request.get("request_id") or "").strip(),
         "origin_run_id": str(existing.get("origin_run_id") or request.get("run_id") or "").strip(),
         "payload": payload,
+        "semantic": semantic,
     }
 
 
@@ -1173,19 +1398,7 @@ def _target_id_from_item(item: Dict[str, Any]) -> str:
 
 
 def _infer_relation_class(relation_type: str, relation_class: str = "") -> str:
-    relation_class = str(relation_class or "").strip().upper()
-    if relation_class:
-        return relation_class
-    relation_type = str(relation_type or "").strip().upper()
-    if relation_type in {"EQUAL", "IMPLIES", "DISJOINT", "OVERLAP"}:
-        return "LOGICAL"
-    if relation_type in {"POSITIVE_IMPACT", "NEGATIVE_IMPACT", "ASSOCIATED"}:
-        return "IMPACT"
-    if relation_type in {"DIRECTLY_PRICES", "TRACKS", "HEDGES", "EXPOSED_TO"}:
-        return "MAPPING"
-    if relation_type in {"REPORTED_BY", "SUPPORTED_BY", "OBSERVED_IN"}:
-        return "EVIDENCE"
-    return relation_class or "IMPACT"
+    return infer_relation_class(relation_type, relation_class)
 
 
 def _expression_value_from_item(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -1515,6 +1728,9 @@ def _apply_graph_event_item(
     event_id = str(item.get("event_id") or item.get("target_id") or "").strip()
     existing_row = conn.execute("SELECT * FROM graph_events WHERE event_id = ?", (event_id,)).fetchone() if event_id else None
     existing = _graph_event_from_row(existing_row)
+    if existing:
+        existing_semantics = _load_event_semantics(conn, [str(existing.get("event_id") or "")])
+        existing["semantic"] = existing_semantics.get(str(existing.get("event_id") or ""), {})
 
     if action == "event_create" and existing:
         raise ValueError(f"event already exists: {event_id}")
@@ -1575,6 +1791,19 @@ def _apply_graph_event_item(
                 now,
             ),
         )
+
+    semantic_after = _upsert_graph_event_semantic(
+        conn,
+        event_id=after["event_id"],
+        semantic=after.get("semantic") if isinstance(after.get("semantic"), dict) else {},
+        request=request,
+        actor_type=actor_type,
+        actor_id=actor_id,
+        patch_item=item,
+        now=now,
+    )
+    if semantic_after:
+        after["semantic"] = semantic_after
 
     _write_graph_event_version(
         conn,
@@ -1879,7 +2108,38 @@ def _apply_graph_expression_item(
         patch_item=item,
         now=now,
     )
-    return {"expression_id": after["expression_id"], "version": version_number, "action": action}
+    derived_edges: List[Dict[str, Any]] = []
+    if after.get("lifecycle") == "ACTIVE":
+        for edge_item in derived_edges_from_expression(after["expression_id"], after.get("expression") or {}):
+            source_id = str(edge_item.get("source_id") or "").strip()
+            target_id = str(edge_item.get("target_id") or "").strip()
+            edge_id = str(edge_item.get("edge_id") or "").strip()
+            if not _node_exists(conn, source_id, "event") or not _node_exists(conn, target_id, "event"):
+                derived_edges.append({
+                    "edge_id": edge_id,
+                    "action": "skipped",
+                    "reason": "derived edge endpoint event not found",
+                    "source_id": source_id,
+                    "target_id": target_id,
+                })
+                continue
+            if edge_id and conn.execute("SELECT 1 FROM graph_edges WHERE edge_id = ?", (edge_id,)).fetchone():
+                derived_edges.append({"edge_id": edge_id, "action": "skipped", "reason": "derived edge already exists"})
+                continue
+            try:
+                derived_edges.append(
+                    _apply_graph_edge_item(
+                        conn,
+                        item=edge_item,
+                        request=request,
+                        actor_type="system",
+                        actor_id="event_expression_deriver",
+                        now=now,
+                    )
+                )
+            except Exception as exc:
+                derived_edges.append({"edge_id": edge_id, "action": "skipped", "reason": str(exc)})
+    return {"expression_id": after["expression_id"], "version": version_number, "action": action, "derived_edges": derived_edges}
 
 
 def _event_merge_source_ids(item: Dict[str, Any], target_event_id: str) -> List[str]:
@@ -2260,7 +2520,11 @@ def list_graph_events(*, q: str = "", limit: int = 50) -> List[Dict[str, Any]]:
                 LIMIT ?""",
             (*args, limit_num),
         ).fetchall()
-    return [_graph_event_from_row(row) for row in rows]
+        events = [_graph_event_from_row(row) for row in rows]
+        semantics = _load_event_semantics(conn, [str(event.get("event_id") or "") for event in events])
+    for event in events:
+        event["semantic"] = semantics.get(str(event.get("event_id") or ""), {})
+    return events
 
 
 def list_graph_finance_nodes(*, q: str = "", limit: int = 50) -> List[Dict[str, Any]]:

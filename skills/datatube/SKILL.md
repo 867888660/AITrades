@@ -6,9 +6,9 @@ description: >
   Use when the user asks to install DataTube, start DataTube, fix DataTube,
   research Polymarket/Binance market opportunities, analyze news or event risk,
   inspect EventGraph data, validate EventGraph patches, submit EventGraph change
-  requests, generate a strategy draft, run risk checks or simulation, submit a
-  draft for human approval, review pending approvals, inspect strategy status,
-  or audit agent runs. Trigger examples include "install DataTube",
+  requests, reason about EventGraph scenarios/impact chains, generate a strategy
+  draft, run risk checks or simulation, submit a draft for human approval, review
+  pending approvals, inspect strategy status, or audit agent runs. Trigger examples include "install DataTube",
   "start DataTube", "research BTC Polymarket markets",
   "test EventGraph capability", "create a strategy draft",
   "review pending approvals", "DataTube status", "Polymarket research",
@@ -72,9 +72,9 @@ Choose one workflow family from the user's request:
 - **Research**: news/event research, Polymarket market discovery, Binance crypto
   context, BTC/ETH/SOL market scans, or event-to-market analysis. Use
   [references/research.md](references/research.md).
-- **EventGraph**: inspect graph/news/event data, run news search, validate graph
-  patches, create change requests, or review pending graph changes. Use
-  [references/eventgraph.md](references/eventgraph.md).
+- **EventGraph**: inspect graph/news/event data, run news search, reason about
+  strict logic vs scenario/impact relations, validate graph patches, create
+  change requests, or review pending graph changes. Use [references/eventgraph.md](references/eventgraph.md).
 - **Strategy**: create or revise a strategy draft, run risk checks, simulate,
   submit for human confirmation. Use [references/strategy.md](references/strategy.md).
 - **Review**: pending approvals, strategy health, run/step/audit review, failure

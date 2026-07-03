@@ -6,6 +6,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Tuple
 
+from services.event_graph_logic import build_logic_candidates, build_market_semantic
 from services.event_news_service import list_events as list_news_events, list_graph_core
 from services.polymarket_service import list_market_categories, search_markets
 
@@ -454,6 +455,7 @@ def _add_core_graph_nodes(
         if not event_id:
             continue
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        semantic = event.get("semantic") if isinstance(event.get("semantic"), dict) else {}
         heat = _safe_float(payload.get("heat"), 56.0)
         nodes[event_id] = _node(
             event_id,
@@ -474,6 +476,7 @@ def _add_core_graph_nodes(
                 "current_version": event.get("current_version") or 1,
                 "updated_at_utc": event.get("updated_at_utc") or "",
                 "payload": payload,
+                "semantic": semantic,
             },
         )
         added += 1
@@ -638,6 +641,7 @@ def build_event_graph(params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     nodes: Dict[str, Dict[str, Any]] = {}
     edges: List[Dict[str, Any]] = []
     event_buckets: Dict[str, Dict[str, Any]] = {}
+    market_semantics: List[Dict[str, Any]] = []
     market_count = 0
 
     for market in markets:
@@ -679,6 +683,14 @@ def build_event_graph(params: Dict[str, Any] | None = None) -> Dict[str, Any]:
 
         finance_id = _hash_id("fin_pm", condition_id, 16)
         finance_label = str(market.get("group_item_title") or market.get("question") or condition_id).strip()
+        semantic = build_market_semantic(
+            market,
+            event_id=event_id,
+            event_label=event_label,
+            finance_id=finance_id,
+            finance_label=finance_label,
+        )
+        market_semantics.append(semantic)
         nodes[finance_id] = _node(
             finance_id,
             node_type="FINANCE",
@@ -700,6 +712,7 @@ def build_event_graph(params: Dict[str, Any] | None = None) -> Dict[str, Any]:
                 "end_date": market.get("end_date") or "",
                 "metrics": heat_info,
                 "rules": _clip(market.get("rules"), 900),
+                "semantic": semantic,
             },
         )
         edges.append(
@@ -742,6 +755,7 @@ def build_event_graph(params: Dict[str, Any] | None = None) -> Dict[str, Any]:
                     "liquidity": round(bucket["liquidity"], 2),
                 },
                 "rules_sample": bucket["rules"],
+                "semantic_status": "DERIVED_PREVIEW",
                 "top_markets": [
                     {
                         "condition_id": market.get("condition_id") or "",
@@ -817,6 +831,12 @@ def build_event_graph(params: Dict[str, Any] | None = None) -> Dict[str, Any]:
 
     core_objects = _add_core_graph_nodes(nodes, edges, query=query, params=params)
     _add_news_event_nodes(nodes, edges, query=query, params=params)
+    logic_result: Dict[str, Any] = {"candidates": [], "edges": [], "summary": {"total": 0, "implies": 0, "disjoint": 0, "equal": 0}}
+    if _truthy(params.get("include_logic_candidates"), True):
+        logic_limit = _safe_int(params.get("logic_limit"), 90, 0, 240)
+        node_heat = {node_id: _safe_float(node.get("heat"), 1.0) for node_id, node in nodes.items()}
+        logic_result = build_logic_candidates(market_semantics, node_heat=node_heat, max_candidates=logic_limit)
+        edges.extend(logic_result.get("edges") or [])
 
     node_list = sorted(nodes.values(), key=lambda item: (item["type"] != "EVENT", -float(item.get("heat") or 0), item["label"]))
     edge_list = _merge_unique_edges(edges)
@@ -845,9 +865,17 @@ def build_event_graph(params: Dict[str, Any] | None = None) -> Dict[str, Any]:
             "edges": len(edge_list),
             "markets": market_count,
             "core_objects": core_objects,
+            "logic_candidates": int((logic_result.get("summary") or {}).get("total") or 0),
+            "logical_edges": sum(1 for edge in edge_list if edge.get("relation_class") == "LOGICAL"),
             "max_heat": round(max_heat, 1),
+        },
+        "trust": {
+            "label": "UNVERIFIED / DERIVED_PREVIEW",
+            "description": "Preview nodes, signals, and logic candidates are system-derived discovery objects until accepted into Graph Core.",
         },
         "nodes": node_list,
         "edges": edge_list,
         "event_rankings": event_nodes[:30],
+        "logic_candidates": logic_result.get("candidates") or [],
+        "logic_candidate_summary": logic_result.get("summary") or {},
     }

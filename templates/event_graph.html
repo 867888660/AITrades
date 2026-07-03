@@ -83,6 +83,21 @@
                 <label class="checkbox"><input id="showFinanceToggle" type="checkbox" checked> Finance</label>
                 <label class="checkbox"><input id="showSignalsToggle" type="checkbox" checked> Signal</label>
               </div>
+              <label>
+                Relation Mode
+                <select id="eventGraphRelationMode">
+                  <option value="all" selected>All</option>
+                  <option value="logical">Strict Logic</option>
+                  <option value="reasoning">Reasoning</option>
+                  <option value="impact">Impact</option>
+                  <option value="causal">Causal</option>
+                  <option value="scenario">Scenario</option>
+                  <option value="market_move">Market Move</option>
+                  <option value="mapping">Mapping</option>
+                  <option value="evidence">Evidence</option>
+                  <option value="expression">Expression</option>
+                </select>
+              </label>
               <button type="submit">查询图谱</button>
             </form>
             <div class="event-graph-category-head">
@@ -128,6 +143,6 @@
       </main>
     </div>
     <script src="{{ url_for('static', filename='echarts.min.js') }}"></script>
-    <script src="{{ url_for('static', filename='event_graph.js') }}?v=eventgraph-art-20260627"></script>
+    <script src="{{ url_for('static', filename='event_graph.js') }}?v=eventgraph-reasoning-20260702"></script>
   </body>
 </html>

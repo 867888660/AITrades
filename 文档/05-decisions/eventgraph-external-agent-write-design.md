@@ -435,13 +435,17 @@ POST /api/event-graph/change-requests/{request_id}/request-changes
 POST /api/event-graph/change-requests/{request_id}/apply
 ```
 
-Trusted rule-only 暂未开放；当前所有 Graph Core apply 均通过 human/admin 审阅路径：
+Trusted rule 已开放为 Settings 控制项。默认 `manual` 模式下，Graph Core apply 仍通过 human/admin 审阅路径：
 
 ```text
 POST /api/event-graph/change-requests/{request_id}/apply
 ```
 
-未来如开放低风险自动 apply，仍必须检查 capability、risk_level 和 action allowlist。
+当 Settings 中 `agent_policy.event_graph_approval.mode=trusted_all` 时，外部 agent 提交的 change request 在通过 patch validation 后，可由 `system` actor 自动 approve/apply，并写入审计和版本历史。`trusted_low_risk` 模式保留给低风险动作；当前自动 apply 仍必须检查 capability、risk_level、item 数量、confidence、证据要求和当前 apply 引擎支持的 action allowlist。
+
+2026-07-01 补充：LOGICAL edge 与 Expression 属于语义假设层，当前版本即使处于 `trusted_all` 也不会自动 apply；必须经过人工确认后才进入 Graph Core。Expression 获批写入后，由系统派生的 `SYSTEM_DERIVED` edges 可自动生成并写入版本历史。
+
+2026-07-02 补充：EventGraph 关系分为 strict logic 与 reasoning 两类。`LOGICAL` 只用于 `EQUAL / IMPLIES / DISJOINT / OVERLAP` 这类严格真假关系，并且可以参与自动推导。大模型推演、市场影响、宏观传导、概率方向和场景链不得写成 `IMPLIES`；应写入 `IMPACT / CAUSAL / SCENARIO / MARKET_MOVE / EVIDENCE` 等非严格关系，并必须携带 mechanism、confidence、time_horizon、assumptions、evidence 或 run trace。非严格关系可用于解释和策略研究，但不能参与 strict logic 的自动传递。
 
 ## 6. 数据库设计
 
