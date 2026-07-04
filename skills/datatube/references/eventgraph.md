@@ -3,6 +3,13 @@
 Use this reference for EventGraph read/search/patch validation/change-request
 workflows.
 
+For user-facing EventGraph architecture explanations, root-cause analysis, or
+"teach me the whole system" requests, also read the repository guide at
+`文档/02-usage/eventgraph-system-guide.md` when it is available. That guide is
+the human-readable map of the trust layers, read/write paths, validation
+pipeline, change-request state machine, apply/version flow, and derived-news
+deduplication model.
+
 EventGraph has three semantic layers:
 
 - `derived_preview`: automatic discovery from news, markets, prices, and heat
@@ -29,6 +36,35 @@ Agent workflows must not:
 - mark derived news facts as human verified
 - encode scenario/impact/causal hypotheses as strict `IMPLIES`
 
+## Supported Change Request Actions
+
+Only submit actions that the Graph Core apply engine can write. Unsupported
+actions are rejected during validation and cannot be approved or applied.
+
+Supported actions:
+
+```text
+event_create
+event_update
+event_archive
+event_merge
+finance_create
+finance_update
+finance_archive
+edge_create
+edge_update
+edge_delete
+finance_mapping_create
+expression_create
+expression_update
+expression_archive
+```
+
+Do not submit pseudo-actions such as `event_promote`, `tag_add`,
+`observation_link`, or `metadata_update`. To promote an external observation
+into Graph Core, submit an `event_create` patch with evidence, source, time,
+category, confidence, and provenance fields.
+
 ## Relation Classes
 
 Use `LOGICAL` only for strict truth-space relations:
@@ -51,6 +87,7 @@ IMPACT:
   NEGATIVE_IMPACT
   INCREASES_PROBABILITY
   DECREASES_PROBABILITY
+  ASSOCIATED
 
 CAUSAL:
   CAUSES
@@ -73,6 +110,12 @@ EVIDENCE:
   SUPPORTED_BY
   CONTRADICTED_BY
   OBSERVED_IN
+
+MAPPING:
+  DIRECTLY_PRICES
+  TRACKS
+  HEDGES
+  EXPOSED_TO
 ```
 
 Reasoning edges do not participate in strict logical inference. Include
@@ -159,7 +202,7 @@ python scripts/datatube_client.py news-search --q BTC --limit-per-source 3
 Validate a patch:
 
 ```bash
-python scripts/datatube_client.py event-patch-validate --data "{\"change_type\":\"tag_add\",\"patch\":{\"items\":[{\"action\":\"tag_add\",\"event_id\":\"event_id\",\"tag\":\"candidate\",\"confidence\":0.5}]}}"
+python scripts/datatube_client.py event-patch-validate --data "{\"change_type\":\"event_create\",\"patch\":{\"items\":[{\"action\":\"event_create\",\"event_id\":\"evt_example_20260704\",\"title\":\"Example event\",\"category\":\"News\",\"status\":\"ACTIVE\",\"confidence\":0.72,\"source_refs\":[\"https://example.com/source\"],\"evidence_summary\":\"Short evidence summary here\"}]}}"
 ```
 
 Validate a reasoning edge:
@@ -171,7 +214,7 @@ python scripts/datatube_client.py event-patch-validate --data "{\"patch\":{\"ite
 Submit a change request only when the user asked for a proposed graph change:
 
 ```bash
-python scripts/datatube_client.py event-change-request --data "{\"change_type\":\"tag_add\",\"title\":\"Propose tag\",\"reason\":\"Evidence summary here\",\"patch\":{\"items\":[{\"action\":\"tag_add\",\"event_id\":\"event_id\",\"tag\":\"candidate\",\"confidence\":0.5}]}}"
+python scripts/datatube_client.py event-change-request --data "{\"change_type\":\"event_create\",\"title\":\"Propose EventGraph core event\",\"reason\":\"Evidence summary here\",\"patch\":{\"items\":[{\"action\":\"event_create\",\"event_id\":\"evt_example_20260704\",\"title\":\"Example event\",\"category\":\"News\",\"status\":\"ACTIVE\",\"confidence\":0.72,\"source_refs\":[\"https://example.com/source\"],\"evidence_summary\":\"Short evidence summary here\"}]}}"
 ```
 
 Review pending requests:
