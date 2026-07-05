@@ -19,6 +19,13 @@ from services.polymarket_service import (
     resolve_market_selection,
 )
 from services import strategy_data_source
+from services.history_data_service import (
+    DEFAULT_BINANCE_INTERVAL,
+    HISTORY_DB_PATH,
+    get_backtest_metric_catalog,
+    get_backtest_run,
+    get_backtest_workspace_strategy,
+)
 from services.strategy_event_service import list_strategy_events
 from services.strategy_stats_store import get_strategy_stats_db_path
 from services.strategy_metric_store import load_metric_events
@@ -56,7 +63,72 @@ _PANEL_TITLES = {
     "indicator_macd": "MACD",
     "metric_values": "Strategy Metrics",
     "metric_states": "State Lanes",
+    "backtest_metrics": "Backtest Metrics",
+    "backtest_states": "Backtest State",
+    "volume": "Volume",
 }
+_BACKTEST_RUN_CACHE_TTL_SECONDS = 20.0
+_BACKTEST_RUN_CACHE_MAX = 8
+_BACKTEST_RUN_CACHE_LOCK = threading.Lock()
+_BACKTEST_RUN_CACHE: Dict[int, Tuple[float, Dict[str, Any]]] = {}
+_BACKTEST_SERIES_CONFIG = [
+    {
+        "key": "backtest_position_ratio",
+        "label": "Backtest Position",
+        "panel": "positions",
+        "render": "step",
+        "unit": "ratio",
+        "category": "backtest_position",
+        "source_label": "Backtest Equity",
+        "source_detail": "position_ratio from equity meta",
+        "removable": True,
+    },
+    {
+        "key": "backtest_equity",
+        "label": "Backtest Equity",
+        "panel": "capital",
+        "render": "line",
+        "unit": "currency",
+        "category": "backtest_capital",
+        "source_label": "Backtest Equity",
+        "source_detail": "equity curve",
+        "removable": True,
+    },
+    {
+        "key": "backtest_pnl",
+        "label": "Backtest PnL",
+        "panel": "capital",
+        "render": "line",
+        "unit": "currency",
+        "category": "backtest_capital",
+        "source_label": "Backtest Equity",
+        "source_detail": "pnl curve",
+        "removable": True,
+        "style": {"visible": False, "line_type": "solid", "width": 1.8, "show_symbol": False},
+    },
+    {
+        "key": "backtest_return",
+        "label": "Backtest Return",
+        "panel": "backtest_metrics",
+        "render": "line",
+        "unit": "ratio",
+        "category": "backtest_metric",
+        "source_label": "Backtest Metrics",
+        "source_detail": "equity / initial equity - 1",
+        "removable": True,
+    },
+    {
+        "key": "backtest_drawdown",
+        "label": "Backtest Drawdown",
+        "panel": "backtest_metrics",
+        "render": "line",
+        "unit": "ratio",
+        "category": "backtest_metric",
+        "source_label": "Backtest Metrics",
+        "source_detail": "equity / running peak - 1",
+        "removable": True,
+    },
+]
 _PRICE_DETAIL_KEYS = {"yes_bid", "yes_ask", "no_bid", "no_ask", "yes_last_price", "no_last_price", "yes_mid", "no_mid"}
 _STATS_DETAIL_KEYS = {
     "yes_qty",
@@ -78,6 +150,11 @@ def _is_price_field(key: str) -> bool:
     text = str(key or "")
     return (
         text in _PRICE_DETAIL_KEYS
+        or text.endswith("_open")
+        or text.endswith("_high")
+        or text.endswith("_low")
+        or text.endswith("_close")
+        or text.endswith("_ohlc")
         or text.endswith("_yes_bid")
         or text.endswith("_yes_ask")
         or text.endswith("_yes_mid")
@@ -916,6 +993,257 @@ def _load_strategy_tick_price_samples(
     return {ts: sample for ts, sample in samples.items() if len(sample) > 1}
 
 
+def _load_binance_kline_samples(
+    detail: Dict[str, Any],
+    from_ts: str,
+    to_ts: str,
+    interval_seconds: int,
+) -> Dict[str, Dict[str, Any]]:
+    symbol = str(detail.get("symbol") or "").strip().upper()
+    if not symbol:
+        return {}
+    stored_interval = str(detail.get("interval") or DEFAULT_BINANCE_INTERVAL).strip() or DEFAULT_BINANCE_INTERVAL
+    if not HISTORY_DB_PATH.exists():
+        return {}
+    conn = sqlite3.connect(str(HISTORY_DB_PATH), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    buckets: Dict[str, Dict[str, Any]] = {}
+    try:
+        rows = conn.execute(
+            """SELECT open_time_utc, open, high, low, close, volume
+               FROM binance_klines
+               WHERE symbol = ? AND interval = ? AND open_time_utc >= ? AND open_time_utc <= ?
+               ORDER BY open_time_ms ASC""",
+            (symbol, stored_interval, from_ts, to_ts),
+        ).fetchall()
+        if not rows and stored_interval != DEFAULT_BINANCE_INTERVAL:
+            rows = conn.execute(
+                """SELECT open_time_utc, open, high, low, close, volume
+                   FROM binance_klines
+                   WHERE symbol = ? AND interval = ? AND open_time_utc >= ? AND open_time_utc <= ?
+                   ORDER BY open_time_ms ASC""",
+                (symbol, DEFAULT_BINANCE_INTERVAL, from_ts, to_ts),
+            ).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        bucket = _bucket_ts(row["open_time_utc"], interval_seconds)
+        open_value = _safe_float(row["open"])
+        high_value = _safe_float(row["high"])
+        low_value = _safe_float(row["low"])
+        close_value = _safe_float(row["close"])
+        volume_value = _safe_float(row["volume"]) or 0.0
+        if open_value is None or high_value is None or low_value is None or close_value is None:
+            continue
+        sample = buckets.setdefault(bucket, {
+            "ts": bucket,
+            "open": open_value,
+            "high": high_value,
+            "low": low_value,
+            "close": close_value,
+            "volume": 0.0,
+        })
+        sample["high"] = max(_safe_float(sample.get("high")) or high_value, high_value)
+        sample["low"] = min(_safe_float(sample.get("low")) or low_value, low_value)
+        sample["close"] = close_value
+        sample["volume"] = (_safe_float(sample.get("volume")) or 0.0) + volume_value
+    for sample in buckets.values():
+        sample["ohlc"] = [
+            sample.get("open"),
+            sample.get("close"),
+            sample.get("low"),
+            sample.get("high"),
+        ]
+    return buckets
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _in_time_window(ts: Any, from_dt: datetime | None, to_dt: datetime | None) -> bool:
+    parsed = _parse_iso(ts)
+    if parsed is None:
+        return False
+    if from_dt and parsed < from_dt:
+        return False
+    if to_dt and parsed > to_dt:
+        return False
+    return True
+
+
+def _compact_float(value: Any, digits: int = 6) -> str:
+    num = _safe_float(value)
+    if num is None or not math.isfinite(num):
+        return "-"
+    text = f"{num:.{digits}f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _backtest_order_symbol(order: Dict[str, Any]) -> str:
+    instrument_id = str(order.get("instrument_id") or "").strip()
+    if instrument_id:
+        return instrument_id.split(":")[-1] or instrument_id
+    return str(order.get("leg_id") or "asset").strip() or "asset"
+
+
+def _cached_backtest_run(run_id: int) -> Dict[str, Any]:
+    parsed_run_id = _safe_int(run_id)
+    if parsed_run_id <= 0:
+        return {}
+    now = time.time()
+    with _BACKTEST_RUN_CACHE_LOCK:
+        cached = _BACKTEST_RUN_CACHE.get(parsed_run_id)
+        if cached and now - cached[0] <= _BACKTEST_RUN_CACHE_TTL_SECONDS:
+            return cached[1]
+    run = get_backtest_run(parsed_run_id, equity_limit=0, orders_limit=0, events_limit=0) or {}
+    with _BACKTEST_RUN_CACHE_LOCK:
+        stale_keys = [
+            key
+            for key, (cached_at, _) in _BACKTEST_RUN_CACHE.items()
+            if now - cached_at > _BACKTEST_RUN_CACHE_TTL_SECONDS
+        ]
+        for key in stale_keys:
+            _BACKTEST_RUN_CACHE.pop(key, None)
+        if len(_BACKTEST_RUN_CACHE) >= _BACKTEST_RUN_CACHE_MAX:
+            oldest_key = min(_BACKTEST_RUN_CACHE, key=lambda key: _BACKTEST_RUN_CACHE[key][0])
+            _BACKTEST_RUN_CACHE.pop(oldest_key, None)
+        _BACKTEST_RUN_CACHE[parsed_run_id] = (now, run)
+    return run
+
+
+def _load_backtest_overlay_samples(
+    run_id: Any,
+    from_ts: str,
+    to_ts: str,
+    interval_seconds: int,
+) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    parsed_run_id = _safe_int(run_id)
+    if parsed_run_id <= 0:
+        return {}, [], {}
+    run = _cached_backtest_run(parsed_run_id)
+    from_dt = _parse_iso(from_ts)
+    to_dt = _parse_iso(to_ts)
+    samples: Dict[str, Dict[str, Any]] = {}
+    initial_equity: float | None = None
+    running_peak: float | None = None
+    for point in sorted(run.get("equity") or [], key=lambda item: str(item.get("ts_utc") or "")):
+        ts = point.get("ts_utc")
+        if not _in_time_window(ts, from_dt, to_dt):
+            continue
+        bucket = _bucket_ts(str(ts), interval_seconds)
+        meta = point.get("meta") if isinstance(point.get("meta"), dict) else {}
+        equity_value = _safe_float(point.get("equity"))
+        if equity_value is not None:
+            if initial_equity is None and equity_value > 0:
+                initial_equity = equity_value
+            running_peak = equity_value if running_peak is None else max(running_peak, equity_value)
+        sample = samples.setdefault(bucket, {"ts": bucket})
+        sample["backtest_equity"] = equity_value
+        sample["backtest_cash"] = _safe_float(point.get("cash"))
+        sample["backtest_exposure"] = _safe_float(point.get("exposure"))
+        sample["backtest_pnl"] = _safe_float(point.get("pnl"))
+        sample["backtest_position_ratio"] = _safe_float(meta.get("position_ratio"))
+        sample["backtest_position_qty"] = _safe_float(meta.get("position_qty"))
+        sample["backtest_mark_price"] = _safe_float(meta.get("close"))
+        if equity_value is not None and initial_equity:
+            sample["backtest_return"] = (equity_value / initial_equity) - 1.0
+        if equity_value is not None and running_peak:
+            sample["backtest_drawdown"] = (equity_value / running_peak) - 1.0
+    events: List[Dict[str, Any]] = []
+    for order in run.get("orders") or []:
+        ts = order.get("ts_utc")
+        if not _in_time_window(ts, from_dt, to_dt):
+            continue
+        side = str(order.get("side") or "").upper() or "ORDER"
+        symbol = _backtest_order_symbol(order)
+        qty = _compact_float(order.get("quantity"), 8)
+        price = _compact_float(order.get("price"), 2)
+        reason = str((order.get("meta") or {}).get("reason") or order.get("reason") or "").strip()
+        label = f"{side} {symbol} qty={qty} price={price}"
+        if reason:
+            label = f"{label} reason={reason}"
+        events.append({
+            "ts": ts,
+            "type": "trade",
+            "label": label,
+            "severity": "info",
+            "source": "backtest_order",
+            "run_id": parsed_run_id,
+            "side": side,
+            "symbol": symbol,
+            "quantity": _safe_float(order.get("quantity")),
+            "price": _safe_float(order.get("price")),
+            "fee": _safe_float(order.get("fee")),
+            "reason": reason,
+            "instrument_id": order.get("instrument_id"),
+        })
+    return samples, events, run
+
+
+def _backtest_position_state_lanes(
+    samples: Dict[str, Dict[str, Any]],
+    from_ts: str,
+    to_ts: str,
+) -> List[Dict[str, Any]]:
+    points = sorted(
+        [
+            (ts, _safe_float(sample.get("backtest_position_ratio")))
+            for ts, sample in (samples or {}).items()
+            if sample.get("backtest_position_ratio") is not None
+        ],
+        key=lambda item: item[0],
+    )
+    if not points:
+        return []
+
+    def state_for(value: float | None) -> str:
+        if value is None or abs(value) < 1e-9:
+            return "Flat"
+        return "Long" if value > 0 else "Short"
+
+    def color_for(state: str) -> str:
+        return {"Long": "#22c55e", "Short": "#ef4444"}.get(state, "#64748b")
+
+    segments: List[Dict[str, Any]] = []
+    current_state = state_for(points[0][1])
+    start = points[0][0] or from_ts
+    for ts, value in points[1:]:
+        next_state = state_for(value)
+        if next_state == current_state:
+            continue
+        if start and ts and start < ts:
+            segments.append({
+                "from": start,
+                "to": ts,
+                "value": current_state,
+                "label": current_state,
+                "color": color_for(current_state),
+                "lane": 0,
+            })
+        start = ts
+        current_state = next_state
+    end = to_ts or points[-1][0]
+    if start and end and start < end:
+        segments.append({
+            "from": start,
+            "to": end,
+            "value": current_state,
+            "label": current_state,
+            "color": color_for(current_state),
+            "lane": 0,
+        })
+    return [{
+        "key": "backtest_position_state",
+        "label": "Backtest Position State",
+        "lane": 0,
+        "segments": segments,
+    }] if segments else []
+
+
 def _prefix_sample_map(sample_map: Dict[str, Dict[str, Any]], prefix: str) -> Dict[str, Dict[str, Any]]:
     if not prefix:
         return sample_map
@@ -1468,21 +1796,41 @@ def _metric_catalog_by_key(capabilities: Dict[str, Any]) -> Dict[str, Dict[str, 
     }
 
 
+def _merge_metric_catalog(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for item in (base.get("items") if isinstance(base, dict) else []) or []:
+        key = str(item.get("key") or "").strip()
+        if key:
+            merged[key] = item
+    for item in (extra.get("items") if isinstance(extra, dict) else []) or []:
+        key = str(item.get("key") or "").strip()
+        if key:
+            merged[key] = item
+    items = list(merged.values())
+    return {
+        "items": items,
+        "numeric": [item for item in items if item.get("metric_type") == "number" and item.get("value_state") == "value"],
+        "state": [item for item in items if item.get("kind") == "state" and item.get("value_state") == "value"],
+    }
+
+
 def _metric_series_items(metric_keys: List[str], capabilities: Dict[str, Any]) -> List[Dict[str, Any]]:
     catalog = _metric_catalog_by_key(capabilities)
     items: List[Dict[str, Any]] = []
     for key in metric_keys:
         meta = catalog.get(key) or {"key": key, "label": key, "unit": ""}
+        meta_payload = meta.get("meta") if isinstance(meta.get("meta"), dict) else {}
+        is_backtest_derived = str(meta_payload.get("source") or "") == "backtest_derived" or str(key).startswith("backtest_")
         items.append(
             {
                 "key": f"metric:{key}",
                 "label": str(meta.get("label") or key),
-                "panel": str(meta.get("panel") or "") or "metric_values",
+                "panel": str(meta.get("panel") or "") or ("backtest_metrics" if is_backtest_derived else "metric_values"),
                 "render": "line",
                 "unit": str(meta.get("unit") or ""),
-                "category": "strategy_metric",
+                "category": "backtest_metric" if is_backtest_derived else "strategy_metric",
                 "metric_key": key,
-                "source_label": "策略 Metrics",
+                "source_label": "Backtest Metrics" if is_backtest_derived else "策略 Metrics",
                 "source_detail": f"metrics.{key}",
                 "removable": False,
             }
@@ -1599,6 +1947,13 @@ def _state_color(key: str, value: Any, meta: Dict[str, Any], index: int) -> str:
     return _STATE_COLORS[index % len(_STATE_COLORS)]
 
 
+def _state_value_key(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        return str(value)
+
+
 def _metric_state_lanes(
     detail: Dict[str, Any],
     metric_keys: List[str],
@@ -1613,15 +1968,24 @@ def _metric_state_lanes(
     events_by_key = load_metric_events(int(row_id), metric_keys, from_ts, to_ts)
     lanes: List[Dict[str, Any]] = []
     for lane_index, key in enumerate(metric_keys):
-        events = sorted(events_by_key.get(key) or [], key=lambda item: _parse_iso(item.get("ts")) or datetime.min.replace(tzinfo=timezone.utc))
+        raw_events = sorted(events_by_key.get(key) or [], key=lambda item: _parse_iso(item.get("ts")) or datetime.min.replace(tzinfo=timezone.utc))
+        events = []
+        previous_value_key = ""
+        for event in raw_events:
+            value = _metric_value_from_event(event)
+            if value is None:
+                continue
+            value_key = _state_value_key(value)
+            if events and value_key == previous_value_key:
+                continue
+            events.append({**event, "_metric_value": value})
+            previous_value_key = value_key
         if not events:
             continue
         meta = catalog.get(key) or {"key": key, "label": key, "meta": {}}
         segments = []
         for idx, event in enumerate(events):
-            value = _metric_value_from_event(event)
-            if value is None:
-                continue
+            value = event.get("_metric_value")
             start = max(str(event.get("ts") or from_ts), from_ts)
             end = str(events[idx + 1].get("ts") or to_ts) if idx + 1 < len(events) else to_ts
             if end <= from_ts or start >= to_ts:
@@ -1633,6 +1997,133 @@ def _metric_state_lanes(
                     "value": str(value),
                     "label": _state_label(key, value, meta.get("meta") or {}),
                     "color": _state_color(key, value, meta.get("meta") or {}, idx),
+                    "lane": lane_index,
+                }
+            )
+        if segments:
+            lanes.append(
+                {
+                    "key": key,
+                    "label": str(meta.get("label") or key),
+                    "lane": lane_index,
+                    "segments": segments,
+                }
+            )
+    return lanes
+
+
+def _point_strategy_metrics(point: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    meta = point.get("meta") if isinstance(point.get("meta"), dict) else {}
+    metrics = meta.get("strategy_metrics") if isinstance(meta.get("strategy_metrics"), dict) else {}
+    metrics_meta = meta.get("strategy_metrics_meta") if isinstance(meta.get("strategy_metrics_meta"), dict) else {}
+    return metrics, metrics_meta
+
+
+def _backtest_derived_metric_value(
+    key: str,
+    point: Dict[str, Any],
+    initial_equity: float | None,
+    running_peak: float | None,
+) -> Any:
+    if key == "backtest_return":
+        equity = _safe_float(point.get("equity"))
+        return (equity / initial_equity - 1.0) if equity is not None and initial_equity else None
+    if key == "backtest_drawdown":
+        equity = _safe_float(point.get("equity"))
+        return (equity / running_peak - 1.0) if equity is not None and running_peak else None
+    return None
+
+
+def _load_backtest_metric_numeric_samples(
+    run: Dict[str, Any],
+    metric_keys: List[str],
+    from_ts: str,
+    to_ts: str,
+    interval_seconds: int,
+) -> Dict[str, Dict[str, Any]]:
+    if not run or not metric_keys:
+        return {}
+    from_dt = _parse_iso(from_ts)
+    to_dt = _parse_iso(to_ts)
+    output: Dict[str, Dict[str, Any]] = {}
+    initial_equity: float | None = None
+    running_peak: float | None = None
+    for point in sorted(run.get("equity") or [], key=lambda item: str(item.get("ts_utc") or "")):
+        equity = _safe_float(point.get("equity"))
+        if equity is not None and equity > 0:
+            if initial_equity is None:
+                initial_equity = equity
+            running_peak = equity if running_peak is None else max(running_peak, equity)
+        ts = point.get("ts_utc")
+        if not _in_time_window(ts, from_dt, to_dt):
+            continue
+        bucket = _bucket_ts(str(ts), interval_seconds)
+        sample = output.setdefault(bucket, {"ts": bucket})
+        metrics, _ = _point_strategy_metrics(point)
+        for key in metric_keys:
+            value = _backtest_derived_metric_value(key, point, initial_equity, running_peak)
+            if value is None:
+                value = metrics.get(key)
+            number = _safe_float(value)
+            if number is not None and math.isfinite(number):
+                sample[f"metric:{key}"] = number
+    return output
+
+
+def _load_backtest_metric_state_lanes(
+    run: Dict[str, Any],
+    metric_keys: List[str],
+    from_ts: str,
+    to_ts: str,
+    capabilities: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if not run or not metric_keys:
+        return []
+    metric_keys = [key for key in metric_keys if key != "backtest_position_state"]
+    if not metric_keys:
+        return []
+    from_dt = _parse_iso(from_ts)
+    to_dt = _parse_iso(to_ts)
+    catalog = _metric_catalog_by_key(capabilities)
+    lanes: List[Dict[str, Any]] = []
+    points = sorted(run.get("equity") or [], key=lambda item: str(item.get("ts_utc") or ""))
+    for lane_index, key in enumerate(metric_keys):
+        events: List[Dict[str, Any]] = []
+        previous_value_key = ""
+        for point in points:
+            ts = point.get("ts_utc")
+            if not _in_time_window(ts, from_dt, to_dt):
+                continue
+            metrics, metrics_meta = _point_strategy_metrics(point)
+            if key not in metrics:
+                continue
+            value = metrics.get(key)
+            if value is None:
+                continue
+            item_meta = metrics_meta.get(key) if isinstance(metrics_meta.get(key), dict) else {}
+            value_key = _state_value_key(value)
+            if events and value_key == previous_value_key:
+                continue
+            events.append({"ts": str(ts), "value": value, "meta": item_meta})
+            previous_value_key = value_key
+        if not events:
+            continue
+        meta = catalog.get(key) or {"key": key, "label": key, "meta": events[-1].get("meta") or {}}
+        segments = []
+        for idx, event in enumerate(events):
+            value = event.get("value")
+            start = max(str(event.get("ts") or from_ts), from_ts)
+            end = str(events[idx + 1].get("ts") or to_ts) if idx + 1 < len(events) else to_ts
+            if end <= from_ts or start >= to_ts:
+                continue
+            meta_payload = meta.get("meta") or event.get("meta") or {}
+            segments.append(
+                {
+                    "from": start,
+                    "to": min(end, to_ts),
+                    "value": str(value),
+                    "label": _state_label(key, value, meta_payload),
+                    "color": _state_color(key, value, meta_payload, idx),
                     "lane": lane_index,
                 }
             )
@@ -1661,6 +2152,53 @@ def _market_series_items(targets: List[Dict[str, Any]], main_side: str) -> List[
         detail = target["detail"]
         prefix = f"market_{index}_"
         label_prefix = _short_market_label(detail, f"Market {index + 1}")
+        if _is_binance_detail(detail):
+            symbol = str(detail.get("symbol") or label_prefix).strip().upper()
+            return_label = symbol or label_prefix
+            items.append({
+                "key": f"{prefix}ohlc",
+                "label": f"{return_label} K线",
+                "panel": "main",
+                "render": "candlestick",
+                "unit": "price",
+                "category": "market_target",
+                "market_index": index,
+                "market_label": return_label,
+                "base_key": "ohlc",
+                "source_label": "Binance OHLCV",
+                "source_detail": f"{symbol} {detail.get('interval') or DEFAULT_BINANCE_INTERVAL}",
+                "removable": True,
+            })
+            items.append({
+                "key": f"{prefix}close",
+                "label": f"{return_label} Close",
+                "panel": "main",
+                "render": "line",
+                "unit": "price",
+                "category": "market_target",
+                "market_index": index,
+                "market_label": return_label,
+                "base_key": "close",
+                "source_label": "Binance Close",
+                "source_detail": f"{symbol} {detail.get('interval') or DEFAULT_BINANCE_INTERVAL}",
+                "removable": True,
+                "style": {"visible": False, "line_type": "solid", "width": 1.6, "smooth": False, "show_symbol": False},
+            })
+            items.append({
+                "key": f"{prefix}volume",
+                "label": f"{return_label} Volume",
+                "panel": "volume",
+                "render": "bar",
+                "unit": "compact_number",
+                "category": "market_volume",
+                "market_index": index,
+                "market_label": return_label,
+                "base_key": "volume",
+                "source_label": "Binance Volume",
+                "source_detail": f"{symbol} {detail.get('interval') or DEFAULT_BINANCE_INTERVAL}",
+                "removable": True,
+            })
+            continue
         if index == 0:
             side_keys = _main_series(main_side, {"main_allowed": ["yes_bid", "yes_ask", "no_bid", "no_ask"]})
         else:
@@ -1717,7 +2255,53 @@ def _leg_identity(detail: Dict[str, Any]) -> str:
     )
 
 
+def _is_binance_detail(detail: Dict[str, Any]) -> bool:
+    source = str(detail.get("source") or "").strip().lower()
+    venue = str(detail.get("venue") or "").strip().lower()
+    asset_class = str(detail.get("asset_class") or "").strip().lower()
+    instrument_id = str(detail.get("instrument_id") or "").strip().lower()
+    return source == "binance" or venue == "binance" or asset_class in {"crypto_spot", "crypto"} or instrument_id.startswith("crypto_spot:binance:")
+
+
+def _target_identity(detail: Dict[str, Any]) -> str:
+    if _is_binance_detail(detail):
+        symbol = str(detail.get("symbol") or "").strip().upper()
+        interval = str(detail.get("interval") or DEFAULT_BINANCE_INTERVAL).strip()
+        instrument_id = str(detail.get("instrument_id") or "").strip()
+        return f"binance|{symbol}|{interval}|{instrument_id}"
+    return _leg_identity(detail)
+
+
+def _binance_target_detail_from_leg(leg: Dict[str, Any], leg_index: int) -> Dict[str, Any] | None:
+    source = str(leg.get("source") or leg.get("venue") or "").strip().lower()
+    asset_class = str(leg.get("asset_class") or "").strip().lower()
+    instrument_id = str(leg.get("instrument_id") or "").strip()
+    symbol = str(leg.get("symbol") or "").strip().upper()
+    if not symbol and instrument_id.lower().startswith("crypto_spot:binance:"):
+        symbol = instrument_id.split(":")[-1].upper()
+    if not (symbol and (source == "binance" or asset_class in {"crypto_spot", "crypto"} or instrument_id.lower().startswith("crypto_spot:binance:"))):
+        return None
+    interval = str(leg.get("interval") or DEFAULT_BINANCE_INTERVAL).strip() or DEFAULT_BINANCE_INTERVAL
+    display = str(leg.get("display_name") or leg.get("label") or symbol).strip()
+    return {
+        "source": "binance",
+        "venue": "binance",
+        "asset_class": "crypto_spot",
+        "symbol": symbol,
+        "interval": interval,
+        "instrument_id": instrument_id or f"crypto_spot:binance:{symbol}",
+        "display_name": display,
+        "question": display,
+        "leg_index": leg_index,
+        "budget_cap": leg.get("budget_cap"),
+        "params_json": leg.get("params_json"),
+    }
+
+
 def _market_target_detail_from_payload(target: Dict[str, Any]) -> Dict[str, Any] | None:
+    binance_detail = _binance_target_detail_from_leg(target, int(target.get("leg_index") or 0))
+    if binance_detail is not None:
+        return binance_detail
     condition_id = str(target.get("condition_id") or "").strip()
     yes_token = str(target.get("yes_token") or "").strip()
     no_token = str(target.get("no_token") or "").strip()
@@ -1745,6 +2329,11 @@ def _strategy_leg_market_targets(row_id: int, base_detail: Dict[str, Any] | None
         strategy = strategy_data_source.get_strategy(row_id)
     except Exception:
         strategy = None
+    if not strategy:
+        try:
+            strategy = get_backtest_workspace_strategy(row_id)
+        except Exception:
+            strategy = None
     primary_detail = base_detail or fetch_strategy_detail(row_id, allow_remote_positions=False)
     if not strategy:
         return [{"detail": primary_detail, "origin": "strategy", "is_primary": True}]
@@ -1758,30 +2347,34 @@ def _strategy_leg_market_targets(row_id: int, base_detail: Dict[str, Any] | None
     primary_identity = _leg_identity(primary_detail)
     for index, leg in enumerate(legs):
         leg_index = int(leg.get("leg_index") or index)
-        condition_id = str(leg.get("condition_id") or "").strip()
-        yes_token = str(leg.get("yes_token") or "").strip()
-        no_token = str(leg.get("no_token") or "").strip()
-        token_id = yes_token or no_token
-        if index == 0 and primary_identity:
-            detail = dict(primary_detail)
+        binance_detail = _binance_target_detail_from_leg(leg, leg_index)
+        if binance_detail is not None:
+            detail = binance_detail
         else:
-            detail = _market_target_detail_from_payload(
-                {
-                    "condition_id": condition_id,
-                    "yes_token": yes_token,
-                    "no_token": no_token,
-                    "token_id": token_id,
-                    "label": leg.get("label") or f"Leg {leg_index}",
-                    "question": leg.get("question") or leg.get("label") or f"Leg {leg_index}",
-                }
-            )
-            if detail is None:
-                resolved = resolve_market_selection(condition_id=condition_id, token_id=token_id, limit=20)
-                detail = build_workspace_market_detail(resolved.get("selected"), condition_id=condition_id, token_id=token_id)
+            condition_id = str(leg.get("condition_id") or "").strip()
+            yes_token = str(leg.get("yes_token") or "").strip()
+            no_token = str(leg.get("no_token") or "").strip()
+            token_id = yes_token or no_token
+            if index == 0 and primary_identity:
+                detail = dict(primary_detail)
+            else:
+                detail = _market_target_detail_from_payload(
+                    {
+                        "condition_id": condition_id,
+                        "yes_token": yes_token,
+                        "no_token": no_token,
+                        "token_id": token_id,
+                        "label": leg.get("label") or f"Leg {leg_index}",
+                        "question": leg.get("question") or leg.get("label") or f"Leg {leg_index}",
+                    }
+                )
+                if detail is None:
+                    resolved = resolve_market_selection(condition_id=condition_id, token_id=token_id, limit=20)
+                    detail = build_workspace_market_detail(resolved.get("selected"), condition_id=condition_id, token_id=token_id)
         detail["leg_index"] = leg_index
         detail["budget_cap"] = leg.get("budget_cap")
         detail["params_json"] = leg.get("params_json")
-        identity = _leg_identity(detail)
+        identity = _target_identity(detail)
         if not identity.strip("|") or identity in seen:
             continue
         seen.add(identity)
@@ -1809,7 +2402,7 @@ def _resolve_compare_details(row_id: int, args: Dict[str, Any]) -> List[Dict[str
         if target_type == "strategy":
             for expanded in _strategy_leg_market_targets(int(target.get("row_id") or row_id)):
                 detail = expanded["detail"]
-                identity = _leg_identity(detail)
+                identity = _target_identity(detail)
                 if not identity.strip("|") or identity in seen:
                     continue
                 seen.add(identity)
@@ -1823,7 +2416,7 @@ def _resolve_compare_details(row_id: int, args: Dict[str, Any]) -> List[Dict[str
                 query = str(target.get("question") or target.get("label") or "").strip()
                 resolved = resolve_market_selection(query=query, condition_id=condition_id, token_id=token_id, limit=20)
                 detail = build_workspace_market_detail(resolved.get("selected"), condition_id=condition_id, token_id=token_id)
-        identity = _leg_identity(detail)
+        identity = _target_identity(detail)
         if not identity.strip("|") or identity in seen:
             continue
         seen.add(identity)
@@ -1910,6 +2503,13 @@ def _resolve_chart_detail(row_id: int, args: Dict[str, Any]) -> tuple[Dict[str, 
         "items": [
             {
                 "label": target["detail"].get("question") or target["detail"].get("display_name"),
+                "type": target["detail"].get("source") or target.get("origin"),
+                "source": target["detail"].get("source") or "",
+                "venue": target["detail"].get("venue") or "",
+                "asset_class": target["detail"].get("asset_class") or "",
+                "symbol": target["detail"].get("symbol") or "",
+                "interval": target["detail"].get("interval") or "",
+                "instrument_id": target["detail"].get("instrument_id") or "",
                 "condition_id": target["detail"].get("condition_id"),
                 "yes_token": target["detail"].get("yes_token"),
                 "no_token": target["detail"].get("no_token"),
@@ -1923,6 +2523,8 @@ def _resolve_chart_detail(row_id: int, args: Dict[str, Any]) -> tuple[Dict[str, 
 
 
 def _indicator_source_key(detail: Dict[str, Any], main_side: str) -> str:
+    if _is_binance_detail(detail):
+        return "market_0_close"
     if main_side == "no" and detail.get("no_token"):
         return "no_ask"
     if main_side == "yes" and detail.get("yes_token"):
@@ -2071,6 +2673,15 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
     )
     defaults = get_strategy_chart_defaults(detail)
     capabilities = get_strategy_chart_capabilities(detail)
+    backtest_run_id = _safe_int(args.get("backtest_run_id"))
+    if backtest_run_id:
+        capabilities = {
+            **capabilities,
+            "metric_catalog": _merge_metric_catalog(
+                capabilities.get("metric_catalog") or {},
+                get_backtest_metric_catalog(backtest_run_id),
+            ),
+        }
     interval = str(args.get("interval") or defaults.get("interval") or "5s")
     interval_seconds = _parse_seconds(interval)
     from_ts, to_ts = _resolve_time_bounds(args, defaults)
@@ -2079,6 +2690,12 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
     style_overrides = _series_style_overrides(args)
     selected_series = []
     selected_series.extend(_requested_sub_series(args, defaults, capabilities))
+    has_binance_targets = any(_is_binance_detail(target.get("detail") or {}) for target in market_targets)
+    if has_binance_targets:
+        selected_series = [
+            item for item in selected_series
+            if item not in {"yes_position", "no_position", "yes_qty", "no_qty", "yes_avg", "no_avg"}
+        ]
     sub_metrics_debug = _sub_series_debug(args, defaults, capabilities)
     selected_metric_keys, selected_state_metric_keys = _selected_metric_keys(selected_series)
     static_selected_series = [item for item in selected_series if not item.startswith("metric:") and not item.startswith("metric_state:")]
@@ -2086,6 +2703,11 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
     overlay_finance = _allowed_overlay_symbols(args, capabilities, "overlay_finance")
     overlay_crypto_fields = _selected_overlay_fields(args, defaults, capabilities, "crypto")
     overlay_finance_fields = _selected_overlay_fields(args, defaults, capabilities, "finance")
+    if backtest_run_id:
+        static_selected_series = [
+            item for item in static_selected_series
+            if item not in {"strategy_pnl", "strategy_bankroll", "initial_capital", "realized_profit", "profit_roll_ratio"}
+        ]
     series_items = _market_series_items(market_targets, main_side)
     series_items.extend(_static_series_items(static_selected_series, detail))
     series_items.extend(_metric_series_items(selected_metric_keys, capabilities))
@@ -2096,12 +2718,17 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
     market_detail_samples = []
     for index, target in enumerate(market_targets):
         prefix = f"market_{index}_"
-        price_sample_map = _load_price_samples(target["detail"], from_ts, to_ts, interval_seconds)
-        if index == 0:
+        is_binance_target = _is_binance_detail(target["detail"])
+        price_sample_map = (
+            _load_binance_kline_samples(target["detail"], from_ts, to_ts, interval_seconds)
+            if is_binance_target
+            else _load_price_samples(target["detail"], from_ts, to_ts, interval_seconds)
+        )
+        if index == 0 and not is_binance_target:
             tick_price_sample_map = _load_strategy_tick_price_samples(detail, from_ts, to_ts, interval_seconds)
             price_sample_map = _overlay_sample_maps(tick_price_sample_map, price_sample_map)
-        detail_sample_map = _detail_sample(target["detail"], interval_seconds, from_ts, to_ts)
-        if index == 0:
+        detail_sample_map = {} if is_binance_target else _detail_sample(target["detail"], interval_seconds, from_ts, to_ts)
+        if index == 0 or is_binance_target:
             market_price_maps.append(_prefix_sample_map(price_sample_map, prefix))
             market_detail_samples.append(
                 _prefix_sample_map(_select_sample_keys(detail_sample_map, _PRICE_DETAIL_KEYS), prefix)
@@ -2120,9 +2747,34 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
     finance_overlay_samples = _load_finance_overlay_samples(
         from_ts, to_ts, interval_seconds, overlay_finance, overlay_finance_fields
     )
+    backtest_samples, backtest_events, backtest_run = _load_backtest_overlay_samples(
+        backtest_run_id, from_ts, to_ts, interval_seconds
+    )
+    backtest_metric_samples = _load_backtest_metric_numeric_samples(
+        backtest_run, selected_metric_keys, from_ts, to_ts, interval_seconds
+    )
+    backtest_state_lanes = (
+        _backtest_position_state_lanes(backtest_samples, from_ts, to_ts)
+        if "backtest_position_state" in selected_state_metric_keys
+        else []
+    )
+    backtest_metric_state_lanes = _load_backtest_metric_state_lanes(
+        backtest_run, selected_state_metric_keys, from_ts, to_ts, capabilities
+    )
+    if backtest_samples:
+        selected_backtest_metric_keys = set(selected_metric_keys)
+        series_items.extend(
+            dict(item)
+            for item in _BACKTEST_SERIES_CONFIG
+            if item.get("category") != "backtest_metric" and item.get("key") not in selected_backtest_metric_keys
+        )
+    if backtest_state_lanes:
+        metric_state_lanes.extend(backtest_state_lanes)
+    if backtest_metric_state_lanes:
+        metric_state_lanes.extend(backtest_metric_state_lanes)
     t_samples1 = time.perf_counter()
     print(
-        f"[SV][chart] load_samples {(t_samples1 - t_samples0) * 1000:.1f}ms price_maps={len(market_price_maps)} stats={len(stats_samples)}"
+        f"[SV][chart] load_samples {(t_samples1 - t_samples0) * 1000:.1f}ms price_maps={len(market_price_maps)} stats={len(stats_samples)} backtest={len(backtest_samples)}"
     )
     stats_db_path = get_strategy_stats_db_path(detail)
     t_merge0 = time.perf_counter()
@@ -2135,6 +2787,8 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
         stats_detail_sample,
         crypto_overlay_samples,
         finance_overlay_samples,
+        backtest_samples,
+        backtest_metric_samples,
         *market_detail_samples,
     )
     _sync_row_pnl_to_visible_prices(rows)
@@ -2171,6 +2825,15 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
     if virtual_trade_events:
         events = [ev for ev in events if str(ev.get("type") or "").lower() not in ("trade", "fill", "order")]
         events.extend(virtual_trade_events)
+    if backtest_events:
+        events.extend(backtest_events)
+        events.sort(key=lambda item: str(item.get("ts") or ""))
+
+    state_lane_panel_title = _PANEL_TITLES["metric_states"]
+    if metric_state_lanes and all(str(lane.get("key") or "").startswith("backtest_") for lane in metric_state_lanes):
+        state_lane_panel_title = _PANEL_TITLES["backtest_states"]
+    elif metric_state_lanes and any(str(lane.get("key") or "").startswith("backtest_") for lane in metric_state_lanes):
+        state_lane_panel_title = "State / Backtest Lanes"
 
     total_ms = (time.perf_counter() - t0) * 1000
     print(f"[SV][chart] total {total_ms:.1f}ms row_id={row_id} rows={len(rows)} series={len(series_items)}")
@@ -2186,6 +2849,7 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
             "overlay_finance": overlay_finance,
             "overlay_crypto_fields": overlay_crypto_fields,
             "overlay_finance_fields": overlay_finance_fields,
+            "backtest_run_id": backtest_run_id or None,
             "target": target_meta,
             "indicator_config": indicator_cfg,
             "series_style_overrides": style_overrides,
@@ -2196,20 +2860,29 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
                 "series_count": len(series_items),
                 "metric_series_count": len([item for item in series_items if item.get("category") == "strategy_metric"]),
                 "state_lane_count": len(metric_state_lanes),
+                "backtest_state_lane_count": len(backtest_state_lanes),
             },
             "sources": {
                 "price_history_db": str(_monitoring_db_path()),
+                "binance_history_db": str(HISTORY_DB_PATH),
                 "strategy_stats_db": str(stats_db_path) if stats_db_path else "",
                 "current_price_source": str(detail.get("price_source") or "unknown"),
                 "current_price_source_path": str(detail.get("realtime_snapshot_db_path") or ""),
                 "history_price_points": len(price_samples),
                 "history_stats_points": len(stats_samples),
                 "history_metric_points": len(metric_samples),
+                "history_backtest_points": len(backtest_samples),
+                "history_backtest_metric_points": len(backtest_metric_samples),
+                "history_backtest_orders": len(backtest_events),
+                "history_backtest_status": str(backtest_run.get("status") or ""),
+                "history_backtest_derived_metrics": len(backtest_samples) if backtest_samples else 0,
+                "history_backtest_state_lanes": len(backtest_state_lanes),
+                "history_backtest_metric_state_lanes": len(backtest_metric_state_lanes),
             },
         },
         "panels": [
             *_panel_list(series_items),
-            *([{"id": "metric_states", "title": _PANEL_TITLES["metric_states"]}] if metric_state_lanes else []),
+            *([{"id": "metric_states", "title": state_lane_panel_title}] if metric_state_lanes else []),
         ],
         "series": series_items,
         "events": events,

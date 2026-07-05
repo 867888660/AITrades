@@ -19,6 +19,8 @@ const els = {
   windowHint: $("reportWindowHint"),
   useActualWindow: $("reportUseActualWindowBtn"),
   rerun: $("reportRerunBtn"),
+  workspaceLink: $("reportWorkspaceLink"),
+  workspaceImport: $("reportWorkspaceImportBtn"),
 };
 
 let equityChart = null;
@@ -402,6 +404,26 @@ function renderReport(run) {
   const snapshot = run.case_snapshot || {};
   els.title.textContent = snapshot.case_name || `Backtest Run ${run.run_id}`;
   els.meta.textContent = `run_id=${run.run_id} | case_id=${run.case_id} | strategy=${snapshot.run_strategy_code || run.strategy_id || "-"} | created=${run.created_at_utc || "-"}`;
+  const strategyId = snapshot.run_strategy_id || run.strategy_id || snapshot.strategy_id;
+  if (els.workspaceLink) {
+    els.workspaceLink.hidden = false;
+    if (strategyId && run.run_id) {
+      els.workspaceLink.href = `/strategies/${encodeURIComponent(strategyId)}/workspace?source=backtest&run_id=${encodeURIComponent(run.run_id)}`;
+      els.workspaceLink.textContent = "在工作台查看";
+      els.workspaceLink.title = "打开策略工作台并加载本次回测区间";
+      els.workspaceLink.classList.remove("disabled");
+      els.workspaceLink.removeAttribute("aria-disabled");
+      if (els.workspaceImport) els.workspaceImport.hidden = true;
+    } else {
+      els.workspaceLink.hidden = true;
+      if (els.workspaceImport) {
+        els.workspaceImport.hidden = false;
+        els.workspaceImport.disabled = false;
+        els.workspaceImport.textContent = "导入工作台";
+        els.workspaceImport.title = "从本次回测的 legs、参数和策略代码创建一个 Stop 状态的工作台策略";
+      }
+    }
+  }
   renderStatus(run);
   renderWindowEditor(run);
   renderMetrics(run);
@@ -415,6 +437,27 @@ function renderReport(run) {
 async function loadReport() {
   const payload = await apiJson(`/api/history/backtest-runs/${runId}?equity_limit=5000&orders_limit=3000&events_limit=500`);
   renderReport(payload.data || {});
+}
+
+async function importWorkspaceForRun() {
+  if (!els.workspaceImport) return;
+  els.workspaceImport.disabled = true;
+  els.workspaceImport.textContent = "导入中...";
+  try {
+    const payload = await apiJson(`/api/history/backtest-runs/${runId}/workspace`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    const workspaceUrl = payload.data?.workspace_url || "";
+    await loadReport();
+    if (workspaceUrl) {
+      window.open(workspaceUrl, "_blank", "noopener,noreferrer");
+    }
+  } catch (err) {
+    els.status.innerHTML = `<div class="status error">${escapeHtml(err.message)}</div>`;
+    els.workspaceImport.disabled = false;
+    els.workspaceImport.textContent = "导入工作台";
+  }
 }
 
 async function rerunWithEditedWindow(options = {}) {
@@ -457,6 +500,7 @@ els.refresh.addEventListener("click", () => {
 
 els.rerun?.addEventListener("click", () => rerunWithEditedWindow());
 els.useActualWindow?.addEventListener("click", () => useActualWindow());
+els.workspaceImport?.addEventListener("click", () => importWorkspaceForRun());
 
 loadReport().catch((err) => {
   els.status.innerHTML = `<div class="status error">${escapeHtml(err.message)}</div>`;

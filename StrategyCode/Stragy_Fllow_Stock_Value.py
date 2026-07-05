@@ -748,6 +748,25 @@ def _run_strategy(usedata: _UseDataProxy, anchor_company: str, rank_position: in
         "manual_pause_open": manual_pause_open,
         "force_flat": force_flat,
     }
+    metrics_meta = {
+        "gap_up": {"kind": "continuous", "label": "Gap Up", "unit": "ratio"},
+        "gap_down": {"kind": "continuous", "label": "Gap Down", "unit": "ratio"},
+        "hold_buffer_yes": {"kind": "continuous", "label": "Hold Buffer Yes", "unit": "ratio"},
+        "recover_buffer_no": {"kind": "continuous", "label": "Recover Buffer No", "unit": "ratio"},
+        "day_to_end": {"kind": "continuous", "label": "Days To End", "unit": "days"},
+        "yes_full_on": {"kind": "continuous", "label": "Yes Full On", "unit": "ratio"},
+        "yes_off": {"kind": "continuous", "label": "Yes Off", "unit": "ratio"},
+        "no_full_on": {"kind": "continuous", "label": "No Full On", "unit": "ratio"},
+        "no_off": {"kind": "continuous", "label": "No Off", "unit": "ratio"},
+        "risk_scale": {"kind": "continuous", "label": "Risk Scale", "unit": "ratio"},
+        "decision": {"kind": "state", "label": "Decision"},
+        "fact_state": {"kind": "state", "label": "Fact State"},
+        "pos_state": {"kind": "state", "label": "Position State"},
+        "target_state": {"kind": "state", "label": "Target State"},
+        "next_state": {"kind": "state", "label": "Next State"},
+        "manual_pause_open": {"kind": "state", "label": "Manual Pause Open"},
+        "force_flat": {"kind": "state", "label": "Force Flat"},
+    }
 
     summary_inputs = [
         "[INPUT]",
@@ -818,6 +837,7 @@ def _run_strategy(usedata: _UseDataProxy, anchor_company: str, rank_position: in
         "schema_version": "1.0",
         "actions": actions,
         "metrics": metrics,
+        "metrics_meta": metrics_meta,
         "print": summary_inputs,
         "wake_reason": wake_reason,
         "state_updates": state_updates,

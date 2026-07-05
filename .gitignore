@@ -18,6 +18,7 @@ wheelhouse/
 dist/
 *.db
 *.db-*
+*.db.bak
 *.sqlite
 *.sqlite3
 Data/*.db
@@ -35,6 +36,7 @@ polymarket_active_markets_cache.json
 project.zip
 *.zip
 .claude/
+.datatube/
 .vscode/
 .idea/
 Thumbs.db

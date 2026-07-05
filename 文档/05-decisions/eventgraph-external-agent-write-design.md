@@ -678,6 +678,17 @@ Version History
 6. 不把策略交易判断写成事实 Edge。
 7. 不把新闻标题直接写成 verified event。
 8. 不把 correlation 写成 causation。
+9. 只使用当前 apply 引擎支持的 action：
+   event_create / event_update / event_archive / event_merge /
+   finance_create / finance_update / finance_archive /
+   edge_create / edge_update / edge_delete / finance_mapping_create /
+   expression_create / expression_update / expression_archive。
+10. 禁止提交 event_promote、tag_add、observation_link、metadata_update
+    这类伪 action；把 observation 提升到 Graph Core 时统一提交
+    event_create，并把 source_refs、evidence_summary、confidence 和
+    provenance 写进 patch item。
+11. patch validate 返回 valid=false 时不得提交 change request；系统会在
+    validate 阶段用 apply allowlist 直接拒绝无效 action。
 ```
 
 推荐 `agent_report` 结构：

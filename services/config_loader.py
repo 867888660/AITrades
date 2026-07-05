@@ -53,6 +53,7 @@ DEFAULT_AGENT_POLICY = {
         "event_read": True,
         "event_news_refresh": True,
         "event_news_search": True,
+        "event_graph_change_request": True,
     },
     "limits": {
         "max_strategy_budget_usdc": 100.0,
@@ -66,6 +67,13 @@ DEFAULT_AGENT_POLICY = {
         "allow_market_order": False,
         "require_human_approval": True,
         "approval_expires_minutes": 1440,
+    },
+    "event_graph_approval": {
+        "mode": "manual",
+        "auto_apply_actor_id": "event_graph_trusted_rule",
+        "max_items_per_request": 100,
+        "min_confidence": 0.0,
+        "require_evidence_summary": False,
     },
     "defaults": {
         "scan_categories": ["Elections Politics", "World", "Geopolitics"],
@@ -168,6 +176,47 @@ def _to_setting_int(value: Any, default: int, min_value: int = 0, max_value: int
     return result
 
 
+def _normalize_event_graph_approval(raw: Any) -> Dict[str, Any]:
+    normalized = _clone_json(DEFAULT_AGENT_POLICY["event_graph_approval"])
+    incoming = raw if isinstance(raw, dict) else {}
+    mode_aliases = {
+        "human": "manual",
+        "human_review": "manual",
+        "manual_review": "manual",
+        "low_risk": "trusted_low_risk",
+        "trusted": "trusted_all",
+        "full_trust": "trusted_all",
+        "fully_trusted": "trusted_all",
+        "complete_trust": "trusted_all",
+    }
+    mode = str(incoming.get("mode") or normalized["mode"]).strip().lower()
+    mode = mode_aliases.get(mode, mode)
+    if mode not in {"manual", "trusted_low_risk", "trusted_all"}:
+        mode = "manual"
+    normalized.update({
+        "mode": mode,
+        "auto_apply_actor_id": str(incoming.get("auto_apply_actor_id") or normalized["auto_apply_actor_id"]).strip()
+        or normalized["auto_apply_actor_id"],
+        "max_items_per_request": _to_setting_int(
+            incoming.get("max_items_per_request"),
+            int(normalized["max_items_per_request"]),
+            1,
+            1000,
+        ),
+        "min_confidence": _to_setting_float(
+            incoming.get("min_confidence"),
+            float(normalized["min_confidence"]),
+            0.0,
+            1.0,
+        ),
+        "require_evidence_summary": _to_setting_bool(
+            incoming.get("require_evidence_summary"),
+            bool(normalized["require_evidence_summary"]),
+        ),
+    })
+    return normalized
+
+
 def _normalize_agent_policy(policy: Any) -> Dict[str, Any]:
     normalized = _clone_json(DEFAULT_AGENT_POLICY)
     incoming = policy if isinstance(policy, dict) else {}
@@ -193,6 +242,10 @@ def _normalize_agent_policy(policy: Any) -> Dict[str, Any]:
         "require_human_approval": _to_setting_bool(incoming_limits.get("require_human_approval"), bool(limit_defaults["require_human_approval"])),
         "approval_expires_minutes": _to_setting_int(incoming_limits.get("approval_expires_minutes"), int(limit_defaults["approval_expires_minutes"]), 1, 43200),
     })
+
+    normalized["event_graph_approval"] = _normalize_event_graph_approval(
+        incoming.get("event_graph_approval", normalized.get("event_graph_approval", {}))
+    )
 
     incoming_defaults = incoming.get("defaults") if isinstance(incoming.get("defaults"), dict) else {}
     default_values = normalized["defaults"]

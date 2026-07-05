@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>AgentMonitor</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=agent-monitor-split-20260628">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=agent-monitor-graph-review-20260704b">
   </head>
   <body>
     <div class="app-shell">
@@ -104,8 +104,6 @@
                       <option value="expression_create">expression_create</option>
                       <option value="expression_update">expression_update</option>
                       <option value="expression_archive">expression_archive</option>
-                      <option value="observation_link">observation_link</option>
-                      <option value="metadata_update">metadata_update</option>
                     </select>
                   </label>
                   <label>
@@ -148,7 +146,12 @@
                     <h3>Change Requests</h3>
                     <p class="muted">外部 agent 提交的 EventGraph 修改请求，等待校验、修改或人工审核。</p>
                   </div>
-                  <span id="agentInternalCount" class="badge">0</span>
+                  <div class="agent-activity-head-actions">
+                    <button id="graphChangeApproveApplyReadyBtn" class="mini primary" type="button" disabled>批量批准并应用</button>
+                    <button id="graphChangeApplyApprovedBtn" class="mini ghost" type="button" disabled>应用已批准</button>
+                    <button id="graphChangeRejectBlockedBtn" class="mini danger" type="button" disabled>拒绝不可应用</button>
+                    <span id="agentInternalCount" class="badge">0</span>
+                  </div>
                 </div>
                 <div id="agentInternalList" class="agent-list"></div>
               </article>
@@ -248,6 +251,6 @@
         </div>
       </main>
     </div>
-    <script src="{{ url_for('static', filename='agent_monitor.js') }}?v=agent-monitor-split-20260628"></script>
+    <script src="{{ url_for('static', filename='agent_monitor.js') }}?v=agent-monitor-graph-review-20260704b"></script>
   </body>
 </html>

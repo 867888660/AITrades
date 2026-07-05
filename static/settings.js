@@ -59,6 +59,7 @@ function fillAgentPolicy(agentPolicy) {
   const limits = agent.limits || {};
   const defaults = agent.defaults || {};
   const permissions = agent.permissions || {};
+  const eventGraphApproval = agent.event_graph_approval || {};
 
   setChecked("agentEnabled", agent.enabled !== false);
   setChecked("agentRequireHumanApproval", limits.require_human_approval !== false);
@@ -79,6 +80,11 @@ function fillAgentPolicy(agentPolicy) {
   setSelectValue("agentSelectionMode", defaults.selection_mode || "yes", "yes");
   setValue("agentScanCategories", arrayToLines(defaults.scan_categories || ["Elections Politics", "World", "Geopolitics"]));
   setValue("agentScanSorts", arrayToLines(defaults.scan_sorts || ["volume24h", "volume", "liquidity", "spread"]));
+  setSelectValue("eventGraphApprovalMode", eventGraphApproval.mode || "manual", "manual");
+  setValue("eventGraphAutoApplyActorId", eventGraphApproval.auto_apply_actor_id || "event_graph_trusted_rule");
+  setValue("eventGraphMaxItemsPerRequest", eventGraphApproval.max_items_per_request ?? 100);
+  setValue("eventGraphMinConfidence", eventGraphApproval.min_confidence ?? 0);
+  setChecked("eventGraphRequireEvidenceSummary", eventGraphApproval.require_evidence_summary);
 
   document.querySelectorAll("[data-agent-permission]").forEach((input) => {
     input.checked = permissions[input.dataset.agentPermission] !== false;
@@ -117,6 +123,13 @@ function buildAgentPolicyPayload() {
       proposal_single_order_usdc: getValue("agentProposalSingleOrderUsdc"),
       max_batch_drafts: getValue("agentMaxBatchDrafts"),
       selection_mode: getValue("agentSelectionMode", "yes"),
+    },
+    event_graph_approval: {
+      mode: getValue("eventGraphApprovalMode", "manual"),
+      auto_apply_actor_id: getValue("eventGraphAutoApplyActorId", "event_graph_trusted_rule").trim(),
+      max_items_per_request: getValue("eventGraphMaxItemsPerRequest"),
+      min_confidence: getValue("eventGraphMinConfidence"),
+      require_evidence_summary: getChecked("eventGraphRequireEvidenceSummary"),
     },
   };
 }

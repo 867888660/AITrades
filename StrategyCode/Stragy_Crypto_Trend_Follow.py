@@ -246,19 +246,44 @@ def _run_strategy(usedata, params):
             "reason": reason,
         })
 
+    decision = "SET_TARGET" if actions else "HOLD"
+    position_state = "flat" if abs(current_pos) <= 1e-9 else "long"
+    trend_state = "uptrend" if trend_ratio >= entry_z else ("exit_zone" if trend_ratio <= exit_z else "neutral")
+    risk_state = reason if reason in {"stop_loss", "trailing_stop", "missing_price_history"} else "normal"
+    metrics = {
+        "close": close,
+        "fast_ema": fast,
+        "slow_ema": slow,
+        "trend_ratio": trend_ratio,
+        "pnl_pct": pnl_pct,
+        "drawdown_pct": drawdown_pct,
+        "target_position": target,
+        "decision": decision,
+        "reason": reason,
+        "position_state": position_state,
+        "trend_state": trend_state,
+        "risk_state": risk_state,
+    }
+    metrics_meta = {
+        "close": {"kind": "continuous", "label": "Close", "unit": "price", "panel": "metric_values"},
+        "fast_ema": {"kind": "continuous", "label": "Fast EMA", "unit": "price", "panel": "metric_values"},
+        "slow_ema": {"kind": "continuous", "label": "Slow EMA", "unit": "price", "panel": "metric_values"},
+        "trend_ratio": {"kind": "continuous", "label": "Trend Ratio", "unit": "ratio", "panel": "metric_values"},
+        "pnl_pct": {"kind": "continuous", "label": "PnL %", "unit": "ratio", "panel": "metric_values"},
+        "drawdown_pct": {"kind": "continuous", "label": "Drawdown %", "unit": "ratio", "panel": "metric_values"},
+        "target_position": {"kind": "continuous", "label": "Target Position", "unit": "ratio", "panel": "metric_values"},
+        "decision": {"kind": "state", "label": "Decision", "panel": "metric_states"},
+        "reason": {"kind": "state", "label": "Decision Reason", "panel": "metric_states"},
+        "position_state": {"kind": "state", "label": "Position State", "panel": "metric_states"},
+        "trend_state": {"kind": "state", "label": "Trend State", "panel": "metric_states"},
+        "risk_state": {"kind": "state", "label": "Risk State", "panel": "metric_states"},
+    }
+
     return {
         "schema_version": "1.0",
         "actions": actions,
-        "metrics": {
-            "close": close,
-            "fast_ema": fast,
-            "slow_ema": slow,
-            "trend_ratio": trend_ratio,
-            "pnl_pct": pnl_pct,
-            "drawdown_pct": drawdown_pct,
-            "target_position": target,
-            "reason": reason,
-        },
+        "metrics": metrics,
+        "metrics_meta": metrics_meta,
         "print": [
             f"close={close}",
             f"fast_ema={fast} slow_ema={slow} trend_ratio={trend_ratio}",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -285,6 +286,7 @@ def _normalize_market(raw: Dict[str, Any], category: str = "Unknown", event: Dic
 
     event = event or {}
     event_slug = raw.get("eventSlug") or raw.get("event_slug") or event.get("slug")
+    event_title = raw.get("eventTitle") or raw.get("event_title") or event.get("title")
     group_item_title = raw.get("groupItemTitle")
     raw_url = raw.get("url")
     market_url = raw_url
@@ -304,6 +306,7 @@ def _normalize_market(raw: Dict[str, Any], category: str = "Unknown", event: Dic
         "condition_id": raw.get("conditionId"),
         "slug": raw.get("slug"),
         "event_slug": event_slug,
+        "event_title": event_title,
         "group_item_title": group_item_title,
         "url": market_url,
         "question": raw.get("question"),
@@ -425,6 +428,19 @@ def _cached_market_index_from_markets(markets: List[Dict[str, Any]]) -> Dict[str
     index = _market_index_from_markets(markets)
     _market_index_cache.update(ts=cache_ts, count=cache_count, index=index)
     return index
+
+
+def _find_unique_condition_prefix(indexes: List[Dict[str, Dict[str, Any]]], value: str) -> Dict[str, Any] | None:
+    prefix = str(value or "").strip().lower()
+    if not prefix or len(prefix) < 8:
+        return None
+    matches: Dict[str, Dict[str, Any]] = {}
+    for index in indexes:
+        for condition_id, market in (index.get("by_condition_id") or {}).items():
+            condition_text = str(condition_id or "").strip()
+            if condition_text.lower().startswith(prefix):
+                matches[condition_text] = market
+    return next(iter(matches.values())) if len(matches) == 1 else None
 
 
 def _dictionary_market(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -799,6 +815,7 @@ def _market_haystack(market: Dict[str, Any]) -> str:
         [
             str(market.get("question", "")),
             str(market.get("slug", "")),
+            str(market.get("event_title", "")),
             str(market.get("category", "")),
             str(market.get("condition_id", "")),
             str(market.get("yes_token", "")),
@@ -809,35 +826,282 @@ def _market_haystack(market: Dict[str, Any]) -> str:
     ).lower()
 
 
+_ORDINAL_ALIASES = {
+    "1st": "first",
+    "first": "1st",
+    "2nd": "second",
+    "second": "2nd",
+    "3rd": "third",
+    "third": "3rd",
+    "4th": "fourth",
+    "fourth": "4th",
+    "5th": "fifth",
+    "fifth": "5th",
+    "6th": "sixth",
+    "sixth": "6th",
+    "7th": "seventh",
+    "seventh": "7th",
+    "8th": "eighth",
+    "eighth": "8th",
+    "9th": "ninth",
+    "ninth": "9th",
+    "10th": "tenth",
+    "tenth": "10th",
+}
+_QUERY_TOKEN_ALIASES = {
+    "aapl": ["apple"],
+    "amzn": ["amazon"],
+    "googl": ["alphabet", "google"],
+    "google": ["alphabet"],
+    "meta": ["facebook"],
+    "msft": ["microsoft"],
+    "nvda": ["nvidia"],
+    "spcx": ["spacex", "space"],
+    "tsla": ["tesla"],
+}
+_ORDINAL_TOKENS = set(_ORDINAL_ALIASES.keys())
+_MONTH_SLUG_PARTS = {
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+}
+_SERIES_TIME_MARKERS = {"end", "on", "by", "before", "after", "in", "during"}
+_SERIES_TRAILING_FILLERS = {"end", "of", "on", "by", "before", "after", "in", "during", "the"}
+
+
+def _query_token_variants(token: str) -> List[str]:
+    variants = [token]
+    alias = _ORDINAL_ALIASES.get(token)
+    if alias and alias not in variants:
+        variants.append(alias)
+    for alias in _QUERY_TOKEN_ALIASES.get(token, []):
+        if alias not in variants:
+            variants.append(alias)
+    return variants
+
+
 def _query_matches_haystack(tokens: List[str], haystack: str) -> bool:
     """All tokens must appear in haystack (AND logic)."""
-    return all(token in haystack for token in tokens)
+    return all(any(variant in haystack for variant in _query_token_variants(token)) for token in tokens)
 
 
 def _tokenize_query(query: str) -> List[str]:
     """Split query into lowercase tokens, filtering empty strings and noise words."""
     _NOISE = {"x", "vs", "v", "or", "and", "the", "a", "an", "of", "in", "on", "to", "for", "-", "/", "&", "|"}
-    raw = [t for t in query.strip().lower().split() if t]
+    raw = re.findall(r"[a-z0-9]+", query.strip().lower())
     # Keep noise words only if they are the sole token
     if len(raw) <= 1:
         return raw
     return [t for t in raw if t not in _NOISE]
 
 
+def _query_slug_seed(query: str) -> str:
+    text = str(query or "").strip()
+    match = re.search(r"(?:https?://)?(?:www\.)?polymarket\.com/event/([^/?#\s]+)", text, flags=re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return text
+
+
+def _slugify_query(query: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", _query_slug_seed(query).strip().lower()).strip("-")
+
+
+def _append_unique(items: List[str], value: str, *, max_len: int | None = None) -> None:
+    value = str(value or "").strip("-")
+    if not value or value in items:
+        return
+    if max_len is not None and len(items) >= max_len:
+        return
+    items.append(value)
+
+
+def _slug_alias_variants(slug: str, *, max_len: int = 12) -> List[str]:
+    parts = [part for part in str(slug or "").split("-") if part]
+    if not parts:
+        return []
+    variants: List[str] = []
+    _append_unique(variants, "-".join(parts), max_len=max_len)
+    for idx, part in enumerate(parts):
+        alias = _ORDINAL_ALIASES.get(part)
+        if not alias:
+            continue
+        alt = list(parts)
+        alt[idx] = alias
+        _append_unique(variants, "-".join(alt), max_len=max_len)
+    return variants
+
+
 def _query_to_slug_candidates(query: str) -> List[str]:
     """Convert user query text into possible Gamma event slug candidates."""
-    import re
-    text = query.strip().lower()
-    # Replace common separators with hyphens
-    slug_base = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
-    if not slug_base:
+    slug_base = _slugify_query(query)
+    slug_bases = _slug_alias_variants(slug_base)
+    if not slug_bases:
         return []
-    candidates = [slug_base]
+    candidates: List[str] = []
     # Try with common suffixes that Polymarket uses for multi-outcome events
-    for suffix in ["-by", "-before", "-in-2026", "-in-2027", "-before-2027"]:
-        if not slug_base.endswith(suffix):
-            candidates.append(slug_base + suffix)
+    for base in slug_bases:
+        _append_unique(candidates, base)
+        for suffix in ["-by", "-before", "-in-2026", "-in-2027", "-before-2027"]:
+            if not base.endswith(suffix):
+                _append_unique(candidates, base + suffix)
     return candidates
+
+
+def _trim_series_slug_parts(parts: List[str]) -> List[str]:
+    trimmed = list(parts)
+    while trimmed and (trimmed[-1] in _SERIES_TRAILING_FILLERS or trimmed[-1].isdigit()):
+        trimmed.pop()
+    return trimmed
+
+
+def _series_slug_candidates(query: str) -> List[str]:
+    """Infer Gamma series slugs from natural event titles such as "2nd Largest Company end of July"."""
+    slug_base = _slugify_query(query)
+    candidates: List[str] = []
+    for slug in _slug_alias_variants(slug_base, max_len=16):
+        parts = [part for part in slug.split("-") if part]
+        if not parts:
+            continue
+        _append_unique(candidates, slug, max_len=24)
+        for idx, part in enumerate(parts):
+            if part in _SERIES_TIME_MARKERS or part in _MONTH_SLUG_PARTS:
+                _append_unique(candidates, "-".join(_trim_series_slug_parts(parts[:idx])), max_len=24)
+        for idx, part in enumerate(parts):
+            if part != "largest":
+                continue
+            for end_idx in range(idx + 1, min(len(parts), idx + 5)):
+                if parts[end_idx] != "company":
+                    continue
+                start_idx = idx - 1 if idx > 0 and parts[idx - 1] in _ORDINAL_TOKENS else idx
+                _append_unique(candidates, "-".join(parts[start_idx : end_idx + 1]), max_len=24)
+                _append_unique(candidates, "-".join(parts[idx : end_idx + 1]), max_len=24)
+    return candidates
+
+
+def _gamma_payload_items(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        return [item for item in payload["data"] if isinstance(item, dict)]
+    return []
+
+
+def _event_category(event: Dict[str, Any]) -> str:
+    tags = event.get("tags") or []
+    if tags and isinstance(tags[0], dict):
+        return str(tags[0].get("label") or "Unknown")
+    return "Unknown"
+
+
+def _gamma_event_haystack(event: Dict[str, Any]) -> str:
+    chunks = [
+        str(event.get("title", "")),
+        str(event.get("question", "")),
+        str(event.get("slug", "")),
+        str(event.get("ticker", "")),
+        str(event.get("description", "")),
+    ]
+    for tag in event.get("tags") or []:
+        if isinstance(tag, dict):
+            chunks.extend([str(tag.get("label", "")), str(tag.get("slug", ""))])
+    for series in event.get("series") or []:
+        if isinstance(series, dict):
+            chunks.extend([str(series.get("title", "")), str(series.get("slug", ""))])
+    for market in event.get("markets") or []:
+        if isinstance(market, dict):
+            chunks.extend(
+                [
+                    str(market.get("question", "")),
+                    str(market.get("slug", "")),
+                    str(market.get("groupItemTitle", "")),
+                ]
+            )
+    return " ".join(chunks).lower()
+
+
+def _markets_from_gamma_events(
+    events: List[Dict[str, Any]],
+    limit: int,
+    seen_cids: set | None = None,
+    tokens: List[str] | None = None,
+) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    seen = seen_cids if seen_cids is not None else set()
+    for event in events:
+        category = _event_category(event)
+        event_markets: List[Dict[str, Any]] = []
+        for market in event.get("markets") or []:
+            if not isinstance(market, dict):
+                continue
+            if market.get("closed") or not market.get("active", True):
+                continue
+            cid = str(market.get("conditionId") or "").strip()
+            if cid and cid in seen:
+                continue
+            event_markets.append(_normalize_market(market, category=category, event=event))
+        market_matches = [item for item in event_markets if tokens and _query_matches_haystack(tokens, _market_haystack(item))]
+        for norm in market_matches or event_markets:
+            cid = str(norm.get("condition_id") or "").strip()
+            if cid and cid in seen:
+                continue
+            if cid:
+                seen.add(cid)
+            results.append(norm)
+            if len(results) >= limit:
+                return results
+    return results
+
+
+def _gamma_series_search(query: str, limit: int = 30) -> List[Dict[str, Any]]:
+    """Use Gamma series lookup when ordinary search misses recurring event titles."""
+    tokens = _tokenize_query(query)
+    candidates = _series_slug_candidates(query)
+    if not tokens or not candidates:
+        return []
+    results: List[Dict[str, Any]] = []
+    seen_cids: set = set()
+    seen_series: set = set()
+    for candidate in candidates:
+        try:
+            resp = SESSION.get(
+                f"{GAMMA_API}/series",
+                params={"slug": candidate},
+                timeout=min(get_timeout(), 5.0),
+            )
+            resp.raise_for_status()
+            series_items = _gamma_payload_items(resp.json())
+        except Exception:
+            continue
+        for series in series_items:
+            series_slug = str(series.get("slug") or "").strip()
+            if not series_slug or series_slug in seen_series:
+                continue
+            seen_series.add(series_slug)
+            try:
+                resp = SESSION.get(
+                    f"{GAMMA_API}/events",
+                    params={"series_slug": series_slug, "limit": 100},
+                    timeout=min(get_timeout(), 8.0),
+                )
+                resp.raise_for_status()
+                events = _gamma_payload_items(resp.json())
+            except Exception:
+                continue
+            matched_events = [event for event in events if _query_matches_haystack(tokens, _gamma_event_haystack(event))]
+            results.extend(_markets_from_gamma_events(matched_events, limit - len(results), seen_cids, tokens=tokens))
+            if len(results) >= limit:
+                return results[:limit]
+    return results[:limit]
 
 
 def _gamma_text_search(query: str, limit: int = 30) -> List[Dict[str, Any]]:
@@ -884,6 +1148,11 @@ def _gamma_text_search(query: str, limit: int = 30) -> List[Dict[str, Any]]:
                 break
         except Exception:
             continue
+
+    # Strategy 1.5: recurring events often live under a Gamma series but are
+    # poorly ranked by generic search. Example: "2nd Largest Company end of July".
+    if not results:
+        results.extend(_gamma_series_search(query, limit=limit))
 
     # Strategy 2: Try /markets with broader fetch + local filter
     if not results:
@@ -937,9 +1206,12 @@ def _search_dictionary_db(tokens: List[str], category_tokens: List[str], limit: 
         where_parts = []
         params: list = []
         for token in tokens:
-            pattern = f"%{token}%"
-            where_parts.append("(question LIKE ? OR Translation LIKE ? OR Subject LIKE ? OR url LIKE ?)")
-            params.extend([pattern, pattern, pattern, pattern])
+            token_parts = []
+            for variant in _query_token_variants(token):
+                pattern = f"%{variant}%"
+                token_parts.append("(question LIKE ? OR Translation LIKE ? OR Subject LIKE ? OR url LIKE ?)")
+                params.extend([pattern, pattern, pattern, pattern])
+            where_parts.append("(" + " OR ".join(token_parts) + ")")
         if category_tokens:
             cat_conditions = " OR ".join(["Subject LIKE ?" for _ in category_tokens])
             where_parts.append(f"({cat_conditions})")
@@ -1254,6 +1526,13 @@ def resolve_market_selection(
     source = "cache" if markets else "empty"
     if condition_text:
         selected = (market_index.get("by_condition_id") or {}).get(condition_text)
+        if selected is None:
+            dictionary_index = _load_dictionary_market_index()
+            selected = (dictionary_index.get("by_condition_id") or {}).get(condition_text)
+            if selected is None:
+                selected = _find_unique_condition_prefix([market_index, dictionary_index], condition_text)
+            if selected is not None:
+                source = "prefix" if str(selected.get("condition_id") or "").strip() != condition_text else "dictionary"
     if selected is None and token_text:
         selected = (market_index.get("by_token") or {}).get(token_text)
 
@@ -2702,6 +2981,9 @@ def _match_strategy_market_with_source(
         matched = (dictionary_index.get("by_condition_id") or {}).get(condition_id)
         if matched:
             return matched, "dictionary"
+        matched = _find_unique_condition_prefix([active_index, dictionary_index], condition_id)
+        if matched:
+            return matched, "prefix"
 
     for token in [str(item.get("yes_token") or "").strip(), str(item.get("no_token") or "").strip()]:
         if not token:
@@ -2719,6 +3001,9 @@ def _match_strategy_market(item: Dict[str, Any], market_index: Dict[str, Dict[st
     condition_id = str(item.get("condition_id") or "").strip()
     if condition_id:
         matched = (market_index.get("by_condition_id") or {}).get(condition_id)
+        if matched:
+            return matched
+        matched = _find_unique_condition_prefix([market_index], condition_id)
         if matched:
             return matched
 
@@ -2962,9 +3247,10 @@ def _strategy_conn_and_table() -> tuple[sqlite3.Connection, str]:
 
 def _ensure_strategy_editable_columns(conn: sqlite3.Connection, table: str) -> None:
     cols = {str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()}
+    cols_normalized = {col.lower() for col in cols}
     changed = False
     for field in STRATEGY_EDITABLE_FIELDS:
-        if field not in cols:
+        if field.lower() not in cols_normalized:
             conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{field}" TEXT')
             changed = True
     if changed:
@@ -3164,21 +3450,32 @@ def fetch_strategy_detail(row_id: int, allow_remote_positions: bool = True) -> D
         _strat = strategy_data_source.get_strategy(row_id)
     except Exception:
         _strat = None
+    if not _strat:
+        try:
+            from services.history_data_service import get_backtest_workspace_strategy
+
+            _strat = get_backtest_workspace_strategy(row_id)
+        except Exception:
+            _strat = None
     if _strat:
         item = strategy_data_source.strategy_to_flat_dict(_strat)
         item_row_id = item.pop("row_id", row_id)
         # Virtual 模式：从 strategy_virtual_positions 注入持仓
         is_virtual = str(_strat.get("mode") or _strat.get("state") or "").strip().lower() == "virtual"
+        is_backtest_snapshot = str(_strat.get("_snapshot_source") or "").strip() == "backtest_history"
         if is_virtual:
             _inject_virtual_positions(item, int(row_id))
-        if is_virtual or not allow_remote_positions:
+        if is_virtual or is_backtest_snapshot or not allow_remote_positions:
             _matched = _match_strategy_market(item, _load_strategy_market_index())
             result = _build_strategy_item(item, _matched, row_id=item_row_id, include_realtime_prices=True)
             _recompute_strategy_metrics(result)
             result["position_source"] = result.get("position_source") or ("virtual" if is_virtual else None)
             result["display_name"] = _build_strategy_display_name(result, row_id=item_row_id)
-            result["table"] = "strategy_registry"
-            result["price_source"] = result.get("price_source") or "strategy_registry"
+            result["table"] = "backtest_history_snapshot" if is_backtest_snapshot else "strategy_registry"
+            result["price_source"] = result.get("price_source") or ("backtest_history_snapshot" if is_backtest_snapshot else "strategy_registry")
+            if is_backtest_snapshot:
+                result["snapshot_source"] = "backtest_history"
+                result["snapshot_run_id"] = _strat.get("_snapshot_run_id")
             try:
                 state_bundle = strategy_data_source.read_strategy_state_bundle(int(row_id))
             except Exception:

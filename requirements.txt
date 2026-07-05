@@ -2,3 +2,7 @@ Flask
 flask-sock
 requests
 cryptography
+pymongo
+tqdm
+websockets
+websockets-proxy

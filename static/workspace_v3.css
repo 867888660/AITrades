@@ -845,6 +845,71 @@ html, body {
   gap: 8px;
 }
 
+.workspace-backtest-analysis {
+  display: grid;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.workspace-backtest-analysis-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.workspace-backtest-equity-chart {
+  width: 100%;
+  min-height: 220px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.4);
+}
+
+.workspace-backtest-empty {
+  display: grid;
+  place-items: center;
+  min-height: 80px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.workspace-backtest-table-scroll {
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.workspace-backtest-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.workspace-backtest-table th,
+.workspace-backtest-table td {
+  padding: 5px 6px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.workspace-backtest-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: rgba(15, 23, 42, 0.94);
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.workspace-backtest-table .num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 /* --- Debug --- */
 .ws3-debug-header {
   display: flex;
@@ -1075,6 +1140,72 @@ html, body {
   flex: 1;
   min-height: 0 !important;
   height: auto !important;
+}
+
+.workspace-chart-insights {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+  margin: 4px 0 8px;
+}
+
+.workspace-chart-insight-group {
+  min-width: 0;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  background: rgba(15, 23, 42, 0.56);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.workspace-chart-insight-title {
+  color: #9db2d1;
+  font-size: 11px;
+  font-weight: 700;
+  margin-bottom: 6px;
+  text-transform: uppercase;
+}
+
+.workspace-chart-insight-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.workspace-chart-insight-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-height: 24px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 6px;
+  background: rgba(2, 6, 23, 0.46);
+  padding: 3px 7px;
+  color: #dbeafe;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+}
+
+.workspace-chart-insight-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  flex: 0 0 auto;
+  background: #60a5fa;
+}
+
+.workspace-chart-insight-label {
+  color: #9db2d1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-chart-insight-value {
+  color: #f8fafc;
+  font-weight: 700;
+  white-space: nowrap;
 }
 
 .workspace-chart-resize-readout {

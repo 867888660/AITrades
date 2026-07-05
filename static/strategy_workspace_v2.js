@@ -7,6 +7,7 @@ const workspaceCharts = document.getElementById("workspaceCharts");
 const workspaceEvents = document.getElementById("workspaceEvents");
 const workspaceSources = document.getElementById("workspaceSources");
 const workspaceBacktest = document.getElementById("workspaceBacktest");
+const workspaceChartInsights = document.getElementById("workspaceChartInsights");
 const settingsForm = document.getElementById("workspaceSettingsForm");
 const settingsMessage = document.getElementById("workspaceSettingsMessage");
 const chartFrom = document.getElementById("chartFrom");
@@ -40,6 +41,55 @@ const workspaceDebugMeta = document.getElementById("workspaceDebugMeta");
 const workspaceDebugLog = document.getElementById("workspaceDebugLog");
 const workspaceDebugClearBtn = document.getElementById("workspaceDebugClearBtn");
 const marketUi = window.PolyMarketUi;
+const workspaceUrlParams = new URLSearchParams(window.location.search);
+let workspaceViewMode = workspaceUrlParams.get("source") === "backtest" ? "backtest" : "live";
+let selectedBacktestRunId = workspaceUrlParams.get("run_id") || "";
+let selectedBacktestResults = null;
+let backtestWindowAppliedForRun = "";
+let workspaceBacktestEquityChart = null;
+
+const PARAM_LABELS = {
+  entry_z: "入场 Z 分数",
+  exit_z: "离场 Z 分数",
+  fast_window: "快线窗口",
+  slow_window: "慢线窗口",
+  fee_bps: "手续费",
+  initial_cash: "初始资金",
+  stop_loss_pct: "止损比例",
+  trailing_stop_pct: "移动止损",
+  target_position: "目标仓位",
+  fair_price: "合理价格",
+  entry_edge: "入场边际",
+  bankroll: "资金规模",
+  strategy_bankroll: "策略资金",
+};
+const PARAM_HINTS = {
+  entry_z: "价格偏离趋势均值达到这个 Z 分数才允许开仓；数值越高，信号越少。",
+  exit_z: "价格回归到这个 Z 分数以内时离场；数值越低，持仓更久。",
+  fast_window: "短周期趋势窗口，越小越敏感。",
+  slow_window: "长周期趋势窗口，越大越平滑。",
+  fee_bps: "单边手续费，1 bps = 0.01%。",
+  initial_cash: "回测或模拟账户的初始现金。",
+  stop_loss_pct: "从入场或峰值回撤达到该比例时触发止损。",
+  trailing_stop_pct: "盈利后按最高价回撤比例跟踪离场。",
+  target_position: "目标持仓比例，1 表示满仓，0.5 表示半仓。",
+};
+const PARAM_GROUPS = [
+  { key: "signal", title: "信号参数", keys: ["entry_z", "exit_z", "fast_window", "slow_window", "fair_price", "entry_edge"] },
+  { key: "risk", title: "风控与交易", keys: ["target_position", "stop_loss_pct", "trailing_stop_pct", "fee_bps"] },
+  { key: "capital", title: "资金", keys: ["initial_cash", "bankroll", "strategy_bankroll"] },
+];
+const SERIES_LABEL_OVERRIDES = {
+  backtest_position_ratio: "回测仓位比例",
+  backtest_position_qty: "回测持仓数量",
+  backtest_equity: "回测权益",
+  backtest_pnl: "回测 PnL",
+  backtest_return: "回测收益率",
+  backtest_drawdown: "回测回撤",
+  strategy_pnl: "策略 PnL",
+  strategy_bankroll: "策略资金",
+  initial_capital: "初始资金",
+};
 
 const EVENT_TIMELINE_CATEGORIES = [
   { key: "print", label: "Print", color: "#94a3b8", lane: 0 },
@@ -75,6 +125,16 @@ function looksLikeDateTimeText(value) {
 }
 function isStateLaneMetricDisplayable(item = {}) {
   return !isTemporalStateLaneKey(item.key) && !looksLikeDateTimeText(item.latest_value);
+}
+function isBacktestDerivedMetricItem(item = {}) {
+  const source = item?.meta && typeof item.meta === "object" ? item.meta.source : "";
+  return source === "backtest_derived" || String(item.key || "").startsWith("backtest_");
+}
+function isBacktestDerivedSeries(item = {}) {
+  return item.category === "backtest_metric" || item.panel === "backtest_metrics" || String(item.metric_key || item.key || "").includes("backtest_");
+}
+function isBacktestDerivedLane(lane = {}) {
+  return String(lane.key || "").startsWith("backtest_") || lane.panel === "backtest_states";
 }
 function isStateLaneDisplayable(lane = {}) {
   return !isTemporalStateLaneKey(stateLaneIdentity(lane));
@@ -184,9 +244,9 @@ const OVERLAY_FIELD_LABELS = {
   max_supply: "MaxSupply",
 };
 const CHART_MODE_CONFIG = {
-  compact: { label: "紧凑", height: 420, gap: 3, topStart: 10, usable: 76 },
-  standard: { label: "标准", height: 520, gap: 4, topStart: 8, usable: 82 },
-  relaxed: { label: "舒展", height: 640, gap: 5, topStart: 7, usable: 86 },
+  compact: { label: "紧凑", height: 520, gap: 2.5, topStart: 8, usable: 80 },
+  standard: { label: "标准", height: 680, gap: 3, topStart: 7, usable: 84 },
+  relaxed: { label: "舒展", height: 860, gap: 3.5, topStart: 6, usable: 87 },
 };
 const CHART_HEIGHT_STORAGE_KEY = "workspaceChartHeight";
 const CHART_MIN_HEIGHT = 420;
@@ -221,7 +281,7 @@ const AUTO_SERIES_COLORS = [
 ];
 const LEGACY_OVERLAY_AUTO_COLORS = new Set(["#a78bfa", "#ff0000", "#ff0a0a"]);
 const PANEL_WEIGHTS = {
-  main: 52,
+  main: 76,
   positions: 12,
   sizes: 12,
   averages: 12,
@@ -231,10 +291,10 @@ const PANEL_WEIGHTS = {
   market_volume: 14,
   market_supply: 14,
   indicator_macd: 14,
-  metric_values: 14,
+  metric_values: 12,
   metric_states: 10,
-  metric_state_lane: 8,
-  event_timeline: 16,
+  metric_state_lane: 7,
+  event_timeline: 10,
 };
 const DELTA_STREAM_INTERVALS = {
   price: 2000,
@@ -258,6 +318,8 @@ const TIMELINE_RANGE_MS = {
   "1d": 24 * 60 * 60 * 1000,
   "3d": 3 * 24 * 60 * 60 * 1000,
   "1w": 7 * 24 * 60 * 60 * 1000,
+  "14d": 14 * 24 * 60 * 60 * 1000,
+  "90d": 90 * 24 * 60 * 60 * 1000,
 };
 const LEGACY_RANGE_MAP = {
   "24h": "1d",
@@ -276,6 +338,7 @@ let trackedMarkets = [];
 let marketResults = [];
 let chartDisplayMode = localStorage.getItem("workspaceChartAppearance") || "standard";
 let workspaceChartHeight = readStoredChartHeight();
+let chartHeightUserAdjusted = false;
 let seriesStyleState = loadJsonStorage("workspaceSeriesStyles", {});
 let activeQuickRange = "1d";
 let autoRefreshEnabled = true;
@@ -287,6 +350,8 @@ let currentLegendNameToKey = new Map();
 let currentChartRequestId = 0;
 let currentChartAbortController = null;
 let chartRefreshDebounceTimer = null;
+const CHART_RELOAD_DEBOUNCE_MS = 420;
+const CHART_RELOAD_BUSY_DEBOUNCE_MS = 700;
 let workspaceDebugLines = [];
 let isChartLoading = false;
 let chartViewState = {
@@ -567,9 +632,19 @@ function formatNumber(value, digits = 2) {
   return Number.isFinite(num) ? num.toLocaleString(undefined, { maximumFractionDigits: digits }) : String(value);
 }
 
+function formatCurrency(value, digits = 2, suffix = "") {
+  const text = formatNumber(value, digits);
+  return text === "-" || !suffix ? text : `${text} ${suffix}`;
+}
+
 function formatPercent(value) {
   const num = Number(value);
   return Number.isFinite(num) ? `${(num * 100).toFixed(2)}%` : "-";
+}
+
+function numericValue(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
 }
 
 function formatTime(value) {
@@ -581,6 +656,45 @@ function formatTime(value) {
     return String(value);
   }
   return `${date.getUTCFullYear()}-${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())} ${pad2(date.getUTCHours())}:${pad2(date.getUTCMinutes())}:${pad2(date.getUTCSeconds())} UTC`;
+}
+
+function normalizeParamKey(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function humanizeParamKey(value) {
+  const text = String(value || "").trim();
+  if (!text) return "-";
+  return text
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function strategyParamLabel(key, fallback = "") {
+  const normalized = normalizeParamKey(key || fallback);
+  const rawFallback = String(fallback || "").trim();
+  if (PARAM_LABELS[normalized]) return PARAM_LABELS[normalized];
+  if (rawFallback && normalizeParamKey(rawFallback) !== normalized) return rawFallback;
+  return humanizeParamKey(key || fallback);
+}
+
+function strategyParamHint(key, fallback = "") {
+  const normalized = normalizeParamKey(key);
+  return PARAM_HINTS[normalized] || fallback || "";
+}
+
+function displaySeriesLabel(item = {}) {
+  const key = String(item.key || "");
+  if (SERIES_LABEL_OVERRIDES[key]) return SERIES_LABEL_OVERRIDES[key];
+  if (item.base_key === "ohlc") return `${item.market_label || item.label || "BTCUSDT"} K线`;
+  if (item.base_key === "close") return `${item.market_label || item.label || "BTCUSDT"} 收盘价`;
+  if (item.base_key === "volume") return `${item.market_label || item.label || "BTCUSDT"} 成交量`;
+  return item.label || key || "-";
+}
+
+function isCryptoSeriesMeta(meta = {}) {
+  const source = String(meta.source_label || meta.source_detail || "").toLowerCase();
+  return source.includes("binance");
 }
 
 function workspaceStrategyMode(strategy = {}) {
@@ -671,6 +785,63 @@ function formatLocalDateTimeInput(date) {
   return `${value.getFullYear()}-${pad2(value.getMonth() + 1)}-${pad2(value.getDate())}T${pad2(value.getHours())}:${pad2(value.getMinutes())}`;
 }
 
+function backtestRunWindow(run = {}) {
+  const metrics = run.metrics || {};
+  const snapshot = run.case_snapshot || {};
+  const windowData = snapshot.data_window || {};
+  const start = metrics.period_start || metrics.requested_start || windowData.start || windowData.from || windowData.history_start || null;
+  const end = metrics.period_end || metrics.requested_end || windowData.end || windowData.to || windowData.history_end || null;
+  return { start, end };
+}
+
+function setBacktestUrlState(mode, runId = "") {
+  const url = new URL(window.location.href);
+  if (mode === "backtest" && runId) {
+    url.searchParams.set("source", "backtest");
+    url.searchParams.set("run_id", runId);
+  } else {
+    url.searchParams.delete("source");
+    url.searchParams.delete("run_id");
+  }
+  window.history.replaceState({}, "", url.toString());
+}
+
+function updateWorkspaceViewBadge() {
+  if (!workspaceAutoRefreshBadge || !workspaceAutoRefreshText) return;
+  if (workspaceViewMode === "backtest") {
+    workspaceAutoRefreshBadge.className = "state-chip pending";
+    workspaceAutoRefreshBadge.textContent = "backtest";
+    workspaceAutoRefreshText.textContent = selectedBacktestRunId
+      ? `回测视图 · Run ${selectedBacktestRunId}`
+      : "回测视图";
+  }
+}
+
+function applyBacktestWindowToChart(run = {}) {
+  if (!run?.run_id || backtestWindowAppliedForRun === String(run.run_id)) return;
+  const range = backtestRunWindow(run);
+  if (!range.start && !range.end) return;
+  if (range.start && chartFrom) {
+    chartFrom.value = formatLocalDateTimeInput(new Date(range.start));
+  }
+  if (range.end && chartTo) {
+    chartTo.value = formatLocalDateTimeInput(new Date(range.end));
+  }
+  if (chartToMode) {
+    chartToMode.value = range.end ? "specific" : "latest";
+  }
+  if (chartResolutionMode && range.start && range.end) {
+    const windowMs = Date.parse(range.end) - Date.parse(range.start);
+    if (Number.isFinite(windowMs) && windowMs > TIMELINE_RANGE_MS["14d"] && chartResolutionMode.value === "15m") {
+      chartResolutionMode.value = "auto";
+    }
+  }
+  activeQuickRange = "custom";
+  chartViewState = { start: null, end: null, startValue: null, endValue: null };
+  backtestWindowAppliedForRun = String(run.run_id);
+  updateQuickRangeButtons();
+}
+
 function formatTimelineLabel(value) {
   const date = value instanceof Date ? value : new Date(value || "");
   if (Number.isNaN(date.getTime())) {
@@ -699,7 +870,9 @@ function autoIntervalForWindowMs(windowMs) {
   if (windowMs <= TIMELINE_RANGE_MS["6h"]) return "30s";
   if (windowMs <= TIMELINE_RANGE_MS["1d"]) return "1m";
   if (windowMs <= TIMELINE_RANGE_MS["3d"]) return "5m";
-  return "15m";
+  if (windowMs <= TIMELINE_RANGE_MS["14d"]) return "15m";
+  if (windowMs <= TIMELINE_RANGE_MS["90d"]) return "1h";
+  return "4h";
 }
 
 function currentResolutionInterval() {
@@ -958,7 +1131,7 @@ function buildSeriesControlsSignature(series, payload = {}) {
 }
 
 function buildChartStructureSignature(payload) {
-  const hasEventTimeline = (payload.events || []).some((event) => event?.ts);
+  const hasEventTimeline = isEventTimelineSelected() && (payload.events || []).some((event) => event?.ts);
   const expandedPanels = expandChartPanels(payload.panels || [], payload.metric_state_lanes || [], payload.events || []);
   return JSON.stringify({
     panels: expandedPanels.map((p) => p.id),
@@ -996,8 +1169,14 @@ function repairSeriesStyleState() {
   }
 }
 
-function scheduleChartReload() {
+function scheduleChartReload(delayMs = null) {
+  if (currentChartAbortController) {
+    currentChartAbortController.abort();
+  }
   clearTimeout(chartRefreshDebounceTimer);
+  const delay = Number.isFinite(Number(delayMs))
+    ? Number(delayMs)
+    : (isChartLoading ? CHART_RELOAD_BUSY_DEBOUNCE_MS : CHART_RELOAD_DEBOUNCE_MS);
   chartRefreshDebounceTimer = setTimeout(() => {
     loadChart().catch((error) => {
       if (isAbortError(error)) {
@@ -1005,7 +1184,7 @@ function scheduleChartReload() {
       }
       setStatus(workspaceCharts, error.message);
     });
-  }, 180);
+  }, delay);
 }
 
 async function fetchJson(url, options) {
@@ -1086,7 +1265,26 @@ function summaryCard(label, value, subvalue) {
 }
 
 function marketIdentity(target) {
-  return [target.type || "", target.condition_id || "", target.yes_token || "", target.no_token || ""].join("|");
+  return [
+    target.type || "",
+    target.condition_id || "",
+    target.yes_token || "",
+    target.no_token || "",
+    target.symbol || "",
+    target.instrument_id || "",
+    target.interval || "",
+  ].join("|");
+}
+
+function isBinanceTarget(target = {}) {
+  const text = [
+    target.type,
+    target.source,
+    target.venue,
+    target.asset_class,
+    target.instrument_id,
+  ].map((value) => String(value || "").toLowerCase()).join("|");
+  return text.includes("binance") || text.includes("crypto_spot");
 }
 
 function buildStrategyTarget() {
@@ -1109,17 +1307,27 @@ function buildStrategyTarget() {
 
 function buildDefaultMarketTargets() {
   const legs = workspaceState?.market_context?.legs || [];
-  const byLeg = legs.map((leg, index) => ({
-    type: "market",
-    row_id: Number(rowId),
-    leg_index: Number.isFinite(Number(leg.leg_index)) ? Number(leg.leg_index) : index,
-    label: leg.label || `Leg ${index + 1}`,
-    question: leg.question || leg.label || `Leg ${index + 1}`,
-    condition_id: leg.condition_id || "",
-    yes_token: leg.yes_token || "",
-    no_token: leg.no_token || "",
-    is_primary: index === 0,
-  })).filter((item) => item.condition_id || item.yes_token || item.no_token);
+  const byLeg = legs.map((leg, index) => {
+    const binance = isBinanceTarget(leg);
+    const symbol = String(leg.symbol || "").toUpperCase();
+    return {
+      type: binance ? "binance" : "market",
+      source: binance ? "binance" : (leg.source || ""),
+      venue: leg.venue || (binance ? "binance" : ""),
+      asset_class: leg.asset_class || (binance ? "crypto_spot" : ""),
+      row_id: Number(rowId),
+      leg_index: Number.isFinite(Number(leg.leg_index)) ? Number(leg.leg_index) : index,
+      label: leg.label || symbol || `Leg ${index + 1}`,
+      question: leg.question || leg.label || symbol || `Leg ${index + 1}`,
+      condition_id: leg.condition_id || "",
+      yes_token: leg.yes_token || "",
+      no_token: leg.no_token || "",
+      symbol,
+      interval: leg.interval || leg.instrument_json?.interval || "1m",
+      instrument_id: leg.instrument_id || (symbol ? `crypto_spot:binance:${symbol}` : ""),
+      is_primary: index === 0,
+    };
+  }).filter((item) => item.condition_id || item.yes_token || item.no_token || item.symbol || item.instrument_id);
   return byLeg.length ? byLeg : [buildStrategyTarget()];
 }
 
@@ -1132,8 +1340,11 @@ function normalizeTrackedMarkets(list) {
     }
     const next = {
       type: String(item.type || "market"),
+      source: item.source || "",
+      venue: item.venue || "",
+      asset_class: item.asset_class || "",
       row_id: item.row_id ? Number(item.row_id) : undefined,
-      label: item.label || item.question || item.condition_id || `Market ${index + 1}`,
+      label: item.label || item.question || item.symbol || item.condition_id || `Market ${index + 1}`,
       question: item.question || item.label || "",
       slug: item.slug || item.raw?.slug || "",
       event_slug: item.event_slug || item.eventSlug || item.raw?.eventSlug || item.raw?.event_slug || "",
@@ -1142,6 +1353,9 @@ function normalizeTrackedMarkets(list) {
       condition_id: item.condition_id || "",
       yes_token: item.yes_token || "",
       no_token: item.no_token || "",
+      symbol: String(item.symbol || "").toUpperCase(),
+      interval: item.interval || "1m",
+      instrument_id: item.instrument_id || "",
       is_primary: index === 0,
     };
     const identity = marketIdentity(next);
@@ -1158,6 +1372,42 @@ function normalizeTrackedMarkets(list) {
     item.is_primary = index === 0;
   });
   trackedMarkets = result;
+  window.workspaceTrackedMarkets = trackedMarkets;
+}
+
+function primaryTrackedMarket() {
+  return trackedMarkets[0] || buildDefaultMarketTargets()[0] || buildStrategyTarget() || {};
+}
+
+function syncMainChartModeOptions() {
+  if (!chartMainSide) return;
+  const primary = primaryTrackedMarket();
+  const cryptoMode = isBinanceTarget(primary);
+  const mode = cryptoMode ? "crypto" : "binary";
+  if (chartMainSide.dataset.mode !== mode) {
+    if (cryptoMode) {
+      const label = `${primary.symbol || primary.label || "Crypto"} K线 / 成交量`;
+      chartMainSide.innerHTML = `<option value="all">${escapeHtml(label)}</option>`;
+    } else {
+      chartMainSide.innerHTML = [
+        '<option value="all">Yes + No</option>',
+        '<option value="yes">Yes</option>',
+        '<option value="no">No</option>',
+      ].join("");
+    }
+    chartMainSide.dataset.mode = mode;
+  }
+  if (cryptoMode) {
+    chartMainSide.value = "all";
+    chartMainSide.disabled = true;
+    chartMainSide.title = "Crypto leg 使用 K线、成交量、仓位和权益曲线，不适用 Yes/No 主图。";
+    return;
+  }
+  chartMainSide.disabled = false;
+  chartMainSide.title = "";
+  if (!["all", "yes", "no"].includes(chartMainSide.value)) {
+    chartMainSide.value = "all";
+  }
 }
 
 function syncMarketSelectorInputs(force = false) {
@@ -1218,15 +1468,43 @@ function setAutoRefresh(enabled) {
 
 function renderHeader(strategy) {
   workspaceTitle.textContent = strategy.display_name || strategy.strategy || "Unnamed";
-  workspaceSubtitle.textContent = `${strategy.question || "-"} | Row ${strategy.row_id || "-"} | Condition ${strategy.condition_id || "-"}`;
+  const primary = trackedMarkets[0] || buildDefaultMarketTargets()[0] || {};
+  workspaceSubtitle.textContent = isBinanceTarget(primary)
+    ? `${primary.symbol || primary.label || "-"} · ${primary.interval || "1m"} · Row ${strategy.row_id || rowId || "-"}`
+    : `${strategy.question || "-"} | Row ${strategy.row_id || "-"} | Condition ${strategy.condition_id || "-"}`;
   syncWorkspaceStateControl(strategy || {});
   syncWorkspaceMachineStateControl(strategy || {}, workspaceStateStore);
 }
 
 function renderSummary(strategy) {
+  if (typeof window.renderSummary === "function" && window.renderSummary !== renderSummary) {
+    window.renderSummary(strategy || {});
+  }
   syncWorkspaceStateControl(strategy || {});
   syncWorkspaceMachineStateControl(strategy || {}, workspaceStateStore);
-  const primary = trackedMarkets[0];
+  const primary = primaryTrackedMarket();
+  if (isBinanceTarget(primary)) {
+    const backtestRun = selectedBacktestResults?.selected_run || workspaceState?.backtest?.latest_run || null;
+    const metrics = backtestRun?.metrics || backtestRun || {};
+    const lastEquity = latestBacktestEquityPoint(backtestRun);
+    const lastMeta = lastEquity?.meta || {};
+    const pnlValue = metrics.total_return !== undefined && metrics.total_return !== null
+      ? formatPercent(metrics.total_return)
+      : formatNumber(lastEquity?.pnl ?? strategy.strategy_pnl, 2);
+    const equityValue = metrics.final_equity ?? lastEquity?.equity ?? strategy.strategy_bankroll;
+    const orderCount = Array.isArray(metrics.orders)
+      ? metrics.orders.length
+      : (metrics.orders ?? backtestRun?.orders?.length);
+    workspaceSummary.innerHTML = [
+      summaryCard("Instrument", primary.symbol || primary.label || "-", `${primary.venue || "binance"} · ${primary.interval || "1m"}`),
+      summaryCard("Mode", strategy.mode || strategy.state || "-", workspaceViewMode === "backtest" ? `Backtest run ${selectedBacktestRunId || backtestRun?.run_id || "-"}` : "Live workspace"),
+      summaryCard("Equity", formatCurrency(equityValue ?? metrics.initial_cash, 2, "USDT"), `Initial ${formatCurrency(metrics.initial_equity ?? metrics.initial_cash, 2, "USDT")}`),
+      summaryCard("Return / DD", `${pnlValue} / ${formatPercent(metrics.max_drawdown)}`, `Sharpe ${formatNumber(metrics.sharpe, 2)}`),
+      summaryCard("Position", formatPercent(lastMeta.position_ratio), `Qty ${formatNumber(lastMeta.position_qty, 8)} · Mark ${formatCurrency(lastMeta.close, 2, "USDT")}`),
+      summaryCard("Trades", formatNumber(orderCount, 0), `Legs ${trackedMarkets.length}`),
+    ].join("");
+    return;
+  }
   workspaceSummary.innerHTML = [
     summaryCard("Yes Bid / Ask", `${formatNumber(strategy.yes_bid, 4)} / ${formatNumber(strategy.yes_ask, 4)}`, `Price Source: ${strategy.price_source || "-"}`),
     summaryCard("No Bid / Ask", `${formatNumber(strategy.no_bid, 4)} / ${formatNumber(strategy.no_ask, 4)}`, `Market Updated: ${formatTime(strategy.market_updated_at)}`),
@@ -1255,26 +1533,354 @@ function renderSources(sourceStatuses) {
   }).join("");
 }
 
+function backtestEquityPoints(run = {}) {
+  return (run.equity || [])
+    .map((point) => ({
+      ...point,
+      equity_value: numericValue(point.equity),
+      pnl_value: numericValue(point.pnl),
+    }))
+    .filter((point) => point.equity_value !== null)
+    .sort((a, b) => String(a.ts_utc || "").localeCompare(String(b.ts_utc || "")));
+}
+
+function latestBacktestEquityPoint(run = {}) {
+  const points = backtestEquityPoints(run || {});
+  return points.length ? points[points.length - 1] : null;
+}
+
+function backtestPositionSnapshot(run = {}) {
+  const latest = latestBacktestEquityPoint(run);
+  const meta = latest?.meta && typeof latest.meta === "object" ? latest.meta : {};
+  return {
+    ts: latest?.ts_utc || "",
+    equity: latest?.equity,
+    cash: latest?.cash,
+    exposure: latest?.exposure,
+    pnl: latest?.pnl,
+    position_ratio: meta.position_ratio,
+    position_qty: meta.position_qty,
+    mark_price: meta.close,
+  };
+}
+
+function disposeWorkspaceBacktestChart() {
+  if (workspaceBacktestEquityChart) {
+    workspaceBacktestEquityChart.dispose();
+    workspaceBacktestEquityChart = null;
+  }
+}
+
+function renderWorkspaceBacktestEquity(run = {}) {
+  const chartEl = document.getElementById("workspaceBacktestEquityChart");
+  if (!chartEl) return;
+  const points = backtestEquityPoints(run);
+  if (!points.length) {
+    disposeWorkspaceBacktestChart();
+    chartEl.innerHTML = `<div class="workspace-backtest-empty">暂无资金曲线数据</div>`;
+    return;
+  }
+  if (!window.echarts) {
+    disposeWorkspaceBacktestChart();
+    chartEl.innerHTML = `<div class="workspace-backtest-empty">图表库未加载</div>`;
+    return;
+  }
+  disposeWorkspaceBacktestChart();
+  workspaceBacktestEquityChart = window.echarts.init(chartEl, null, { renderer: "canvas" });
+  workspaceBacktestEquityChart.setOption({
+    animation: true,
+    backgroundColor: "transparent",
+    grid: { left: 48, right: 14, top: 18, bottom: 28 },
+    tooltip: { trigger: "axis", confine: true },
+    xAxis: {
+      type: "category",
+      data: points.map((point) => point.ts_utc || ""),
+      axisLabel: { color: "#8fb3dc", hideOverlap: true },
+      axisLine: { lineStyle: { color: "rgba(148, 163, 184, 0.22)" } },
+    },
+    yAxis: {
+      type: "value",
+      scale: true,
+      axisLabel: { color: "#8fb3dc" },
+      splitLine: { lineStyle: { color: "rgba(148, 163, 184, 0.12)" } },
+    },
+    series: [{
+      name: "Equity",
+      type: "line",
+      showSymbol: false,
+      smooth: true,
+      lineStyle: { width: 2, color: "#56a7ff" },
+      areaStyle: { color: "rgba(86, 167, 255, 0.12)" },
+      data: points.map((point) => point.equity_value),
+    }],
+  }, true);
+}
+
+function renderWorkspaceBacktestOrders(run = {}) {
+  const ordersEl = document.getElementById("workspaceBacktestOrders");
+  if (!ordersEl) return;
+  const orders = (run.orders || []).slice(-12).reverse();
+  if (!orders.length) {
+    ordersEl.innerHTML = `<div class="workspace-backtest-empty">暂无订单明细</div>`;
+    return;
+  }
+  ordersEl.innerHTML = `
+    <div class="workspace-backtest-table-scroll">
+      <table class="workspace-backtest-table">
+        <thead><tr><th>Time</th><th>Instrument</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th></tr></thead>
+        <tbody>
+          ${orders.map((order) => `
+            <tr>
+              <td class="mono">${escapeHtml(formatTime(order.ts_utc))}</td>
+              <td>${escapeHtml(order.instrument_id || order.leg_id || "-")}</td>
+              <td>${escapeHtml(order.side || "-")}</td>
+              <td class="num">${escapeHtml(formatNumber(order.quantity, 8))}</td>
+              <td class="num">${escapeHtml(formatNumber(order.price, 6))}</td>
+              <td class="num">${escapeHtml(formatNumber(order.fee, 4))}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function backtestKpiCard(label, value, subvalue = "") {
+  return `
+    <div class="workspace-backtest-kpi">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value)}</strong>
+      ${subvalue ? `<small>${escapeHtml(subvalue)}</small>` : ""}
+    </div>
+  `;
+}
+
+function renderWorkspaceBacktestPositions(run = {}) {
+  const el = document.getElementById("workspaceBacktestPositions");
+  if (!el) return;
+  const snapshot = backtestPositionSnapshot(run);
+  if (!snapshot.ts) {
+    el.innerHTML = `<div class="workspace-backtest-empty">暂无仓位快照</div>`;
+    return;
+  }
+  const rows = [
+    ["时间", formatTime(snapshot.ts)],
+    ["仓位比例", formatPercent(snapshot.position_ratio)],
+    ["BTC 数量", formatNumber(snapshot.position_qty, 8)],
+    ["标记价格", formatCurrency(snapshot.mark_price, 2, "USDT")],
+    ["权益", formatCurrency(snapshot.equity, 2, "USDT")],
+    ["现金", formatCurrency(snapshot.cash, 2, "USDT")],
+    ["敞口", formatCurrency(snapshot.exposure, 2, "USDT")],
+    ["PnL", formatCurrency(snapshot.pnl, 2, "USDT")],
+  ];
+  el.innerHTML = `
+    <div class="workspace-backtest-position-grid">
+      ${rows.map(([label, value]) => `
+        <div class="workspace-backtest-position-item">
+          <span>${escapeHtml(label)}</span>
+          <strong>${escapeHtml(value)}</strong>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderWorkspaceBacktestAnalysis(run = null) {
+  if (!run) {
+    disposeWorkspaceBacktestChart();
+    return;
+  }
+  renderWorkspaceBacktestEquity(run);
+  renderWorkspaceBacktestOrders(run);
+  renderWorkspaceBacktestPositions(run);
+}
+
 function renderBacktest(backtest) {
   if (!backtest) {
     setStatus(workspaceBacktest, "Backtest placeholder is unavailable.");
     return;
   }
+  const latest = backtest.latest_run || null;
+  const selectedRun = selectedBacktestResults?.selected_run || null;
+  const selectedMetrics = selectedRun?.metrics || {};
+  const selectedWindow = selectedRun ? backtestRunWindow(selectedRun) : {};
+  const selectedLatest = selectedRun ? latestBacktestEquityPoint(selectedRun) : null;
+  const selectedOrderCount = selectedRun
+    ? (Array.isArray(selectedMetrics.orders) ? selectedMetrics.orders.length : (selectedMetrics.orders ?? selectedRun.orders?.length))
+    : null;
+  const viewTone = workspaceViewMode === "backtest" ? "pending" : "good";
+  const selectedMetricsLine = selectedRun
+    ? [
+        selectedWindow.start || selectedWindow.end ? `${formatTime(selectedWindow.start)} -> ${formatTime(selectedWindow.end)}` : "",
+        selectedMetrics.total_return !== null && selectedMetrics.total_return !== undefined ? `Return ${formatPercent(selectedMetrics.total_return)}` : "",
+        selectedMetrics.max_drawdown !== null && selectedMetrics.max_drawdown !== undefined ? `DD ${formatPercent(selectedMetrics.max_drawdown)}` : "",
+        selectedMetrics.sharpe !== null && selectedMetrics.sharpe !== undefined ? `Sharpe ${formatNumber(selectedMetrics.sharpe, 2)}` : "",
+        selectedMetrics.engine ? `Engine ${selectedMetrics.engine}` : "",
+      ].filter(Boolean).join(" | ")
+    : "";
+  const latestMetrics = latest
+    ? [
+        latest.period_start || latest.period_end ? `${formatTime(latest.period_start)} -> ${formatTime(latest.period_end)}` : "",
+        latest.total_return !== null && latest.total_return !== undefined ? `Return ${formatPercent(latest.total_return)}` : "",
+        latest.max_drawdown !== null && latest.max_drawdown !== undefined ? `DD ${formatPercent(latest.max_drawdown)}` : "",
+        latest.sharpe !== null && latest.sharpe !== undefined ? `Sharpe ${formatNumber(latest.sharpe, 2)}` : "",
+      ].filter(Boolean).join(" | ")
+    : "No backtest run yet.";
+  const statusTone = backtest.status === "ready" ? "good" : backtest.status === "metadata_ready" ? "pending" : "neutral";
+  const latestTone = latest?.tone || "neutral";
+  const actionLabel = backtest.status === "ready" ? "创建回测" : "保存样例";
   workspaceBacktest.innerHTML = `
     <div class="info-item">
       <div class="info-item-header">
         <strong>${escapeHtml(backtest.title || "Backtest")}</strong>
-        <span class="state-chip pending">${escapeHtml(backtest.status || "planned")}</span>
+        <span class="state-chip ${statusTone}">${escapeHtml(backtest.status || "planned")}</span>
+      </div>
+      <div class="table-actions" style="justify-content:flex-start;margin:6px 0 8px;">
+        <button class="ws3-btn ${workspaceViewMode === "live" ? "" : "ws3-btn-ghost"}" type="button" data-workspace-view="live">实盘</button>
+        <button class="ws3-btn ${workspaceViewMode === "backtest" ? "" : "ws3-btn-ghost"}" type="button" data-workspace-view="backtest" ${selectedRun || latest ? "" : "disabled"}>回测</button>
+        <span class="state-chip ${viewTone}">${workspaceViewMode === "backtest" ? "Backtest view" : "Live view"}</span>
       </div>
       <div>${escapeHtml(backtest.summary || "")}</div>
-      <div class="muted">Default cash ${escapeHtml(String(backtest.defaults?.start_cash ?? "-"))} | Create endpoint ${escapeHtml(backtest.next_endpoints?.create || "-")}</div>
+      <div class="muted">Default cash ${escapeHtml(String(backtest.defaults?.start_cash ?? "-"))} | ${escapeHtml((backtest.legs || []).length)} legs | ${escapeHtml((backtest.recent_runs || []).length)} recent runs</div>
+      ${selectedRun ? `
+        <div class="info-item-header" style="margin-top:10px;">
+          <span class="state-chip ${selectedRun.status === "completed" ? "good" : selectedRun.status === "failed" ? "error" : "pending"}">Run ${escapeHtml(String(selectedRun.run_id))}</span>
+          <span class="muted">${escapeHtml(selectedMetricsLine || selectedRun.status || "")}</span>
+        </div>
+        <div class="workspace-backtest-analysis">
+          <div class="workspace-backtest-kpi-grid">
+            ${backtestKpiCard("总收益", formatPercent(selectedMetrics.total_return), `PnL ${formatCurrency(selectedLatest?.pnl, 2, "USDT")}`)}
+            ${backtestKpiCard("最大回撤", formatPercent(selectedMetrics.max_drawdown), `Sharpe ${formatNumber(selectedMetrics.sharpe, 2)}`)}
+            ${backtestKpiCard("最终权益", formatCurrency(selectedMetrics.final_equity ?? selectedLatest?.equity, 2, "USDT"), `初始 ${formatCurrency(selectedMetrics.initial_equity ?? selectedMetrics.initial_cash, 2, "USDT")}`)}
+            ${backtestKpiCard("订单数", formatNumber(selectedOrderCount, 0), `${formatNumber((selectedRun.equity || []).length, 0)} equity points`)}
+          </div>
+          <div class="workspace-backtest-analysis-head">
+            <strong>权益曲线</strong>
+            <span class="muted">${escapeHtml(String((selectedRun.equity || []).length))} points · ${(selectedRun.orders || []).length} orders</span>
+          </div>
+          <div id="workspaceBacktestEquityChart" class="workspace-backtest-equity-chart"></div>
+          <div class="workspace-backtest-analysis-head" style="margin-top:8px;">
+            <strong>当前仓位</strong>
+            <span class="muted">latest equity snapshot</span>
+          </div>
+          <div id="workspaceBacktestPositions"></div>
+          <div class="workspace-backtest-analysis-head" style="margin-top:8px;">
+            <strong>最近订单</strong>
+            <span class="muted">latest 12</span>
+          </div>
+          <div id="workspaceBacktestOrders"></div>
+        </div>
+      ` : ""}
+      <div class="info-item-header" style="margin-top:10px;">
+        <span class="state-chip ${latestTone}">${escapeHtml(latest?.status || "none")}</span>
+        <span class="muted">${escapeHtml(latestMetrics)}</span>
+      </div>
+      <div class="table-actions" style="justify-content:flex-start;margin-top:10px;">
+        <button class="ws3-btn" type="button" data-backtest-create>${escapeHtml(actionLabel)}</button>
+        ${selectedRun?.run_id ? `<a class="ws3-btn ws3-btn-ghost" href="/backtests/${escapeHtml(String(selectedRun.run_id))}" target="_blank" rel="noopener noreferrer">当前报告</a>` : ""}
+        ${latest?.report_url ? `<a class="ws3-btn ws3-btn-ghost" href="${escapeHtml(latest.report_url)}" target="_blank" rel="noopener noreferrer">打开报告</a>` : ""}
+        <a class="ws3-btn ws3-btn-ghost" href="/history" target="_blank" rel="noopener noreferrer">History</a>
+      </div>
     </div>
   `;
+  renderWorkspaceBacktestAnalysis(selectedRun);
+}
+
+async function createWorkspaceBacktest() {
+  if (!workspaceBacktest) return;
+  const button = workspaceBacktest.querySelector("[data-backtest-create]");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "创建中...";
+  }
+  const idleLabel = button?.textContent === "创建中..."
+    ? (workspaceState?.backtest?.status === "ready" ? "创建回测" : "保存样例")
+    : "创建回测";
+  const range = currentTimeRangeParams();
+  const dataWindow = {};
+  if (range.from) dataWindow.start = range.from;
+  if (range.to) dataWindow.end = range.to;
+  const backtestReady = workspaceState?.backtest?.status === "ready";
+  try {
+    const payload = await fetchJson(`/api/polymarket/strategies/${rowId}/backtest`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        data_window: dataWindow,
+        metadata_only: !backtestReady,
+        strict_window: Boolean(dataWindow.start || dataWindow.end),
+      }),
+    });
+    const run = payload?.data?.run || {};
+    pushDebug("[WS] backtest:create", {
+      row_id: Number(rowId),
+      run_id: run.run_id,
+      case_id: payload?.data?.case?.case_id,
+      status: run.status,
+    });
+    await loadWorkspace(false, true);
+    const reportUrl = payload?.data?.report_url;
+    if (reportUrl) {
+      window.open(reportUrl, "_blank", "noopener,noreferrer");
+    }
+  } catch (error) {
+    setStatus(workspaceBacktest, `创建回测失败: ${error.message}`);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = idleLabel;
+    }
+  }
+}
+
+async function switchWorkspaceView(mode) {
+  const nextMode = mode === "backtest" ? "backtest" : "live";
+  if (nextMode === "backtest") {
+    const targetRunId = selectedBacktestRunId || workspaceState?.backtest?.latest_run?.run_id;
+    if (!targetRunId) return;
+    workspaceViewMode = "backtest";
+    selectedBacktestRunId = String(targetRunId);
+    setBacktestUrlState("backtest", selectedBacktestRunId);
+    disconnectWorkspaceLive();
+    setAutoRefresh(false);
+    const payload = await fetchJson(`/api/polymarket/strategies/${rowId}/backtest/results?run_id=${encodeURIComponent(selectedBacktestRunId)}`);
+    selectedBacktestResults = payload?.data || null;
+    window.selectedBacktestResults = selectedBacktestResults;
+    window.workspaceViewMode = workspaceViewMode;
+    if (selectedBacktestResults?.selected_run) {
+      applyBacktestWindowToChart(selectedBacktestResults.selected_run);
+    }
+    renderSummary(workspaceState?.strategy || {});
+    renderWorkspaceModeEvents();
+    renderBacktest(workspaceState?.backtest || null);
+    updateWorkspaceViewBadge();
+    await loadChart();
+    return;
+  }
+  workspaceViewMode = "live";
+  selectedBacktestRunId = "";
+  selectedBacktestResults = null;
+  backtestWindowAppliedForRun = "";
+  window.selectedBacktestResults = selectedBacktestResults;
+  window.workspaceViewMode = workspaceViewMode;
+  setBacktestUrlState("live");
+  renderSummary(workspaceState?.strategy || {});
+  renderWorkspaceModeEvents();
+  renderBacktest(workspaceState?.backtest || null);
+  if (workspaceBootReady) {
+    connectWorkspaceLive();
+    setAutoRefresh(true);
+  }
+  await loadChart();
 }
 
 function buildFieldControl(field, editable) {
   const value = editable?.[field.key];
   const description = buildFieldDescription(field);
+  const label = strategyParamLabel(field.key, field.label);
+  const keyChip = field.key && normalizeParamKey(label) !== normalizeParamKey(field.key)
+    ? `<span class="settings-field-key">${escapeHtml(field.key)}</span>`
+    : "";
   const tooltip = description
     ? `<span class="settings-help" tabindex="0" title="${escapeHtml(description)}" aria-label="${escapeHtml(description)}">?</span>`
     : "";
@@ -1285,13 +1891,13 @@ function buildFieldControl(field, editable) {
     return `
       <label class="checkbox workspace-checkbox">
         <input type="checkbox" data-setting-key="${escapeHtml(field.key)}" ${String(value).toLowerCase() === "true" ? "checked" : ""}>
-        <span class="settings-label-text">${escapeHtml(field.label)}${tooltip}</span>
+        <span class="settings-label-text"><span>${escapeHtml(label)}</span>${keyChip}${tooltip}</span>
       </label>
     `;
   }
   return `
     <label class="settings-field" title="${escapeHtml(description)}">
-      <span class="settings-label-text">${escapeHtml(field.label)}${field.required ? '<span class="settings-required">*</span>' : ""}${tooltip}</span>
+      <span class="settings-label-text"><span>${escapeHtml(label)}</span>${field.required ? '<span class="settings-required">*</span>' : ""}${keyChip}${tooltip}</span>
       <span class="settings-input-row">
         <input
           data-setting-key="${escapeHtml(field.key)}"
@@ -1306,9 +1912,12 @@ function buildFieldControl(field, editable) {
 }
 function buildFieldDescription(field) {
   const parts = [];
-  if (field.description) parts.push(String(field.description));
+  const hint = strategyParamHint(field.key);
+  if (hint) parts.push(hint);
+  if (field.description && String(field.description) !== hint) parts.push(String(field.description));
   if (field.required) parts.push("必填参数");
   if (field.source === "strategy_code") parts.push("说明来自策略代码 FunctionIntroduction");
+  if (field.key) parts.push(`字段名: ${field.key}`);
   return parts.join("\n");
 }
 
@@ -1467,9 +2076,37 @@ async function refreshSettingsUseDataControls({ fillEmpty = false } = {}) {
   }
 }
 
+function parameterGroupKey(field = {}) {
+  const key = normalizeParamKey(field.key || field.label);
+  const match = PARAM_GROUPS.find((group) => group.keys.includes(key));
+  return match?.key || "other";
+}
+
+function renderInputFieldGroups(fields, editable) {
+  const grouped = new Map(PARAM_GROUPS.map((group) => [group.key, { ...group, fields: [] }]));
+  grouped.set("other", { key: "other", title: "其他参数", fields: [] });
+  (fields || []).forEach((field) => {
+    const key = parameterGroupKey(field);
+    if (!grouped.has(key)) grouped.set(key, { key, title: "其他参数", fields: [] });
+    grouped.get(key).fields.push(field);
+  });
+  return [...grouped.values()]
+    .filter((group) => group.fields.length)
+    .map((group) => `
+      <div class="workspace-settings-subgroup">
+        <div class="workspace-settings-subtitle">${escapeHtml(group.title)}</div>
+        <div class="grid two">${group.fields.map((field) => buildFieldControl(field, editable)).join("")}</div>
+      </div>
+    `)
+    .join("");
+}
+
 function renderSettings(schema, strategy) {
   const editable = strategy.editable || {};
   const stateStore = workspaceStateStore || {};
+  const pastePlaceholder = isBinanceTarget(primaryTrackedMarket())
+    ? '{"entry_z": 0.002, "exit_z": 0.0005, "fast_window": 20, "slow_window": 60}'
+    : '{"fair_price": 0.40, "entry_edge": 0.05}';
   const groups = {
     inputs: schema.filter((field) => field.group === "inputs"),
     capital: schema.filter((field) => field.group === "capital"),
@@ -1482,11 +2119,11 @@ function renderSettings(schema, strategy) {
         <span>批量粘贴参数</span>
         <button type="button" class="settings-paste-apply" data-settings-paste-apply>填入匹配字段</button>
       </div>
-      <textarea data-settings-paste-text spellcheck="false" placeholder='{"fair_price": 0.40, "entry_edge": 0.05}'></textarea>
+      <textarea data-settings-paste-text spellcheck="false" placeholder='${escapeHtml(pastePlaceholder)}'></textarea>
     </div>
     <div class="workspace-settings-group">
-      <h3>Inputs</h3>
-      <div class="grid two">${groups.inputs.map((field) => buildFieldControl(field, editable)).join("")}</div>
+      <h3>策略参数</h3>
+      ${renderInputFieldGroups(groups.inputs, editable) || '<div class="ws3-status">当前策略没有可编辑输入参数。</div>'}
     </div>
     ${renderWorkspaceMachineStateSection(stateStore, strategy)}
     ${renderWorkspaceControlsSection(stateStore)}
@@ -1648,8 +2285,15 @@ function renderMetricPicker(capabilities, defaults) {
   const allowed = new Set(capabilities?.sub_allowed || []);
   const selected = new Set(defaults?.sub_series || []);
   const metricCatalog = capabilities?.metric_catalog || {};
-  const numericMetrics = metricCatalog.numeric || [];
-  const stateMetrics = (metricCatalog.state || []).filter(isStateLaneMetricDisplayable);
+  const numericMetrics = (metricCatalog.numeric || []).filter((item) => !isBacktestDerivedMetricItem(item));
+  const backtestMetrics = (metricCatalog.numeric || []).filter(isBacktestDerivedMetricItem);
+  const stateMetrics = (metricCatalog.state || []).filter((item) => !isBacktestDerivedMetricItem(item)).filter(isStateLaneMetricDisplayable);
+  const backtestStateMetrics = (metricCatalog.state || []).filter(isBacktestDerivedMetricItem).filter(isStateLaneMetricDisplayable);
+  const missingBacktestStrategyCatalog = workspaceViewMode === "backtest"
+    && selectedBacktestRunId
+    && !numericMetrics.length
+    && !stateMetrics.length
+    && (backtestMetrics.length || backtestStateMetrics.length);
   chartMetricPicker.innerHTML = `
     <div class="metric-picker-title">副图组</div>
     <div class="metric-picker-groups">
@@ -1685,12 +2329,54 @@ function renderMetricPicker(capabilities, defaults) {
             }).join("")}
           </div>
         </div>
-      ` : ""}
+      ` : (missingBacktestStrategyCatalog ? `
+        <div class="metric-picker-group">
+          <div class="metric-picker-group-title">Strategy Metrics</div>
+          <div class="metric-picker-empty">当前回测 run 没有保存策略代码返回的 metrics；重新回测后会显示策略内部数值指标。</div>
+        </div>
+      ` : "")}
+      ${backtestMetrics.length ? `
+        <div class="metric-picker-group">
+          <div class="metric-picker-group-title">Backtest Metrics</div>
+          <div class="metric-picker-options">
+            ${backtestMetrics.map((item) => {
+              const key = `metric:${item.key}`;
+              return `
+                <label class="checkbox">
+                  <input type="checkbox" data-sub-metric="${escapeHtml(key)}" ${selected.has(key) ? "checked" : ""}>
+                  ${escapeHtml(item.label || item.key)}
+                </label>
+              `;
+            }).join("")}
+          </div>
+        </div>
+      ` : (missingBacktestStrategyCatalog ? `
+        <div class="metric-picker-group">
+          <div class="metric-picker-group-title">State Lanes</div>
+          <div class="metric-picker-empty">当前回测 run 没有保存策略代码返回的状态字段；重新回测后会显示状态机与因子状态色带。</div>
+        </div>
+      ` : "")}
       ${stateMetrics.length ? `
         <div class="metric-picker-group">
           <div class="metric-picker-group-title">State Lanes</div>
           <div class="metric-picker-options">
             ${stateMetrics.map((item) => {
+              const key = `metric_state:${item.key}`;
+              return `
+                <label class="checkbox">
+                  <input type="checkbox" data-sub-metric="${escapeHtml(key)}" ${selected.has(key) ? "checked" : ""}>
+                  ${escapeHtml(item.label || item.key)}
+                </label>
+              `;
+            }).join("")}
+          </div>
+        </div>
+      ` : ""}
+      ${backtestStateMetrics.length ? `
+        <div class="metric-picker-group">
+          <div class="metric-picker-group-title">Backtest State</div>
+          <div class="metric-picker-options">
+            ${backtestStateMetrics.map((item) => {
               const key = `metric_state:${item.key}`;
               return `
                 <label class="checkbox">
@@ -1905,6 +2591,7 @@ function renderPresetOptions(presets) {
 }
 
 function renderTrackedMarkets() {
+  syncMainChartModeOptions();
   if (!trackedMarkets.length) {
     setStatus(workspaceTrackedMarkets, "当前没有可用市场，请先返回策略市场或添加一个市场。");
     return;
@@ -1912,15 +2599,17 @@ function renderTrackedMarkets() {
   workspaceTrackedMarkets.innerHTML = trackedMarkets.map((market, index) => `
     <div class="tracked-market-chip ${index === 0 ? "" : "secondary-chip"}">
       <div class="tracked-market-head">
-        <a class="table-link-button" href="${escapeHtml(marketUi.buildPolymarketUrl(market))}" target="_blank" rel="noopener noreferrer">${escapeHtml(market.label)}</a>
+        ${isBinanceTarget(market)
+          ? `<span class="table-link-button">${escapeHtml(market.label || market.symbol || "Binance")}</span>`
+          : `<a class="table-link-button" href="${escapeHtml(marketUi.buildPolymarketUrl(market))}" target="_blank" rel="noopener noreferrer">${escapeHtml(market.label)}</a>`}
         <div class="table-actions">
-          <button type="button" class="ghost mini" data-watch-market="${escapeHtml(marketIdentity(market))}">${marketUi.isInWatchlist(market) ? "取消自选" : "加入自选"}</button>
+          ${isBinanceTarget(market) ? "" : `<button type="button" class="ghost mini" data-watch-market="${escapeHtml(marketIdentity(market))}">${marketUi.isInWatchlist(market) ? "取消自选" : "加入自选"}</button>`}
           <button type="button" class="ghost mini" data-remove-market="${escapeHtml(marketIdentity(market))}" ${trackedMarkets.length === 1 ? "disabled" : ""}>移除</button>
         </div>
       </div>
       <div class="tracked-market-meta">
-        <span>${market.type === "strategy" ? "策略默认" : "附加市场"}</span>
-        <span>Condition ${escapeHtml(market.condition_id || "-")}</span>
+        <span>${isBinanceTarget(market) ? "Binance" : (market.type === "strategy" ? "策略默认" : "附加市场")}</span>
+        <span>${isBinanceTarget(market) ? `${escapeHtml(market.symbol || "-")} · ${escapeHtml(market.interval || "1m")}` : `Condition ${escapeHtml(market.condition_id || "-")}`}</span>
       </div>
     </div>
   `).join("");
@@ -1929,7 +2618,9 @@ function renderTrackedMarkets() {
 function renderMarketStatus() {
   const primary = trackedMarkets[0];
   workspaceMarketStatus.textContent = primary
-    ? `当前主市场 ${primary.label} | Condition ${primary.condition_id || "-"} | 已加载 ${trackedMarkets.length} 个市场数据集`
+    ? (isBinanceTarget(primary)
+        ? `当前主标的 ${primary.label || primary.symbol} | Binance ${primary.symbol || "-"} ${primary.interval || "1m"} | 已加载 ${trackedMarkets.length} 个数据集`
+        : `当前主市场 ${primary.label} | Condition ${primary.condition_id || "-"} | 已加载 ${trackedMarkets.length} 个市场数据集`)
     : "当前没有市场数据集。";
 }
 
@@ -2003,6 +2694,52 @@ function renderEvents(events) {
       }).join("")}
     </div>
   `;
+}
+
+function orderInstrumentLabel(order = {}) {
+  const instrument = String(order.instrument_id || order.leg_id || "").trim();
+  if (instrument.includes(":")) return instrument.split(":").pop();
+  return instrument || "asset";
+}
+
+function backtestEventsForWorkspace(run = {}) {
+  const orderEvents = (run.orders || []).map((order) => {
+    const side = String(order.side || "ORDER").toUpperCase();
+    const reason = String(order.reason || order.meta?.reason || "").trim();
+    return {
+      ts: order.ts_utc,
+      type: "trade",
+      source: "backtest_order",
+      severity: "info",
+      summary: `${side} ${orderInstrumentLabel(order)} · qty ${formatNumber(order.quantity, 8)} · price ${formatCurrency(order.price, 2, "USDT")}${reason ? ` · ${reason}` : ""}`,
+    };
+  });
+  const engineEvents = (run.events || []).map((event) => ({
+    ts: event.ts_utc || event.ts,
+    type: event.event_type || event.type || "backtest",
+    source: event.source || "backtest",
+    severity: event.severity || "info",
+    summary: event.message || event.summary || event.label || event.status || "Backtest event",
+  }));
+  const tradeEvents = sortDedupeEvents(orderEvents).slice(0, 80);
+  const diagnosticEvents = sortDedupeEvents(engineEvents.filter((event) => {
+    const type = String(event.type || "").toLowerCase();
+    const text = String(event.summary || "").toLowerCase();
+    return type.includes("complete") || type.includes("error") || type.includes("fail") || text.includes("complete") || text.includes("failed");
+  })).slice(0, 8);
+  return [...tradeEvents, ...diagnosticEvents];
+}
+
+function renderWorkspaceModeEvents() {
+  if (workspaceViewMode === "backtest" && selectedBacktestResults?.selected_run) {
+    _fullEventsList = backtestEventsForWorkspace(selectedBacktestResults.selected_run);
+    renderEvents(_fullEventsList);
+    return;
+  }
+  if ((workspaceState?.recent_events || []).length || !_fullEventsList.length) {
+    _fullEventsList = limitEventsWithTypeGuarantee(workspaceState?.recent_events || []);
+    renderEvents(_fullEventsList);
+  }
 }
 
 function patchWorkspaceSummary(fields) {
@@ -2230,6 +2967,7 @@ function setupChartResizeHandle() {
     };
     const onUp = () => {
       document.body.classList.remove("chart-resizing");
+      chartHeightUserAdjusted = true;
       persistChartAppearance();
       if (currentChartPayload) {
         renderCharts(currentChartPayload);
@@ -2243,6 +2981,18 @@ function setupChartResizeHandle() {
     window.addEventListener("pointerup", onUp, { once: true });
     window.addEventListener("pointercancel", onUp, { once: true });
   });
+}
+
+function ensureReadableBacktestChartHeight(payload = {}) {
+  if (chartHeightUserAdjusted || workspaceViewMode !== "backtest") {
+    return;
+  }
+  const expandedPanels = expandChartPanels(payload.panels || [], payload.metric_state_lanes || [], payload.events || []);
+  const panelCount = expandedPanels.length || 1;
+  const targetHeight = panelCount >= 7 ? 980 : panelCount >= 6 ? 900 : panelCount >= 5 ? 820 : 0;
+  if (targetHeight && workspaceChartHeight < targetHeight) {
+    applyChartHeight(targetHeight, false);
+  }
 }
 
 function setupEventTimelineHover(chart) {
@@ -2359,6 +3109,122 @@ function formatChartValue(value, unit) {
     return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 2 }).format(num);
   }
   return num.toLocaleString(undefined, { maximumFractionDigits: Math.abs(num) < 10 ? 4 : 2 });
+}
+
+function latestFiniteSeriesValue(rows = [], key) {
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const value = Number(rows[index]?.[key]);
+    if (Number.isFinite(value)) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function latestStateLaneSegment(lane = {}, toTs = "") {
+  const segments = (lane.segments || []).filter((segment) => segment.from && segment.to);
+  if (!segments.length) return null;
+  const targetTime = new Date(toTs || segments[segments.length - 1].to).getTime();
+  const active = segments.find((segment) => {
+    const start = new Date(segment.from).getTime();
+    const end = new Date(segment.to).getTime();
+    return Number.isFinite(start) && Number.isFinite(end) && start <= targetTime && targetTime <= end;
+  });
+  return active || segments[segments.length - 1];
+}
+
+function renderChartInsights(payload = {}) {
+  if (!workspaceChartInsights) return;
+  const rows = payload.rows || [];
+  const buildMetricChips = (seriesItems) => seriesItems.map((item) => {
+    const value = latestFiniteSeriesValue(rows, item.key);
+    if (value === null) return "";
+    return `
+      <span class="workspace-chart-insight-chip" title="${escapeHtml(item.label || item.key)}">
+        <span class="workspace-chart-insight-dot" style="background:${escapeHtml(colorForSeries(item.key))}"></span>
+        <span class="workspace-chart-insight-label">${escapeHtml(displaySeriesLabel(item))}</span>
+        <span class="workspace-chart-insight-value">${escapeHtml(formatChartValue(value, item.unit))}</span>
+      </span>
+    `;
+  }).filter(Boolean);
+  const strategyMetricChips = buildMetricChips(
+    (payload.series || []).filter((item) => item.panel === "metric_values" && !isBacktestDerivedSeries(item))
+  );
+  const backtestMetricChips = buildMetricChips(
+    (payload.series || []).filter((item) => item.panel === "backtest_metrics" || isBacktestDerivedSeries(item))
+  );
+
+  const buildLaneChips = (lanes) => lanes.map((lane) => {
+      const segment = latestStateLaneSegment(lane, payload.meta?.to || "");
+      if (!segment) return "";
+      const color = stateLaneSegmentColor(lane, segment);
+      return `
+        <span class="workspace-chart-insight-chip" title="${escapeHtml(stateLaneIdentity(lane))}">
+          <span class="workspace-chart-insight-dot" style="background:${escapeHtml(color)}"></span>
+          <span class="workspace-chart-insight-label">${escapeHtml(stateLaneDisplayName(lane))}</span>
+          <span class="workspace-chart-insight-value">${escapeHtml(stateLaneSegmentLabel(segment, lane))}</span>
+        </span>
+      `;
+    })
+    .filter(Boolean);
+  const strategyLaneChips = buildLaneChips(
+    (payload.metric_state_lanes || [])
+      .filter((lane) => !isBacktestDerivedLane(lane))
+      .filter((lane) => isStateLaneDisplayable(lane) && (lane.segments || []).length)
+  );
+  const backtestLaneChips = buildLaneChips(
+    (payload.metric_state_lanes || [])
+      .filter(isBacktestDerivedLane)
+      .filter((lane) => isStateLaneDisplayable(lane) && (lane.segments || []).length)
+  );
+
+  const groups = [];
+  if (strategyMetricChips.length) {
+    groups.push(`
+      <div class="workspace-chart-insight-group">
+        <div class="workspace-chart-insight-title">Strategy Metrics</div>
+        <div class="workspace-chart-insight-row">${strategyMetricChips.join("")}</div>
+      </div>
+    `);
+  }
+  if (backtestMetricChips.length) {
+    groups.push(`
+      <div class="workspace-chart-insight-group">
+        <div class="workspace-chart-insight-title">Backtest Metrics</div>
+        <div class="workspace-chart-insight-row">${backtestMetricChips.join("")}</div>
+      </div>
+    `);
+  }
+  if (strategyLaneChips.length) {
+    groups.push(`
+      <div class="workspace-chart-insight-group">
+        <div class="workspace-chart-insight-title">State Lanes</div>
+        <div class="workspace-chart-insight-row">${strategyLaneChips.join("")}</div>
+      </div>
+    `);
+  }
+  if (backtestLaneChips.length) {
+    groups.push(`
+      <div class="workspace-chart-insight-group">
+        <div class="workspace-chart-insight-title">Backtest State</div>
+        <div class="workspace-chart-insight-row">${backtestLaneChips.join("")}</div>
+      </div>
+    `);
+  }
+
+  workspaceChartInsights.hidden = groups.length === 0;
+  workspaceChartInsights.innerHTML = groups.join("");
+}
+
+function formatTooltipValue(value, unit, meta = {}) {
+  const text = formatChartValue(value, unit);
+  if (text === "-") return text;
+  if (unit === "price" && isCryptoSeriesMeta(meta)) return `${text} USDT`;
+  if (unit === "currency") {
+    const suffix = isCryptoSeriesMeta(meta) || String(meta.key || "").startsWith("backtest_") ? "USDT" : "USD";
+    return `${text} ${suffix}`;
+  }
+  return text;
 }
 
 function formatAxisTimeLabel(value, rangeMs) {
@@ -2568,9 +3434,17 @@ function buildTooltipFormatter(seriesMap, payload = {}) {
       }
       const meta = seriesMap.get(param.seriesId || param.seriesName);
       if (!meta) return;
+      const label = displaySeriesLabel(meta);
+      if (meta.render === "candlestick") {
+        const values = Array.isArray(param.value) ? param.value.slice(1) : [];
+        if (values.length >= 4) {
+          lines.push(`${param.marker}${escapeHtml(label)}: 开 ${escapeHtml(formatTooltipValue(values[0], meta?.unit, meta))} · 高 ${escapeHtml(formatTooltipValue(values[3], meta?.unit, meta))} · 低 ${escapeHtml(formatTooltipValue(values[2], meta?.unit, meta))} · 收 ${escapeHtml(formatTooltipValue(values[1], meta?.unit, meta))}`);
+        }
+        return;
+      }
       const rawValue = Array.isArray(param.value) ? param.value[1] : param.value;
       if (rawValue === null || rawValue === undefined || rawValue === "") return;
-      lines.push(`${param.marker}${escapeHtml(meta?.label || param.seriesName)}: ${escapeHtml(formatChartValue(rawValue, meta?.unit))}`);
+      lines.push(`${param.marker}${escapeHtml(label)}: ${escapeHtml(formatTooltipValue(rawValue, meta?.unit, meta))}`);
     });
     lines.push(...buildReferenceTooltipLines(payload, rawTs, seenSeriesIds, rows, referenceSeries));
     return lines.join("<br>");
@@ -2580,7 +3454,7 @@ function buildTooltipFormatter(seriesMap, payload = {}) {
 function buildChartDataZoom(layout) {
   return [
     { type: "inside", xAxisIndex: layout.map((_, index) => index), filterMode: "none", throttle: 40, moveOnMouseMove: true, moveOnMouseWheel: false, zoomOnMouseWheel: true, preventDefaultMouseMove: true },
-    { type: "slider", xAxisIndex: layout.map((_, index) => index), filterMode: "none", bottom: 12, height: 24, realtime: true, brushSelect: true, showDetail: false, handleSize: 18, moveHandleSize: 10, handleStyle: { color: "#dbeafe", borderColor: "#60a5fa", borderWidth: 1 }, backgroundColor: "rgba(255, 255, 255, 0.04)", fillerColor: "rgba(86, 167, 255, 0.18)", borderColor: "rgba(148, 163, 184, 0.16)", textStyle: { color: "#90a5c3" } },
+    { type: "slider", xAxisIndex: layout.map((_, index) => index), filterMode: "none", bottom: 8, left: 22, right: 82, height: 18, realtime: true, brushSelect: true, showDetail: false, handleSize: 14, moveHandleSize: 8, handleStyle: { color: "#dbeafe", borderColor: "#60a5fa", borderWidth: 1 }, backgroundColor: "rgba(255, 255, 255, 0.035)", fillerColor: "rgba(86, 167, 255, 0.16)", borderColor: "rgba(148, 163, 184, 0.14)", textStyle: { color: "#90a5c3" } },
   ];
 }
 
@@ -2620,7 +3494,8 @@ function expandChartPanels(basePanels = [], stateLanes = [], events = []) {
   if (lanePanels.length && !insertedStateLanes) {
     panels.push(...lanePanels);
   }
-  if ((events || []).some((event) => event?.ts) && !panels.find((p) => p.id === "event_timeline")) {
+  const includeEventTimeline = isEventTimelineSelected();
+  if (includeEventTimeline && (events || []).some((event) => event?.ts) && !panels.find((p) => p.id === "event_timeline")) {
     panels.push({ id: "event_timeline", title: "Events" });
   }
   return panels;
@@ -2634,8 +3509,8 @@ function buildChartCoordinateState(payload) {
   const { minTs, maxTs, rangeMs } = getTimeExtent(rows, payload.meta || {});
   const panelIndex = new Map(layout.map((item, index) => [item.panel.id, index]));
   const grid = layout.map((item) => ({
-    left: item.panel.id === "event_timeline" ? 92 : 76,
-    right: 26,
+    left: item.panel.id === "event_timeline" ? 92 : 22,
+    right: 82,
     top: item.top,
     height: item.height,
     containLabel: false,
@@ -2654,21 +3529,25 @@ function buildChartCoordinateState(payload) {
   const yAxis = layout.map((item, index) => {
     const isStatePanel = isStateLanePanel(item.panel);
     const isEventPanel = item.panel.id === "event_timeline";
+    const isMainPanel = item.panel.id === "main";
     const eventLaneCount = EVENT_TIMELINE_CATEGORIES.length;
     const eventLaneLabels = new Map(EVENT_TIMELINE_CATEGORIES.map((cat) => [cat.lane, cat.label]));
     return {
       type: "value",
       gridIndex: index,
+      position: isEventPanel ? "left" : "right",
       scale: !isStatePanel && !isEventPanel,
       min: isStatePanel ? 0 : (isEventPanel ? -0.5 : undefined),
       max: isStatePanel ? 1 : (isEventPanel ? eventLaneCount - 0.5 : undefined),
       name: item.panel.title,
-      nameTextStyle: { color: "#90a5c3", padding: [0, 0, 0, 8], width: 64, overflow: "truncate" },
+      nameLocation: "end",
+      nameGap: isMainPanel ? 12 : 8,
+      nameTextStyle: { color: "#90a5c3", padding: [0, 4, 0, 0], width: 72, overflow: "truncate", align: isEventPanel ? "left" : "right" },
       axisLabel: {
         show: !isStatePanel,
         color: "#90a5c3",
         fontSize: isEventPanel ? 11 : undefined,
-        margin: isEventPanel ? 10 : 8,
+        margin: isEventPanel ? 10 : 10,
         lineHeight: isEventPanel ? 18 : undefined,
         formatter(value) {
           if (isEventPanel) {
@@ -2679,8 +3558,8 @@ function buildChartCoordinateState(payload) {
         },
       },
       axisTick: { show: !isStatePanel && !isEventPanel },
-      axisLine: { show: true, lineStyle: { color: "rgba(148, 163, 184, 0.28)" } },
-      splitLine: { show: isEventPanel ? true : (!isStatePanel && !isEventPanel), lineStyle: { color: isEventPanel ? "rgba(148, 163, 184, 0.08)" : "rgba(148, 163, 184, 0.10)" } },
+      axisLine: { show: true, lineStyle: { color: "rgba(148, 163, 184, 0.22)" } },
+      splitLine: { show: isEventPanel ? true : (!isStatePanel && !isEventPanel), lineStyle: { color: isEventPanel ? "rgba(148, 163, 184, 0.08)" : "rgba(148, 163, 184, 0.09)" } },
     };
   });
   const dataZoom = applyChartViewStateToDataZoom(buildChartDataZoom(layout));
@@ -2703,6 +3582,46 @@ function buildChartSeriesOption(payload, targetKeys = null) {
   const allowedKeys = targetKeys ? new Set(targetKeys) : null;
   const chartSeries = series.map((item) => {
     if (allowedKeys && !allowedKeys.has(item.key)) return null;
+    if (item.render === "candlestick") {
+      const style = seriesStyleState[item.key] || item.style || {};
+      if (style.visible === false) return null;
+      const data = rows.map((row) => {
+        const raw = row[item.key];
+        const values = Array.isArray(raw)
+          ? raw.map((value) => Number(value))
+          : [
+              Number(row[item.key.replace(/ohlc$/, "open")]),
+              Number(row[item.key.replace(/ohlc$/, "close")]),
+              Number(row[item.key.replace(/ohlc$/, "low")]),
+              Number(row[item.key.replace(/ohlc$/, "high")]),
+            ];
+        if (values.length >= 4 && values.every((value) => Number.isFinite(value))) {
+          return [row.ts, values[0], values[1], values[2], values[3]];
+        }
+        return null;
+      }).filter(Boolean);
+      if (!data.length) return null;
+      seriesMetaById.set(item.key, item);
+      return {
+        id: item.key,
+        name: displaySeriesLabel(item),
+        type: "candlestick",
+        xAxisIndex: panelIndex.get(item.panel) || 0,
+        yAxisIndex: panelIndex.get(item.panel) || 0,
+        data,
+        itemStyle: {
+          color: style.up_color || "#31d0aa",
+          color0: style.down_color || "#f05d6a",
+          borderColor: style.up_color || "#31d0aa",
+          borderColor0: style.down_color || "#f05d6a",
+        },
+        barWidth: "54%",
+        barMinWidth: 1,
+        barMaxWidth: 14,
+        emphasis: { focus: "series" },
+        z: 6,
+      };
+    }
     const isBar = item.render === "bar";
     const isBidAsk = /_(bid|ask)$/.test(item.key);
     const isPriceSeries = item.category === "market_target" || item.category === "price" || /_(bid|ask|mid|last_price)$/.test(item.key);
@@ -2720,7 +3639,7 @@ function buildChartSeriesOption(payload, targetKeys = null) {
     seriesMetaById.set(item.key, item);
     return {
       id: item.key,
-      name: item.label,
+      name: displaySeriesLabel(item),
       type: isBar ? "bar" : "line",
       xAxisIndex: panelIndex.get(item.panel) || 0,
       yAxisIndex: panelIndex.get(item.panel) || 0,
@@ -2781,30 +3700,90 @@ function buildEventMarkLines(events = []) {
 }
 
 function buildEventMarkLineSeries(payload, panelIndex) {
-  const eventLines = buildEventMarkLines(payload.events || []);
-  if (!eventLines.length) return [];
+  return [];
+}
+
+function tradeEventSide(event = {}) {
+  const direct = String(event.side || event.action || "").trim().toUpperCase();
+  if (direct === "BUY" || direct === "SELL") return direct;
+  const text = String(event.label || event.summary || event.type || event.event_type || "").toUpperCase();
+  if (text.includes("SELL")) return "SELL";
+  if (text.includes("BUY")) return "BUY";
+  return "";
+}
+
+function tradeEventPrice(event = {}) {
+  const direct = numericValue(event.price);
+  if (direct !== null) return direct;
+  const text = String(event.label || event.summary || "");
+  const match = text.match(/(?:price=|@|price\s+)([0-9,.]+)/i);
+  if (!match) return null;
+  return numericValue(match[1].replaceAll(",", ""));
+}
+
+function tradeEventQuantity(event = {}) {
+  const direct = numericValue(event.quantity);
+  if (direct !== null) return direct;
+  const text = String(event.label || event.summary || "");
+  const match = text.match(/qty=([0-9,.]+)/i);
+  return match ? numericValue(match[1].replaceAll(",", "")) : null;
+}
+
+function buildTradeMarkerSeries(payload, panelIndex) {
   const mainPanelIndex = panelIndex.get("main") ?? 0;
-  const rows = payload.rows || [];
-  const firstTs = rows[0]?.ts || payload.meta?.from || eventLines[0]?.xAxis;
-  const lastTs = rows[rows.length - 1]?.ts || payload.meta?.to || firstTs;
-  return [{
-    id: "__event_mark_lines",
-    name: "Events",
-    type: "line",
-    xAxisIndex: mainPanelIndex,
-    yAxisIndex: mainPanelIndex,
-    data: [[firstTs, 0], [lastTs, 0]],
-    showSymbol: false,
-    lineStyle: { opacity: 0, width: 0 },
-    itemStyle: { opacity: 0 },
-    tooltip: { show: false },
-    z: 2,
-    markLine: {
-      symbol: ["none", "none"],
-      silent: false,
-      data: eventLines,
-    },
-  }];
+  const bySide = { BUY: [], SELL: [] };
+  (payload.events || []).forEach((event) => {
+    const side = tradeEventSide(event);
+    if (!side || !bySide[side]) return;
+    const price = tradeEventPrice(event);
+    const ts = event.ts;
+    if (!ts || price === null) return;
+    bySide[side].push({
+      value: [ts, price],
+      side,
+      price,
+      quantity: tradeEventQuantity(event),
+      reason: event.reason || "",
+      label: event.label || event.summary || "",
+      ts,
+      itemStyle: {
+        color: side === "BUY" ? "#22c55e" : "#ef4444",
+        borderColor: side === "BUY" ? "#bbf7d0" : "#fecdd3",
+        borderWidth: 1,
+      },
+    });
+  });
+  return Object.entries(bySide).map(([side, data]) => {
+    if (!data.length) return null;
+    const isBuy = side === "BUY";
+    return {
+      id: `__trade_marker:${side}`,
+      name: isBuy ? "BUY" : "SELL",
+      type: "scatter",
+      xAxisIndex: mainPanelIndex,
+      yAxisIndex: mainPanelIndex,
+      data,
+      symbol: "triangle",
+      symbolRotate: isBuy ? 0 : 180,
+      symbolSize: 8,
+      symbolOffset: isBuy ? [0, 7] : [0, -7],
+      z: 30,
+      emphasis: { scale: 1.6, focus: "self" },
+      tooltip: {
+        trigger: "item",
+        formatter(param) {
+          const d = param.data || {};
+          const qty = d.quantity === null || d.quantity === undefined ? "-" : formatNumber(d.quantity, 8);
+          return [
+            `<strong style="color:${isBuy ? "#86efac" : "#fca5a5"}">${escapeHtml(side)}</strong> <span style="color:#90a5c3">${escapeHtml(formatTime(d.ts))}</span>`,
+            `Price: ${escapeHtml(formatCurrency(d.price, 2, "USDT"))}`,
+            `Qty: ${escapeHtml(qty)}`,
+            d.reason ? `Reason: ${escapeHtml(d.reason)}` : "",
+          ].filter(Boolean).join("<br>");
+        },
+      },
+    };
+  }).filter(Boolean);
 }
 
 function buildMetricStateSeries(payload, panelIndex) {
@@ -2962,8 +3941,9 @@ function buildChartOption(payload) {
   const { chartSeries, seriesMetaById } = buildChartSeriesOption(payload);
   const stateSeries = buildMetricStateSeries(payload, panelIndex);
   const eventTimelineSeries = buildEventTimelineSeries(payload, panelIndex);
+  const tradeMarkerSeries = buildTradeMarkerSeries(payload, panelIndex);
   const eventMarkerSeries = buildEventMarkLineSeries(payload, panelIndex);
-  const legendSeries = [...chartSeries, ...stateSeries, ...eventTimelineSeries];
+  const legendSeries = [...chartSeries, ...tradeMarkerSeries, ...stateSeries, ...eventTimelineSeries];
   const allSeries = [...legendSeries, ...eventMarkerSeries];
   currentLegendNameToKey = new Map();
   legendSeries.forEach((item) => {
@@ -3032,9 +4012,10 @@ function ensureSeriesStyleState(series) {
     const fromPayload = item.style || {};
     const macd = existing.macd || {};
     const compactHidden = isCompactDefaultHiddenSeries(item);
+    const payloadHidden = fromPayload.visible === false;
     const visible = needsLayoutMigration && compactHidden
       ? false
-      : (hasExisting ? existing.visible !== false : !compactHidden);
+      : (hasExisting ? existing.visible !== false : (!compactHidden && !payloadHidden));
     seriesStyleState[item.key] = {
       color: overlayStyleColor(item.key, existing, fromPayload),
       width: Number(existing.width || fromPayload.width || (item.panel === "main" ? 2.4 : 2)),
@@ -3194,7 +4175,7 @@ function renderSeriesControls(series, payload = {}) {
     dot.className = "series-control-dot";
     dot.style.background = style.color || colorForSeries(item.key);
     const label = document.createElement("span");
-    label.textContent = item.label || item.key;
+    label.textContent = displaySeriesLabel(item);
     button.append(dot, label);
     legendRow.appendChild(button);
   });
@@ -3232,7 +4213,7 @@ function renderSeriesControls(series, payload = {}) {
     ].join("");
     const color = style.color || colorForSeries(item.key);
     card.querySelector(".series-control-dot").style.background = color;
-    card.querySelector("strong").textContent = item.label || item.key;
+    card.querySelector("strong").textContent = displaySeriesLabel(item);
     card.querySelector(".series-control-badge").textContent = item?.source_label || "Market line";
     const subtitle = card.querySelector(".series-control-subtitle");
     subtitle.textContent = clampText(item?.source_detail || item?.category || "");
@@ -3331,10 +4312,13 @@ function renderCharts(payload) {
       series: series.length,
       panels: panels.length,
     });
+    renderChartInsights({});
     setStatus(workspaceCharts, "该范围暂无可绘制数据。");
     return;
   }
 
+  renderChartInsights(payload);
+  ensureReadableBacktestChartHeight(payload);
   ensureChartShell();
 
   const controlsSignature = buildSeriesControlsSignature(series, payload);
@@ -3773,6 +4757,7 @@ function currentSeriesStylePayload() {
 function buildChartRequestParams(options = {}) {
   const includeStyle = options.includeStyle !== false;
   syncTimelineUi();
+  syncMainChartModeOptions();
   const params = new URLSearchParams({
     interval: chartInterval.value,
     main_side: chartMainSide.value,
@@ -3784,6 +4769,9 @@ function buildChartRequestParams(options = {}) {
     overlay_finance_fields: selectedOverlayFields("finance").join(","),
     market_targets_json: JSON.stringify(trackedMarkets),
   });
+  if (workspaceViewMode === "backtest" && selectedBacktestRunId) {
+    params.set("backtest_run_id", selectedBacktestRunId);
+  }
   if (includeStyle) {
     params.set("series_style_json", JSON.stringify(currentSeriesStylePayload()));
   }
@@ -3844,6 +4832,7 @@ function applyWorkspaceConfig(config) {
     finance: { symbols: chart.overlay_finance || [], fields: chart.overlay_finance_fields || [] },
   };
   normalizeTrackedMarkets(chart.market_targets || buildDefaultMarketTargets());
+  syncMainChartModeOptions();
   syncMarketSelectorInputs(true);
   renderTrackedMarkets();
   renderMarketStatus();
@@ -3960,13 +4949,25 @@ async function loadWorkspace(forceResetOverlay = false, silent = false) {
   }
   let payload;
   let statePayload;
+  let backtestPayload;
   try {
-    [payload, statePayload] = await Promise.all([
-      fetchJson(`/api/polymarket/strategies/${rowId}/workspace?include_events=0`),
+    const workspaceParams = new URLSearchParams({ include_events: "0" });
+    if (workspaceViewMode === "backtest" && selectedBacktestRunId) {
+      workspaceParams.set("source", "backtest");
+      workspaceParams.set("run_id", selectedBacktestRunId);
+    }
+    [payload, statePayload, backtestPayload] = await Promise.all([
+      fetchJson(`/api/polymarket/strategies/${rowId}/workspace?${workspaceParams.toString()}`),
       fetchJson(`/api/registry/strategies/${rowId}/state-store`).catch((error) => {
         pushDebug("[WS] state-store:error", { row_id: Number(rowId), message: error?.message || String(error) });
         return null;
       }),
+      selectedBacktestRunId
+        ? fetchJson(`/api/polymarket/strategies/${rowId}/backtest/results?run_id=${encodeURIComponent(selectedBacktestRunId)}`).catch((error) => {
+            pushDebug("[WS] backtest-result:error", { row_id: Number(rowId), run_id: selectedBacktestRunId, message: error?.message || String(error) });
+            return null;
+          })
+        : Promise.resolve(null),
     ]);
   } catch (error) {
     pushDebug("[WS] loadWorkspace:error", {
@@ -3979,6 +4980,13 @@ async function loadWorkspace(forceResetOverlay = false, silent = false) {
   const t1 = performance.now();
   workspaceState = payload.data || {};
   workspaceStateStore = statePayload?.data || null;
+  selectedBacktestResults = backtestPayload?.data || selectedBacktestResults;
+  window.workspaceState = workspaceState;
+  window.selectedBacktestResults = selectedBacktestResults;
+  window.workspaceViewMode = workspaceViewMode;
+  if (workspaceViewMode === "backtest" && selectedBacktestResults?.selected_run) {
+    applyBacktestWindowToChart(selectedBacktestResults.selected_run);
+  }
   window.workspaceStateStore = workspaceStateStore;
   renderHeader(workspaceState.strategy || {});
   renderSources(workspaceState.source_statuses || {});
@@ -3993,14 +5001,14 @@ async function loadWorkspace(forceResetOverlay = false, silent = false) {
   if (!silent || !trackedMarkets.length) {
     normalizeTrackedMarkets(buildDefaultMarketTargets());
   }
+  syncMainChartModeOptions();
   syncMarketSelectorInputs(!silent);
   renderTrackedMarkets();
   renderMarketStatus();
   renderSummary(workspaceState.strategy || {});
-  if ((workspaceState.recent_events || []).length || !_fullEventsList.length) {
-    renderEvents(workspaceState.recent_events || []);
-  }
+  renderWorkspaceModeEvents();
   renderBacktest(workspaceState.backtest || null);
+  updateWorkspaceViewBadge();
   renderPresetOptions(workspaceState.workspace_presets || []);
   renderMarketResults();
   updateQuickRangeButtons();
@@ -4279,6 +5287,10 @@ async function refreshChartAuto() {
 }
 
 async function loadEvents() {
+  if (workspaceViewMode === "backtest" && selectedBacktestResults?.selected_run) {
+    renderWorkspaceModeEvents();
+    return;
+  }
   const t0 = performance.now();
   console.log("[WS] loadEvents start");
   pushDebug("[WS] loadEvents:start", { row_id: Number(rowId) });
@@ -4571,7 +5583,12 @@ document.getElementById("workspaceRefreshBtn").addEventListener("click", async (
     await loadWorkspace(false, true);
     await loadChart();
     loadEvents().catch(() => {});
-    connectWorkspaceLive();
+    if (workspaceViewMode === "backtest") {
+      disconnectWorkspaceLive();
+      setAutoRefresh(false);
+    } else {
+      connectWorkspaceLive();
+    }
   } catch (error) {
     setStatus(workspaceSummary, error.message);
   }
@@ -4673,6 +5690,19 @@ workspaceMarketResults.addEventListener("click", async (event) => {
   renderMarketResults();
   renderSummary(workspaceState?.strategy || {});
   await loadChart();
+});
+
+workspaceBacktest?.addEventListener("click", (event) => {
+  const view = event.target.closest("[data-workspace-view]");
+  if (view) {
+    event.preventDefault();
+    switchWorkspaceView(view.dataset.workspaceView).catch((error) => setStatus(workspaceBacktest, `切换视图失败: ${error.message}`));
+    return;
+  }
+  const create = event.target.closest("[data-backtest-create]");
+  if (!create) return;
+  event.preventDefault();
+  createWorkspaceBacktest().catch((error) => setStatus(workspaceBacktest, `创建回测失败: ${error.message}`));
 });
 
 document.querySelectorAll("[data-range-value]").forEach((button) => {
@@ -4798,6 +5828,9 @@ window.addEventListener("resize", () => {
   if (workspaceChartInstance) {
     workspaceChartInstance.resize();
   }
+  if (workspaceBacktestEquityChart) {
+    workspaceBacktestEquityChart.resize();
+  }
 });
 
 document.addEventListener("visibilitychange", () => {
@@ -4806,6 +5839,10 @@ document.addEventListener("visibilitychange", () => {
     workspaceAutoRefreshBadge.textContent = "hold";
     workspaceAutoRefreshText.textContent = "标签页隐藏中，自动刷新暂时降频。";
   } else {
+    if (workspaceViewMode === "backtest") {
+      updateWorkspaceViewBadge();
+      return;
+    }
     if (!workspaceBootReady || workspaceBooting || !workspaceState) {
       pushDebug("[WS] visibility:defer", {
         row_id: Number(rowId),
@@ -4837,8 +5874,14 @@ async function boot() {
     await loadChart();
     workspaceBootReady = true;
     initialEventsLoad.catch(() => {});
-    connectWorkspaceLive();
-    setAutoRefresh(true);
+    if (workspaceViewMode === "backtest") {
+      disconnectWorkspaceLive();
+      setAutoRefresh(false);
+      updateWorkspaceViewBadge();
+    } else {
+      connectWorkspaceLive();
+      setAutoRefresh(true);
+    }
   } catch (error) {
     setStatus(workspaceSummary, error.message);
     setStatus(workspaceCharts, error.message);

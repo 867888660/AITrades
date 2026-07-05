@@ -180,6 +180,22 @@ EVENT_GRAPH_CAPABILITIES: Dict[str, Any] = {
     "patch_validate_capability": "event.graph.patch.validate",
     "change_request_capability": "event.graph.change_request",
     "approval_modes": ["manual", "trusted_low_risk", "trusted_all"],
+    "supported_apply_actions": [
+        "event_create",
+        "event_update",
+        "event_archive",
+        "event_merge",
+        "finance_create",
+        "finance_update",
+        "finance_archive",
+        "edge_create",
+        "edge_update",
+        "edge_delete",
+        "finance_mapping_create",
+        "expression_create",
+        "expression_update",
+        "expression_archive",
+    ],
     "relation_classes": {
         "LOGICAL": sorted(LOGICAL_RELATIONS),
         "IMPACT": sorted(IMPACT_RELATIONS),
@@ -977,14 +993,34 @@ def _load_draft(conn: sqlite3.Connection, draft_id: str) -> Optional[Dict[str, A
     return _format_draft(row) if row else None
 
 
+def _resolve_market_identity(value: str) -> Dict[str, Any]:
+    text = str(value or "").strip()
+    if not text:
+        return {}
+    try:
+        resolved = resolve_market_selection(condition_id=text, limit=1)
+    except Exception:
+        return {}
+    selected = resolved.get("selected") if isinstance(resolved, dict) else {}
+    return selected if isinstance(selected, dict) else {}
+
+
 def _normalize_market(raw: Dict[str, Any]) -> Dict[str, Any]:
     market = dict(raw or {})
     instrument_id = str(market.get("instrument_id") or market.get("condition_id") or market.get("market_id") or "").strip()
     condition_id = str(market.get("condition_id") or market.get("market_id") or "").strip()
+    resolved = _resolve_market_identity(condition_id or instrument_id)
+    resolved_condition_id = str(resolved.get("condition_id") or "").strip()
+    if resolved_condition_id:
+        if not condition_id or resolved_condition_id.lower().startswith(condition_id.lower()) or condition_id.lower().startswith("0x"):
+            condition_id = resolved_condition_id
+        if not instrument_id or resolved_condition_id.lower().startswith(instrument_id.lower()) or instrument_id.lower().startswith("0x"):
+            instrument_id = resolved_condition_id
     outcome = str(market.get("outcome") or market.get("side") or "YES").strip().upper()
     if outcome not in {"YES", "NO"}:
         outcome = "YES"
     return {
+        **resolved,
         **market,
         "instrument_id": instrument_id,
         "condition_id": condition_id,
@@ -993,9 +1029,73 @@ def _normalize_market(raw: Dict[str, Any]) -> Dict[str, Any]:
         "venue": str(market.get("venue") or "polymarket").strip().lower(),
         "max_entry_price": _safe_float(market.get("max_entry_price", market.get("max_price")), 0.0),
         "max_exposure_usdc": _safe_float(market.get("max_exposure_usdc", market.get("budget_cap")), 0.0),
-        "yes_token": market.get("yes_token") or "",
-        "no_token": market.get("no_token") or "",
+        "yes_token": market.get("yes_token") or resolved.get("yes_token") or "",
+        "no_token": market.get("no_token") or resolved.get("no_token") or "",
     }
+
+
+_DEADLINE_PARAM_KEY = "Enddate"
+_DEADLINE_PARAM_ALIASES = {"enddate", "endtime", "l0endtime"}
+
+
+def _normalize_param_key(value: Any) -> str:
+    return "".join(ch for ch in str(value or "").lower() if ch.isalnum())
+
+
+def _params_have_deadline(params: Dict[str, Any]) -> bool:
+    for key, value in (params or {}).items():
+        if _normalize_param_key(key) in _DEADLINE_PARAM_ALIASES and str(value or "").strip():
+            return True
+    return False
+
+
+def _market_end_date_value(market: Dict[str, Any], *, allow_resolve: bool = False) -> str:
+    if not isinstance(market, dict):
+        return ""
+    raw = market.get("raw") if isinstance(market.get("raw"), dict) else {}
+    for value in (
+        market.get("end_date"),
+        market.get("endDate"),
+        market.get("Enddate"),
+        market.get("EndDate"),
+        raw.get("endDate"),
+        raw.get("umaEndDate"),
+        raw.get("end_date"),
+    ):
+        text = str(value or "").strip()
+        if text:
+            return text
+    if not allow_resolve:
+        return ""
+    condition_id = str(market.get("condition_id") or market.get("instrument_id") or market.get("market_id") or "").strip()
+    if not condition_id:
+        return ""
+    try:
+        resolved = resolve_market_selection(condition_id=condition_id, limit=1)
+        selected = resolved.get("selected") if isinstance(resolved, dict) else {}
+        if isinstance(selected, dict):
+            return _market_end_date_value(selected, allow_resolve=False)
+    except Exception:
+        return ""
+    return ""
+
+
+def _first_market_end_date(markets: List[Dict[str, Any]], *, allow_resolve: bool = False) -> str:
+    for market in markets or []:
+        end_date = _market_end_date_value(market, allow_resolve=allow_resolve)
+        if end_date:
+            return end_date
+    return ""
+
+
+def _ensure_params_deadline(params: Dict[str, Any], markets: List[Dict[str, Any]], *, allow_resolve: bool = False) -> Dict[str, Any]:
+    clean = dict(params or {})
+    if _params_have_deadline(clean):
+        return clean
+    end_date = _first_market_end_date(markets, allow_resolve=allow_resolve)
+    if end_date:
+        clean[_DEADLINE_PARAM_KEY] = end_date
+    return clean
 
 
 def _clip_text(value: Any, limit: int = 220) -> str:
@@ -1145,6 +1245,7 @@ def _normalize_draft_payload(payload: Dict[str, Any], *, existing: Optional[Dict
     execution_rules = source.get("execution_rules") if isinstance(source.get("execution_rules"), dict) else {}
     exit_rules = source.get("exit_rules") if isinstance(source.get("exit_rules"), dict) else {}
     params = source.get("params") if isinstance(source.get("params"), dict) else {}
+    params = _ensure_params_deadline(params, markets, allow_resolve=True)
     mode = str(source.get("mode") or source.get("state") or "Stop").strip() or "Stop"
     if mode not in VALID_STRATEGY_MODES:
         mode = "Stop"
@@ -1872,16 +1973,7 @@ _EVIDENCE_RELATIONS = EVIDENCE_RELATIONS
 _MAPPING_RELATIONS = MAPPING_RELATIONS
 _MARKET_MOVE_RELATIONS = MARKET_MOVE_RELATIONS
 _REASONING_RELATION_CLASSES = REASONING_RELATION_CLASSES
-_LOW_RISK_ACTIONS = {
-    "alias_create",
-    "alias_update",
-    "tag_add",
-    "tag_remove",
-    "observation_link",
-    "metadata_update",
-    "text_update",
-    "typo_fix",
-}
+_LOW_RISK_ACTIONS: set[str] = set()
 _HIGH_RISK_ACTIONS = {
     "edge_create",
     "edge_update",
@@ -2001,6 +2093,13 @@ def _validate_event_graph_patch_payload(payload: Dict[str, Any]) -> Dict[str, An
             action = "unknown"
         action_key = action.lower()
         item["action"] = action_key
+        if action_key != "unknown" and action_key not in _EVENT_GRAPH_APPLY_ACTIONS:
+            errors.append({
+                "code": "UNSUPPORTED_APPLY_ACTION",
+                "index": index,
+                "action": action_key,
+                "message": f"Action '{action_key}' cannot be applied to Graph Core in this release. Use one of: {', '.join(sorted(_EVENT_GRAPH_APPLY_ACTIONS))}",
+            })
 
         relation_class = str(item.get("relation_class") or "").strip().upper()
         relation_type = str(item.get("relation_type") or "").strip().upper()
@@ -2480,6 +2579,8 @@ def human_review_event_graph_change_request(request_id: str, payload: Optional[D
     actor_type, actor_id = _actor(payload, default_type="human", default_id=DEFAULT_HUMAN_ID)
     if actor_type not in {"human", "admin"}:
         raise ValueError("only human/admin can review EventGraph change requests")
+    if str(decision or "").strip().lower() in {"approve", "approved"}:
+        _ensure_event_graph_change_request_applyable(get_change_request(request_id))
     item = review_change_request(
         request_id,
         decision=decision,
@@ -2499,11 +2600,29 @@ def human_review_event_graph_change_request(request_id: str, payload: Optional[D
     return item
 
 
+def _ensure_event_graph_change_request_applyable(request: Dict[str, Any]) -> None:
+    validation = request.get("validation") if isinstance(request.get("validation"), dict) else {}
+    if validation and validation.get("valid") is False:
+        raise ValueError("cannot apply invalid change request")
+    patch = request.get("patch") if isinstance(request.get("patch"), dict) else {}
+    items = patch.get("items") if isinstance(patch.get("items"), list) else []
+    if not items:
+        raise ValueError("change request patch has no items")
+    unsupported = sorted({
+        str(item.get("action") or "").strip().lower()
+        for item in items
+        if isinstance(item, dict) and str(item.get("action") or "").strip().lower() not in _EVENT_GRAPH_APPLY_ACTIONS
+    })
+    if unsupported:
+        raise ValueError("unsupported apply action(s): " + ", ".join(unsupported))
+
+
 def human_apply_event_graph_change_request(request_id: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     payload = payload or {}
     actor_type, actor_id = _actor(payload, default_type="human", default_id=DEFAULT_HUMAN_ID)
     if actor_type not in {"human", "admin"}:
         raise ValueError("only human/admin can apply EventGraph change requests")
+    _ensure_event_graph_change_request_applyable(get_change_request(request_id))
     result = apply_change_request(request_id, actor_type=actor_type, actor_id=actor_id)
     _audit_request(
         actor_type=actor_type,
@@ -2515,6 +2634,33 @@ def human_apply_event_graph_change_request(request_id: str, payload: Optional[Di
         output_data=_compact_audit_value(result),
     )
     return result
+
+
+def human_approve_and_apply_event_graph_change_request(request_id: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = payload or {}
+    actor_type, actor_id = _actor(payload, default_type="human", default_id=DEFAULT_HUMAN_ID)
+    if actor_type not in {"human", "admin"}:
+        raise ValueError("only human/admin can approve and apply EventGraph change requests")
+    request = get_change_request(request_id)
+    status = str(request.get("status") or "").strip().upper()
+    if status not in {"PENDING", "APPROVED", "APPLY_FAILED"}:
+        raise ValueError("change request must be PENDING, APPROVED, or APPLY_FAILED before approve-and-apply")
+    _ensure_event_graph_change_request_applyable(request)
+    reviewed = request
+    if status != "APPROVED":
+        reviewed = human_review_event_graph_change_request(
+            request_id,
+            payload,
+            decision="approve",
+        )
+    applied = human_apply_event_graph_change_request(request_id, payload)
+    final = get_change_request(request_id)
+    final["review_result"] = {
+        "request_id": reviewed.get("request_id"),
+        "status": reviewed.get("status"),
+    }
+    final["apply_result"] = applied
+    return final
 
 
 def _select_market_outcome(market: Dict[str, Any], mode: str = "yes") -> str:
@@ -3255,6 +3401,9 @@ def _load_snapshot(conn: sqlite3.Connection, approval_id: str) -> Dict[str, Any]
     snapshot = _parse_json(data.get("snapshot_json"), {})
     if isinstance(snapshot, dict):
         snapshot = dict(snapshot)
+        markets = snapshot.get("markets") if isinstance(snapshot.get("markets"), list) else []
+        params = snapshot.get("params") if isinstance(snapshot.get("params"), dict) else {}
+        snapshot["params"] = _ensure_params_deadline(params, markets, allow_resolve=True)
         snapshot["agent_report"] = _normalize_agent_report(snapshot, snapshot)
         cleaned_thesis = _clean_agent_text(snapshot.get("thesis"), 260)
         if cleaned_thesis:
@@ -3323,6 +3472,11 @@ def _draft_json_from_strategy_form(base: Dict[str, Any], payload: Dict[str, Any]
         if markets and _safe_float(result["budget"].get("max_total_usdc"), 0.0) <= 0:
             result["budget"]["max_total_usdc"] = sum(_safe_float(m.get("max_exposure_usdc"), 0.0) for m in markets)
 
+    result["params"] = _ensure_params_deadline(
+        result.get("params") if isinstance(result.get("params"), dict) else {},
+        result.get("markets") if isinstance(result.get("markets"), list) else [],
+        allow_resolve=True,
+    )
     return _normalize_draft_payload({"draft": result})
 
 
@@ -3539,6 +3693,7 @@ def _strategy_payload_from_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     execution_rules = snapshot.get("execution_rules") if isinstance(snapshot.get("execution_rules"), dict) else {}
     exit_rules = snapshot.get("exit_rules") if isinstance(snapshot.get("exit_rules"), dict) else {}
     params = snapshot.get("params") if isinstance(snapshot.get("params"), dict) else {}
+    params = _ensure_params_deadline(params, markets, allow_resolve=True)
     mode = str(snapshot.get("mode") or snapshot.get("state") or "Stop").strip() or "Stop"
     if mode not in VALID_STRATEGY_MODES:
         mode = "Stop"

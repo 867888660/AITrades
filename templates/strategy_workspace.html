@@ -4,8 +4,8 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>策略工作台</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
-    <link rel="stylesheet" href="{{ url_for('static', filename='workspace_v3.css') }}?v=20260608_state_lanes">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260705_metric_empty_notice">
+    <link rel="stylesheet" href="{{ url_for('static', filename='workspace_v3.css') }}?v=20260704_chart_state_docs">
   </head>
   <body data-row-id="{{ row_id }}">
     <div class="ws3-shell">
@@ -57,6 +57,9 @@
                 <option value="1m">1m</option>
                 <option value="5m">5m</option>
                 <option value="15m">15m</option>
+                <option value="1h">1H</option>
+                <option value="4h">4H</option>
+                <option value="1d">1D</option>
               </select>
             </label>
             <input id="chartInterval" type="hidden" value="5s">
@@ -82,6 +85,7 @@
           </div>
 
           <p id="workspaceChartMeta" class="ws3-chart-meta"></p>
+          <div id="workspaceChartInsights" class="workspace-chart-insights" hidden></div>
           <div id="chartMetricPicker" class="metric-picker"></div>
           <div id="chartOverlayPicker" class="metric-picker"></div>
           <div class="ws3-chart-area" id="workspaceCharts"></div>
@@ -176,7 +180,7 @@
     <script src="{{ url_for('static', filename='echarts.min.js') }}" onerror="this.src='https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js'"></script>
     <script src="{{ url_for('static', filename='polymarket_links.js') }}"></script>
     <script src="{{ url_for('static', filename='strategy_params_bulk.js') }}?v=20260523_param_bulk"></script>
-    <script src="{{ url_for('static', filename='strategy_workspace_v2.js') }}?v=20260608_events_smooth_ref"></script>
-    <script src="{{ url_for('static', filename='workspace_v3_patch.js') }}?v=20260514_events_stable"></script>
+    <script src="{{ url_for('static', filename='strategy_workspace_v2.js') }}?v=20260705_chart_perf_state_lane_compress"></script>
+    <script src="{{ url_for('static', filename='workspace_v3_patch.js') }}?v=20260704_chart_state_docs"></script>
   </body>
 </html>

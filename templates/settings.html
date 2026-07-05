@@ -181,6 +181,42 @@
 
               <section class="settings-section">
                 <div class="settings-section-head">
+                  <h2>EventGraph 审批模式</h2>
+                  <p>只管理 EventGraph 正式入图；新闻 observation / derived event 继续自动入库，策略审批和实盘执行不受这里影响。</p>
+                </div>
+                <div class="grid three">
+                  <label>
+                    审批策略
+                    <select id="eventGraphApprovalMode">
+                      <option value="manual">人工批准</option>
+                      <option value="trusted_low_risk">低风险自动</option>
+                      <option value="trusted_all">完全信任</option>
+                    </select>
+                  </label>
+                  <label>
+                    自动执行 Actor
+                    <input id="eventGraphAutoApplyActorId" placeholder="event_graph_trusted_rule">
+                  </label>
+                  <label>
+                    单次自动条数上限
+                    <input id="eventGraphMaxItemsPerRequest" type="number" min="1" max="1000" step="1">
+                  </label>
+                </div>
+                <div class="grid two">
+                  <label>
+                    最小 confidence
+                    <input id="eventGraphMinConfidence" type="number" min="0" max="1" step="0.01">
+                  </label>
+                  <label class="switch">
+                    <input id="eventGraphRequireEvidenceSummary" type="checkbox">
+                    <span>自动入图必须带证据摘要</span>
+                  </label>
+                </div>
+                <p class="settings-note">完全信任会让通过校验的 EventGraph change request 由 system 自动 approve/apply，并写入版本历史和审计日志。</p>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-head">
                   <h2>资金与风险上限</h2>
                   <p>Agent 超过这些边界时，风控会阻止提交或要求人工修改。</p>
                 </div>
@@ -291,6 +327,7 @@
                   <label class="checkbox"><input type="checkbox" data-agent-permission="event_read"><span>读取 EventGraph / 新闻事件</span></label>
                   <label class="checkbox"><input type="checkbox" data-agent-permission="event_news_refresh"><span>刷新全球新闻事件</span></label>
                   <label class="checkbox"><input type="checkbox" data-agent-permission="event_news_search"><span>检索指定新闻事件</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="event_graph_change_request"><span>提交 EventGraph 变更请求</span></label>
                 </div>
                 <p class="settings-note">硬性禁止：agent 不能批准自己的策略、不能直接执行实盘、不能修改自身权限。</p>
               </section>
@@ -338,6 +375,6 @@
         </section>
       </main>
     </div>
-    <script src="{{ url_for('static', filename='settings.js') }}?v=llm-settings-20260628"></script>
+    <script src="{{ url_for('static', filename='settings.js') }}?v=eventgraph-approval-20260630"></script>
   </body>
 </html>

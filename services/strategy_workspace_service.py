@@ -9,6 +9,7 @@ from services.backtest_service import get_backtest_placeholder
 from services.config_loader import get_market_realtime_db_path, load_web_settings
 from services.realtime_collector import collector
 from services.virtual_context_builder import build_use_data
+from services.history_data_service import get_backtest_metric_catalog, get_backtest_workspace_strategy
 from services.polymarket_service import (
     fetch_strategy_detail,
     get_strategy_chart_capabilities,
@@ -20,6 +21,22 @@ from services.strategy_event_service import list_strategy_events
 from services.strategy_settings_service import build_strategy_settings_schema
 from services.strategy_stats_store import get_strategy_stats_db_path, strategy_metrics_db_directory
 from services.workspace_preset_service import list_workspace_presets
+
+
+_BACKTEST_STRATEGY_METRIC_DEFAULTS = (
+    "trend_ratio",
+    "pnl_pct",
+    "drawdown_pct",
+    "target_position",
+)
+_BACKTEST_STATE_LANE_DEFAULTS = (
+    "decision",
+    "position_state",
+    "reason",
+    "risk_state",
+    "trend_state",
+    "machine_state",
+)
 
 
 def _path_status(path_text: str | None) -> Dict[str, Any]:
@@ -34,7 +51,58 @@ def _path_status(path_text: str | None) -> Dict[str, Any]:
     }
 
 
-def get_strategy_workspace(row_id: int, include_events: bool = False) -> Dict[str, Any]:
+def _merge_metric_catalog(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for item in (base.get("items") if isinstance(base, dict) else []) or []:
+        key = str(item.get("key") or "").strip()
+        if key:
+            merged[key] = item
+    for item in (extra.get("items") if isinstance(extra, dict) else []) or []:
+        key = str(item.get("key") or "").strip()
+        if key:
+            merged[key] = item
+    items = list(merged.values())
+    return {
+        "items": items,
+        "numeric": [item for item in items if item.get("metric_type") == "number" and item.get("value_state") == "value"],
+        "state": [item for item in items if item.get("kind") == "state" and item.get("value_state") == "value"],
+    }
+
+
+def _is_backtest_derived_catalog_item(item: Dict[str, Any]) -> bool:
+    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    key = str(item.get("key") or "")
+    return meta.get("source") == "backtest_derived" or key.startswith("backtest_")
+
+
+def _default_strategy_metric_keys(catalog: Dict[str, Any]) -> list[str]:
+    numeric_items = {
+        str(item.get("key") or ""): item
+        for item in (catalog.get("numeric") if isinstance(catalog, dict) else []) or []
+        if item.get("key") and not _is_backtest_derived_catalog_item(item)
+    }
+    state_items = {
+        str(item.get("key") or ""): item
+        for item in (catalog.get("state") if isinstance(catalog, dict) else []) or []
+        if item.get("key") and not _is_backtest_derived_catalog_item(item)
+    }
+    defaults: list[str] = []
+    for key in _BACKTEST_STRATEGY_METRIC_DEFAULTS:
+        if key in numeric_items:
+            defaults.append(f"metric:{key}")
+    if not defaults:
+        for key in list(numeric_items)[:3]:
+            defaults.append(f"metric:{key}")
+    for key in _BACKTEST_STATE_LANE_DEFAULTS:
+        if key in state_items:
+            defaults.append(f"metric_state:{key}")
+    if not any(key.startswith("metric_state:") for key in defaults):
+        for key in list(state_items)[:4]:
+            defaults.append(f"metric_state:{key}")
+    return defaults
+
+
+def get_strategy_workspace(row_id: int, include_events: bool = False, backtest_run_id: int | str | None = None) -> Dict[str, Any]:
     t0 = time.perf_counter()
     print(f"[SV][workspace] start row_id={row_id} include_events={include_events}")
 
@@ -70,6 +138,11 @@ def get_strategy_workspace(row_id: int, include_events: bool = False) -> Dict[st
         raw_strategy = strategy_data_source.get_strategy(row_id) or {}
     except Exception:
         raw_strategy = {}
+    if not raw_strategy:
+        try:
+            raw_strategy = get_backtest_workspace_strategy(row_id) or {}
+        except Exception:
+            raw_strategy = {}
     live_leg_snapshots = {
         int(snap.get("leg_index") or 0): snap
         for snap in (detail.get("legs_snapshot") or [])
@@ -100,7 +173,7 @@ def get_strategy_workspace(row_id: int, include_events: bool = False) -> Dict[st
             fallback_pnl = leg.get("unrealized_pnl")
         market_legs.append(
             {
-                "type": "market",
+                "type": "binance" if str(leg.get("venue") or "").strip().lower() == "binance" or str(leg.get("asset_class") or "").strip().lower() in {"crypto_spot", "crypto"} else "market",
                 "leg_index": leg_index,
                 "label": f"Leg {leg_index + 1}",
                 "condition_id": leg.get("condition_id") or "",
@@ -110,6 +183,7 @@ def get_strategy_workspace(row_id: int, include_events: bool = False) -> Dict[st
                 "asset_class": leg.get("asset_class") or "polymarket_binary",
                 "venue": leg.get("venue") or "",
                 "symbol": leg.get("symbol") or "",
+                "interval": (leg.get("instrument_json") or {}).get("interval") if isinstance(leg.get("instrument_json"), dict) else "",
                 "instrument_id": leg.get("instrument_id") or "",
                 "instrument_json": leg.get("instrument_json") or {},
                 "budget_cap": leg.get("budget_cap"),
@@ -141,13 +215,71 @@ def get_strategy_workspace(row_id: int, include_events: bool = False) -> Dict[st
             }
         )
 
+    has_crypto_legs = any(
+        str(leg.get("venue") or "").strip().lower() == "binance"
+        or str(leg.get("asset_class") or "").strip().lower() in {"crypto_spot", "crypto"}
+        for leg in (raw_strategy.get("legs") or [])
+    )
+    chart_defaults = get_strategy_chart_defaults(detail)
+    chart_capabilities = get_strategy_chart_capabilities(detail)
+    if has_crypto_legs:
+        chart_defaults = {
+            **chart_defaults,
+            "interval": "15m",
+            "range": "1w",
+            "main_side": "all",
+            "main_series": [],
+            "sub_series": ["strategy_pnl"],
+            "template": "crypto_spot",
+        }
+        chart_capabilities = {
+            **chart_capabilities,
+            "main_allowed": [],
+            "sub_allowed": ["strategy_pnl", "strategy_bankroll", "initial_capital", "realized_profit"],
+        }
+    parsed_backtest_run_id = 0
+    try:
+        parsed_backtest_run_id = int(str(backtest_run_id or "").strip() or "0")
+    except (TypeError, ValueError):
+        parsed_backtest_run_id = 0
+    if parsed_backtest_run_id:
+        backtest_catalog = get_backtest_metric_catalog(parsed_backtest_run_id)
+        chart_capabilities = {
+            **chart_capabilities,
+            "metric_catalog": _merge_metric_catalog(chart_capabilities.get("metric_catalog") or {}, backtest_catalog),
+        }
+        backtest_defaults = [
+            "metric:backtest_return",
+            "metric:backtest_drawdown",
+            "metric_state:backtest_position_state",
+        ]
+        strategy_metric_defaults = _default_strategy_metric_keys(chart_capabilities.get("metric_catalog") or {})
+        available_catalog_keys = {
+            f"metric:{item.get('key')}"
+            for item in chart_capabilities.get("metric_catalog", {}).get("numeric", [])
+            if item.get("key")
+        } | {
+            f"metric_state:{item.get('key')}"
+            for item in chart_capabilities.get("metric_catalog", {}).get("state", [])
+            if item.get("key")
+        }
+        merged_sub = list(chart_defaults.get("sub_series") or [])
+        for key in [*strategy_metric_defaults, *backtest_defaults]:
+            if key in available_catalog_keys and key not in merged_sub:
+                merged_sub.append(key)
+        chart_defaults = {
+            **chart_defaults,
+            "sub_series": merged_sub,
+            "template": "backtest_crypto" if has_crypto_legs else chart_defaults.get("template", "backtest"),
+        }
+
     total_ms = (time.perf_counter() - t0) * 1000
     print(f"[SV][workspace] total {total_ms:.1f}ms row_id={row_id}")
     return {
         "strategy": detail,
         "settings_schema": build_strategy_settings_schema(detail),
-        "chart_defaults": get_strategy_chart_defaults(detail),
-        "chart_capabilities": get_strategy_chart_capabilities(detail),
+        "chart_defaults": chart_defaults,
+        "chart_capabilities": chart_capabilities,
         "market_context": {
             "type": "strategy",
             "row_id": row_id,

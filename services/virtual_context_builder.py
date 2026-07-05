@@ -32,6 +32,7 @@ from services.strategy_schema_service import get_strategy_code_schemas, merge_sc
 _MARKET_META_CACHE: Dict[str, Dict[str, Any]] = {}
 _MARKET_META_TTL_SECONDS = 300.0
 _DICTIONARY_META_CACHE: Dict[str, Dict[str, Any]] = {}
+_RESOLVED_META_CACHE: Dict[str, Dict[str, Any]] = {}
 _END_DATE_INPUT_KEYS = ("Enddate", "EndDate", "end_date", "endDate", "EndTime", "L0_EndTime")
 
 
@@ -589,6 +590,37 @@ def _read_dictionary_market_meta(condition_id: str) -> Dict[str, Any]:
     return dict(data)
 
 
+def _read_resolved_market_meta(condition_id: str) -> Dict[str, Any]:
+    condition_id = str(condition_id or "").strip()
+    if not condition_id:
+        return {}
+    now = time.monotonic()
+    cached = _RESOLVED_META_CACHE.get(condition_id)
+    if cached and (now - float(cached.get("ts") or 0.0)) < _MARKET_META_TTL_SECONDS:
+        return dict(cached.get("data") or {})
+    data: Dict[str, Any] = {}
+    try:
+        from services.polymarket_service import resolve_market_selection
+
+        resolved = resolve_market_selection(condition_id=condition_id, limit=1)
+        selected = resolved.get("selected") if isinstance(resolved, dict) else {}
+        if isinstance(selected, dict) and selected:
+            raw = selected.get("raw") if isinstance(selected.get("raw"), dict) else {}
+            data = {
+                "condition_id": selected.get("condition_id") or condition_id,
+                "question": selected.get("question") or raw.get("question") or "",
+                "category": selected.get("category") or "",
+                "end_date": selected.get("end_date") or raw.get("endDate") or raw.get("umaEndDate") or "",
+                "url": selected.get("url") or raw.get("url") or "",
+                "yes_token": selected.get("yes_token") or "",
+                "no_token": selected.get("no_token") or "",
+            }
+    except Exception:
+        data = {}
+    _RESOLVED_META_CACHE[condition_id] = {"ts": now, "data": data}
+    return dict(data)
+
+
 # ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
@@ -691,6 +723,7 @@ def build_use_data(
         instrument_params = _parse_json_dict(leg.get("params_json"))
         instrument_meta = _parse_json_dict(leg.get("instrument_json"))
         dictionary_meta = _read_dictionary_market_meta(condition_id)
+        resolved_meta = _read_resolved_market_meta(condition_id)
 
         # 自动补全：有 condition_id 但缺 token 时，从 markets_state 反查
         if condition_id and (not yes_token or not no_token):
@@ -703,6 +736,10 @@ def build_use_data(
             yes_token = str(dictionary_meta.get("yes_token") or "").strip()
         if not no_token:
             no_token = str(dictionary_meta.get("no_token") or "").strip()
+        if not yes_token:
+            yes_token = str(resolved_meta.get("yes_token") or "").strip()
+        if not no_token:
+            no_token = str(resolved_meta.get("no_token") or "").strip()
 
         yes_snap = _read_market_snapshot(realtime_db_path, yes_token)
         no_snap = _read_market_snapshot(realtime_db_path, no_token)
@@ -739,6 +776,7 @@ def build_use_data(
             or strategy.get("end_date")
             or market_meta.get("end_date")
             or dictionary_meta.get("end_date")
+            or resolved_meta.get("end_date")
             or ""
         )
         day_to_end, hour_to_end = _days_hours_to_end(end_date_iso)
@@ -754,6 +792,7 @@ def build_use_data(
             or state_snap.get("question")
             or state_snap.get("title")
             or dictionary_meta.get("question")
+            or resolved_meta.get("question")
             or market_meta.get("question")
             or symbol
             or ""

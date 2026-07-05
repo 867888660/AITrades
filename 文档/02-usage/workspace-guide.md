@@ -1,5 +1,7 @@
 # Strategy Workspace Guide
 
+`State Lanes`、`Strategy Metrics`、策略状态机与 `stop_loss_locked` 的准确定义见 [state-lanes-and-metrics.md](../03-features/state-lanes-and-metrics.md)。
+
 > 2026-05-05 补充：策略监控首页、Legs Snapshot 粒度、Recent Action 滚动展示、以及 Polymarket grouped market 外链规则，详见 [strategy-monitor-home-ui.md](../03-features/strategy-monitor-home-ui.md)。
 > 2026-05-07 补充：工作台状态切换、图表稀疏数据兜底、Print 去重展示、图表副指标范围与策略监控页保持一致。
 

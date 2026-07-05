@@ -15,6 +15,7 @@ from services.binance_market_service import search_binance_markets
 from services.crypto_service import fetch_crypto_quotes
 from services.event_graph_service import build_event_graph, get_event_graph_categories
 from services.event_news_service import (
+    deduplicate_derived_events,
     event_news_scheduler,
     get_status as get_event_news_status,
     list_events as list_news_events,
@@ -24,10 +25,13 @@ from services.event_news_service import (
 from services.finance_service import fetch_finance_quotes
 from services.history_data_service import (
     add_watchlist_item as add_history_watchlist_item,
+    create_backtest_batch as create_history_backtest_batch,
     create_backtest_case as create_history_backtest_case,
     create_backtest_collection as create_history_backtest_collection,
     create_backtest_run as create_history_backtest_run,
+    delete_backtest_batch as delete_history_backtest_batch,
     delete_backtest_case as delete_history_backtest_case,
+    delete_backtest_run as delete_history_backtest_run,
     delete_watchlist_item as delete_history_watchlist_item,
     download_binance_klines,
     download_binance_klines_range,
@@ -35,16 +39,26 @@ from services.history_data_service import (
     evaluate_backtest_case_payload,
     get_coverage as get_history_coverage,
     health_snapshot as get_history_health,
+    get_backtest_batch as get_history_backtest_batch,
     get_backtest_run as get_history_backtest_run,
+    import_backtest_run_to_workspace as import_history_backtest_run_to_workspace,
+    list_backtest_batches as list_history_backtest_batches,
     list_backtest_cases as list_history_backtest_cases,
     list_backtest_collections as list_history_backtest_collections,
     list_backtest_runs as list_history_backtest_runs,
     list_watchlist as list_history_watchlist,
     preview_history,
+    rename_backtest_batch as rename_history_backtest_batch,
+    rename_backtest_case as rename_history_backtest_case,
+    rename_backtest_run as rename_history_backtest_run,
     rerun_backtest_run as rerun_history_backtest_run,
 )
 from services.http_client import SESSION
-from services.backtest_service import create_backtest_placeholder, get_backtest_placeholder
+from services.backtest_service import (
+    create_strategy_backtest,
+    get_strategy_backtest,
+    get_strategy_backtest_results,
+)
 from services.polymarket_dictionary_service import get_dictionary_status, start_dictionary_refresh
 from services.ledger_service import get_ledger_snapshot
 from services.polymarket_service import (
@@ -559,6 +573,19 @@ def event_graph_observations_api():
         return _json_error(exc)
 
 
+@app.post("/api/event-graph/news/deduplicate")
+@debug_timing("event_graph_news_deduplicate")
+def event_graph_news_deduplicate_api():
+    try:
+        payload = request.get_json(silent=True) or {}
+        dry_raw = payload.get("dry_run", request.args.get("dry_run", "0"))
+        dry_run = str(dry_raw).strip().lower() in {"1", "true", "yes", "on"}
+        limit = payload.get("limit") or request.args.get("limit", "500")
+        return jsonify({"ok": True, "data": deduplicate_derived_events(dry_run=dry_run, limit=limit)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
 @app.get("/api/polymarket/markets")
 def polymarket_markets():
     query = request.args.get("q", "")
@@ -775,6 +802,18 @@ def history_backtest_case_delete(case_id: int):
         return _json_error(exc)
 
 
+@app.patch("/api/history/backtest-cases/<int:case_id>")
+@debug_timing("history_backtest_case_rename")
+def history_backtest_case_rename(case_id: int):
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify({"ok": True, "data": rename_history_backtest_case(case_id, payload.get("name") or payload.get("case_name") or "")})
+    except ValueError as exc:
+        return _json_error(exc, 400 if "required" in str(exc).lower() else 404)
+    except Exception as exc:
+        return _json_error(exc)
+
+
 @app.post("/api/history/backtest-cases/evaluate")
 @debug_timing("history_backtest_case_evaluate")
 def history_backtest_case_evaluate():
@@ -787,12 +826,115 @@ def history_backtest_case_evaluate():
         return _json_error(exc)
 
 
+@app.get("/api/history/backtest-batches")
+@debug_timing("history_backtest_batches")
+def history_backtest_batches():
+    try:
+        limit = int(request.args.get("limit") or 50)
+        return jsonify({"ok": True, "data": list_history_backtest_batches(limit=limit)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/history/backtest-batches")
+@debug_timing("history_backtest_batch_create")
+def history_backtest_batch_create():
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify({"ok": True, "data": create_history_backtest_batch(payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/history/backtest-batches/<batch_id>")
+@debug_timing("history_backtest_batch")
+def history_backtest_batch(batch_id: str):
+    try:
+        include_runs = str(request.args.get("include_runs", "1")).lower() not in {"0", "false", "no"}
+        data = get_history_backtest_batch(batch_id, include_runs=include_runs)
+        if not data:
+            return _json_error(ValueError("backtest batch not found"), 404)
+        return jsonify({"ok": True, "data": data})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.delete("/api/history/backtest-batches/<batch_id>")
+@debug_timing("history_backtest_batch_delete")
+def history_backtest_batch_delete(batch_id: str):
+    try:
+        result = delete_history_backtest_batch(batch_id)
+        if not result.get("deleted_runs"):
+            return _json_error(ValueError("backtest batch not found"), 404)
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.patch("/api/history/backtest-batches/<batch_id>")
+@debug_timing("history_backtest_batch_rename")
+def history_backtest_batch_rename(batch_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify({"ok": True, "data": rename_history_backtest_batch(batch_id, payload.get("name") or payload.get("batch_name") or "")})
+    except ValueError as exc:
+        return _json_error(exc, 400 if "required" in str(exc).lower() else 404)
+    except Exception as exc:
+        return _json_error(exc)
+
+
 @app.get("/api/history/backtest-runs")
 @debug_timing("history_backtest_runs")
 def history_backtest_runs():
     try:
         case_id = request.args.get("case_id")
-        return jsonify({"ok": True, "data": list_history_backtest_runs(int(case_id)) if case_id else list_history_backtest_runs()})
+        batch_id = request.args.get("batch_id") or ""
+        return jsonify({
+            "ok": True,
+            "data": list_history_backtest_runs(int(case_id), batch_id=batch_id) if case_id else list_history_backtest_runs(batch_id=batch_id),
+        })
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.delete("/api/history/backtest-runs/<int:run_id>")
+@debug_timing("history_backtest_run_delete")
+def history_backtest_run_delete(run_id: int):
+    try:
+        deleted = delete_history_backtest_run(run_id)
+        if not deleted:
+            return _json_error(ValueError("backtest run not found"), 404)
+        return jsonify({"ok": True, "data": {"run_id": run_id, "deleted": True}})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/history/backtest-runs/<int:run_id>/workspace")
+@debug_timing("history_backtest_run_workspace_import")
+def history_backtest_run_workspace_import(run_id: int):
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify({"ok": True, "data": import_history_backtest_run_to_workspace(run_id, payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.patch("/api/history/backtest-runs/<int:run_id>")
+@debug_timing("history_backtest_run_rename")
+def history_backtest_run_rename(run_id: int):
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify({"ok": True, "data": rename_history_backtest_run(run_id, payload.get("name") or payload.get("run_name") or "")})
+    except ValueError as exc:
+        return _json_error(exc, 400 if "required" in str(exc).lower() else 404)
     except Exception as exc:
         return _json_error(exc)
 
@@ -1215,6 +1357,18 @@ def event_graph_change_request_approve_api(request_id: str):
         return _json_error(exc)
 
 
+@app.post("/api/event-graph/change-requests/<request_id>/approve-and-apply")
+@debug_timing("event_graph_change_request_approve_and_apply")
+def event_graph_change_request_approve_and_apply_api(request_id: str):
+    try:
+        payload = _agent_body_payload(default_type="human", default_id="local_user")
+        return jsonify({"ok": True, "data": agent_service.human_approve_and_apply_event_graph_change_request(request_id, payload)})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
 @app.post("/api/event-graph/change-requests/<request_id>/reject")
 @debug_timing("event_graph_change_request_reject")
 def event_graph_change_request_reject_api(request_id: str):
@@ -1542,6 +1696,97 @@ def agent_audit_clear():
         return _json_error(exc)
 
 
+@app.get("/api/agent/backtests/cases")
+@debug_timing("agent_backtest_cases")
+def agent_backtest_cases():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_list_backtest_cases(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/agent/backtests/cases")
+@debug_timing("agent_backtest_case_create")
+def agent_backtest_case_create():
+    try:
+        payload = _agent_body_payload()
+        return jsonify({"ok": True, "data": agent_service.agent_create_backtest_case(payload)}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/backtests/runs")
+@debug_timing("agent_backtest_runs")
+def agent_backtest_runs():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_list_backtest_runs(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/agent/backtests/cases/<int:case_id>/runs")
+@debug_timing("agent_backtest_run_create")
+def agent_backtest_run_create(case_id: int):
+    try:
+        payload = _agent_body_payload()
+        return jsonify({"ok": True, "data": agent_service.agent_create_backtest_run(case_id, payload)}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/backtests/runs/<int:run_id>")
+@debug_timing("agent_backtest_run")
+def agent_backtest_run(run_id: int):
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_get_backtest_run(run_id, _agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 404 if "not found" in str(exc).lower() else 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/backtests/batches")
+@debug_timing("agent_backtest_batches")
+def agent_backtest_batches():
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_list_backtest_batches(_agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/agent/backtests/batches")
+@debug_timing("agent_backtest_batch_create")
+def agent_backtest_batch_create():
+    try:
+        payload = _agent_body_payload()
+        return jsonify({"ok": True, "data": agent_service.agent_create_backtest_batch(payload)}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/backtests/batches/<batch_id>")
+@debug_timing("agent_backtest_batch")
+def agent_backtest_batch(batch_id: str):
+    try:
+        return jsonify({"ok": True, "data": agent_service.agent_get_backtest_batch(batch_id, _agent_query_payload())})
+    except ValueError as exc:
+        return _json_error(exc, 404 if "not found" in str(exc).lower() else 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
 @app.get("/api/agent/strategies")
 @debug_timing("agent_strategies_list")
 def agent_strategies_list():
@@ -1689,7 +1934,10 @@ def polymarket_workspace_preset_delete(preset_id: int):
 def polymarket_strategy_workspace(row_id: int):
     try:
         include_events = request.args.get("include_events", "0") == "1"
-        return jsonify({"ok": True, "data": get_strategy_workspace(row_id, include_events=include_events)})
+        backtest_run_id = request.args.get("backtest_run_id") or request.args.get("run_id")
+        if request.args.get("source") != "backtest":
+            backtest_run_id = None
+        return jsonify({"ok": True, "data": get_strategy_workspace(row_id, include_events=include_events, backtest_run_id=backtest_run_id)})
     except Exception as exc:
         return _json_error(exc)
 
@@ -1726,7 +1974,7 @@ def polymarket_strategy_usedata_draft():
 @app.get("/api/polymarket/strategies/<int:row_id>/backtest")
 def polymarket_strategy_backtest(row_id: int):
     try:
-        return jsonify({"ok": True, "data": get_backtest_placeholder(row_id)})
+        return jsonify({"ok": True, "data": get_strategy_backtest(row_id)})
     except Exception as exc:
         return _json_error(exc)
 
@@ -1735,7 +1983,7 @@ def polymarket_strategy_backtest(row_id: int):
 def polymarket_strategy_backtest_create(row_id: int):
     payload = request.get_json(silent=True) or {}
     try:
-        return jsonify(create_backtest_placeholder(row_id, payload)), 501
+        return jsonify({"ok": True, "data": create_strategy_backtest(row_id, payload)})
     except Exception as exc:
         return _json_error(exc)
 
@@ -1743,7 +1991,11 @@ def polymarket_strategy_backtest_create(row_id: int):
 @app.get("/api/polymarket/strategies/<int:row_id>/backtest/results")
 def polymarket_strategy_backtest_results(row_id: int):
     try:
-        return jsonify(create_backtest_placeholder(row_id, {"results_only": True})), 501
+        run_id = request.args.get("run_id")
+        return jsonify({
+            "ok": True,
+            "data": get_strategy_backtest_results(row_id, int(run_id) if run_id else None),
+        })
     except Exception as exc:
         return _json_error(exc)
 

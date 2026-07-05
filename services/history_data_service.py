@@ -6,6 +6,7 @@ import math
 import sqlite3
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -251,8 +252,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         """
     )
     _ensure_column(conn, "backtest_cases", "collection_name", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "backtest_runs", "batch_id", "TEXT NOT NULL DEFAULT ''")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_backtest_cases_collection ON backtest_cases(collection_name, updated_at_utc DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_backtest_runs_batch ON backtest_runs(batch_id, updated_at_utc DESC)"
     )
     conn.commit()
 
@@ -1083,8 +1088,11 @@ def create_backtest_run(case_id: int, payload: Optional[Dict[str, Any]] = None) 
     if not case:
         raise ValueError("backtest case not found")
     strategy_id = _safe_int(payload.get("strategy_id"), 0) or case.get("strategy_id")
-    strategy_code = str(payload.get("strategy_code") or "").strip()
-    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    case_params = case.get("params") if isinstance(case.get("params"), dict) else {}
+    payload_params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    params = {**case_params, **payload_params}
+    execution_config = case.get("execution_config") if isinstance(case.get("execution_config"), dict) else {}
+    strategy_snapshot = execution_config.get("strategy_snapshot") if isinstance(execution_config.get("strategy_snapshot"), dict) else {}
     strategy = None
     if strategy_id:
         try:
@@ -1093,6 +1101,14 @@ def create_backtest_run(case_id: int, payload: Optional[Dict[str, Any]] = None) 
             strategy = get_strategy(int(strategy_id))
         except Exception:
             strategy = None
+    strategy_code = str(
+        payload.get("strategy_code")
+        or (strategy or {}).get("strategy_code")
+        or execution_config.get("strategy_code")
+        or strategy_snapshot.get("strategy_code")
+        or ""
+    ).strip()
+    batch_id = str(payload.get("batch_id") or "").strip()
     case_snapshot = dict(case)
     case_snapshot["run_strategy_id"] = strategy_id
     case_snapshot["run_strategy_code"] = strategy_code
@@ -1100,11 +1116,16 @@ def create_backtest_run(case_id: int, payload: Optional[Dict[str, Any]] = None) 
     case_snapshot["run_strategy_snapshot"] = strategy or {}
     case_snapshot["run_compatibility"] = _case_compatibility(case.get("legs") or [], strategy, strategy_code=strategy_code)
     case_snapshot["auto_download_missing"] = bool(payload.get("auto_download") or payload.get("auto_download_missing"))
+    if batch_id:
+        case_snapshot["batch_id"] = batch_id
+        case_snapshot["batch_name"] = str(payload.get("batch_name") or "").strip()
     ts = _now_iso()
     status = str(payload.get("status") or "queued").strip() or "queued"
     metrics = {
         "implemented": True,
         "note": "Backtest run is queued and will execute from local historical data.",
+        "batch_id": batch_id,
+        "batch_name": str(payload.get("batch_name") or "").strip(),
         "legs_count": len(case.get("legs") or []),
         "equity_points": 0,
         "orders": 0,
@@ -1116,12 +1137,13 @@ def create_backtest_run(case_id: int, payload: Optional[Dict[str, Any]] = None) 
     try:
         cur = conn.execute(
             """INSERT INTO backtest_runs(
-                   case_id, strategy_id, status, case_snapshot_json, metrics_json,
+                   case_id, strategy_id, batch_id, status, case_snapshot_json, metrics_json,
                    error, created_at_utc, started_at_utc, finished_at_utc, updated_at_utc
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)""",
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)""",
             (
                 int(case_id),
                 strategy_id,
+                batch_id,
                 status,
                 json.dumps(case_snapshot, ensure_ascii=False, sort_keys=True),
                 json.dumps(metrics, ensure_ascii=False, sort_keys=True),
@@ -1307,6 +1329,1298 @@ def _calculate_backtest_metrics(points: List[Dict[str, Any]], orders: List[Dict[
     }
 
 
+_BACKTEST_TIME_METRIC_KEYS = {"now", "ts", "timestamp", "time"}
+_BACKTEST_DERIVED_CATALOG = [
+    {
+        "key": "backtest_return",
+        "label": "回测收益率",
+        "kind": "continuous",
+        "metric_type": "number",
+        "unit": "ratio",
+        "panel": "backtest_metrics",
+        "meta": {"source": "backtest_derived"},
+    },
+    {
+        "key": "backtest_drawdown",
+        "label": "回测回撤",
+        "kind": "continuous",
+        "metric_type": "number",
+        "unit": "ratio",
+        "panel": "backtest_metrics",
+        "meta": {"source": "backtest_derived"},
+    },
+    {
+        "key": "backtest_position_state",
+        "label": "回测仓位状态",
+        "kind": "state",
+        "metric_type": "text",
+        "unit": "",
+        "panel": "backtest_states",
+        "meta": {"source": "backtest_derived"},
+    },
+]
+
+
+def _json_safe_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    return str(value)
+
+
+def _strategy_output_metric_payload(output: Dict[str, Any]) -> Dict[str, Any]:
+    metrics = output.get("metrics") if isinstance(output, dict) and isinstance(output.get("metrics"), dict) else {}
+    metrics_meta = output.get("metrics_meta") if isinstance(output, dict) and isinstance(output.get("metrics_meta"), dict) else {}
+    if not metrics and not metrics_meta:
+        return {}
+    return {
+        "strategy_metrics": _json_safe_value(metrics),
+        "strategy_metrics_meta": _json_safe_value(metrics_meta),
+    }
+
+
+def _metric_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
+        return "number"
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        return "text"
+    return "json"
+
+
+def _looks_like_datetime_text(value: Any) -> bool:
+    text = str(value or "").strip()
+    return len(text) >= 16 and "T" in text and (text.endswith("Z") or "+" in text[10:] or text.count("-") >= 2)
+
+
+def _is_state_lane_catalog_item(item: Dict[str, Any]) -> bool:
+    if str(item.get("kind") or "") != "state" or str(item.get("value_state") or "") != "value":
+        return False
+    key = str(item.get("key") or "").strip().lower()
+    if key in _BACKTEST_TIME_METRIC_KEYS or key.endswith("_until") or key.endswith("_at") or key.endswith("_time"):
+        return False
+    if str(item.get("metric_type") or "") == "text" and _looks_like_datetime_text(item.get("latest_value")):
+        return False
+    return True
+
+
+def _catalog_item_from_metric(
+    key: str,
+    value: Any,
+    meta: Dict[str, Any] | None,
+    count: int,
+    latest_ts: str,
+) -> Dict[str, Any] | None:
+    text_key = str(key or "").strip()
+    if not text_key:
+        return None
+    metric_type = _metric_type(value)
+    if metric_type in {"null", "json"}:
+        return None
+    meta = dict(meta or {})
+    kind = str(meta.get("kind") or "").strip().lower()
+    if not kind:
+        kind = "continuous" if metric_type == "number" else "state"
+    item = {
+        "key": text_key,
+        "label": str(meta.get("label") or text_key),
+        "kind": kind,
+        "metric_type": metric_type,
+        "unit": str(meta.get("unit") or ""),
+        "panel": str(meta.get("panel") or ("metric_values" if metric_type == "number" else "metric_states")),
+        "value_state": "value",
+        "latest_value": value,
+        "latest_ts": latest_ts,
+        "count": int(count or 0),
+        "meta": meta,
+    }
+    if item["kind"] == "state" and not _is_state_lane_catalog_item(item):
+        return None
+    return item
+
+
+def get_backtest_metric_catalog(run_id: int, limit: int = 240) -> Dict[str, Any]:
+    """Return run-aware metric catalog for the backtest workspace picker."""
+    parsed_run_id = _safe_int(run_id)
+    if parsed_run_id <= 0:
+        return {"items": [], "numeric": [], "state": []}
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT ts_utc, equity, meta_json FROM backtest_equity_points WHERE run_id = ? ORDER BY ts_utc",
+            (parsed_run_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+    count = len(rows)
+    if count <= 0:
+        return {"items": [], "numeric": [], "state": []}
+
+    initial_equity: float | None = None
+    running_peak: float | None = None
+    latest_return: float | None = None
+    latest_drawdown: float | None = None
+    latest_position_state = "Flat"
+    metric_counts: Dict[str, int] = {}
+    latest_values: Dict[str, Any] = {}
+    latest_ts_by_key: Dict[str, str] = {}
+    meta_by_key: Dict[str, Dict[str, Any]] = {}
+
+    for row in rows:
+        ts = str(row["ts_utc"] or "")
+        equity = _safe_float(row["equity"])
+        if equity is not None and equity > 0:
+            if initial_equity is None:
+                initial_equity = equity
+            running_peak = equity if running_peak is None else max(running_peak, equity)
+            if initial_equity:
+                latest_return = equity / initial_equity - 1.0
+            if running_peak:
+                latest_drawdown = equity / running_peak - 1.0
+        try:
+            point_meta = json.loads(row["meta_json"] or "{}")
+        except Exception:
+            point_meta = {}
+        point_meta = point_meta if isinstance(point_meta, dict) else {}
+        position_ratio = _safe_float(point_meta.get("position_ratio"))
+        if position_ratio is not None:
+            latest_position_state = "Flat" if abs(position_ratio) < 1e-9 else ("Long" if position_ratio > 0 else "Short")
+        strategy_metrics = point_meta.get("strategy_metrics") if isinstance(point_meta.get("strategy_metrics"), dict) else {}
+        strategy_meta = point_meta.get("strategy_metrics_meta") if isinstance(point_meta.get("strategy_metrics_meta"), dict) else {}
+        for key, value in strategy_metrics.items():
+            text_key = str(key or "").strip()
+            if not text_key:
+                continue
+            metric_counts[text_key] = metric_counts.get(text_key, 0) + 1
+            item_meta = strategy_meta.get(text_key) if isinstance(strategy_meta.get(text_key), dict) else {}
+            if item_meta:
+                meta_by_key[text_key] = item_meta
+            if value is not None:
+                latest_values[text_key] = value
+                latest_ts_by_key[text_key] = ts
+
+    latest_ts = str(rows[-1]["ts_utc"] or "")
+    items: List[Dict[str, Any]] = []
+    derived_values = {
+        "backtest_return": latest_return,
+        "backtest_drawdown": latest_drawdown,
+        "backtest_position_state": latest_position_state,
+    }
+    for config in _BACKTEST_DERIVED_CATALOG:
+        item = dict(config)
+        item.update({
+            "value_state": "value",
+            "latest_value": derived_values.get(str(config.get("key"))),
+            "latest_ts": latest_ts,
+            "count": count,
+        })
+        items.append(item)
+
+    for key in sorted(latest_values):
+        if len(items) >= limit:
+            break
+        item = _catalog_item_from_metric(
+            key,
+            latest_values.get(key),
+            meta_by_key.get(key),
+            metric_counts.get(key, 0),
+            latest_ts_by_key.get(key) or latest_ts,
+        )
+        if item:
+            items.append(item)
+
+    return {
+        "items": items,
+        "numeric": [item for item in items if item.get("metric_type") == "number" and item.get("value_state") == "value"],
+        "state": [item for item in items if _is_state_lane_catalog_item(item)],
+    }
+
+
+def _backtest_leg_id(leg: Dict[str, Any], index: int) -> str:
+    return str(leg.get("id") or leg.get("instrument_id") or leg.get("symbol") or f"leg-{index}").strip()
+
+
+def _resolve_action_leg_index(action: Dict[str, Any], legs: List[Dict[str, Any]]) -> int:
+    raw_index = action.get("leg_index", action.get("leg", action.get("target_leg", 0)))
+    try:
+        return max(0, min(len(legs) - 1, int(float(raw_index))))
+    except (TypeError, ValueError):
+        pass
+    symbol = str(action.get("symbol") or "").strip().upper()
+    instrument_id = str(action.get("instrument_id") or "").strip()
+    for index, leg in enumerate(legs):
+        if symbol and str(leg.get("symbol") or "").strip().upper() == symbol:
+            return index
+        if instrument_id and str(leg.get("instrument_id") or "").strip() == instrument_id:
+            return index
+    return 0
+
+
+def _action_target_position(action: Dict[str, Any], current_position: float) -> Optional[float]:
+    action_type = str(action.get("type") or "").strip().upper()
+    if action_type not in {"SET_TARGET", "SETPOS", "SET_POSITION", "SET_BINARY_TARGET"}:
+        return None
+    for key in ("target_position", "target_pct", "pct", "target"):
+        if key in action:
+            return max(0.0, min(1.0, _finite_float(action.get(key), current_position)))
+    return current_position
+
+
+def _outcome_side(value: Any, default: str = "Yes") -> str:
+    text = str(value or default).strip().lower()
+    return "No" if text == "no" else "Yes"
+
+
+def _binary_price(value: Any, default: float = 0.5) -> float:
+    number = _finite_float(value, default)
+    if number <= 0:
+        return 0.001
+    if number >= 1:
+        return 0.999
+    return number
+
+
+def _polymarket_fee_rate(params: Dict[str, Any]) -> float:
+    if "polymarket_fee_rate" in params:
+        return max(0.0, _finite_float(params.get("polymarket_fee_rate"), 0.05))
+    if "fee_rate" in params:
+        return max(0.0, _finite_float(params.get("fee_rate"), 0.05))
+    return 0.05
+
+
+def _polymarket_fee(qty: float, price: float, rate: float) -> float:
+    return max(0.0, qty) * max(0.0, rate) * _binary_price(price) * (1.0 - _binary_price(price))
+
+
+def _read_polymarket_price_rows(
+    conn: sqlite3.Connection,
+    leg: Dict[str, Any],
+    start_ms: Optional[int],
+    end_ms: Optional[int],
+    limit: int = 500_000,
+) -> List[Dict[str, Any]]:
+    yes_token = str(leg.get("yes_token") or "").strip()
+    no_token = str(leg.get("no_token") or "").strip()
+    token_id = str(leg.get("token_id") or yes_token or no_token or "").strip()
+    if not token_id:
+        return []
+    source_side = "No" if no_token and token_id == no_token and token_id != yes_token else "Yes"
+    params: List[Any] = [token_id]
+    where = ["token_id = ?"]
+    if start_ms is not None:
+        where.append("ts >= ?")
+        params.append(int(start_ms / 1000))
+    if end_ms is not None:
+        where.append("ts <= ?")
+        params.append(int(end_ms / 1000))
+    params.append(int(limit))
+    rows = conn.execute(
+        f"""SELECT token_id, condition_id, ts, ts_utc, price
+            FROM polymarket_price_history
+            WHERE {' AND '.join(where)}
+            ORDER BY ts
+            LIMIT ?""",
+        params,
+    ).fetchall()
+    decoded = []
+    for row in rows:
+        item = dict(row)
+        item["price_side"] = source_side
+        decoded.append(item)
+    return decoded
+
+
+def _portfolio_equity(cash: float, leg_states: List[Dict[str, Any]], rows: List[Dict[str, Any]]) -> tuple[float, float]:
+    exposure = 0.0
+    for state, row in zip(leg_states, rows):
+        exposure += _finite_float(state.get("qty"), 0.0) * _finite_float(row.get("close"), 0.0)
+    return cash + exposure, exposure
+
+
+def _multi_binance_usedata(
+    *,
+    snapshot: Dict[str, Any],
+    legs: List[Dict[str, Any]],
+    leg_states: List[Dict[str, Any]],
+    rows: List[Dict[str, Any]],
+    cash: float,
+    initial_cash: float,
+) -> Dict[str, Any]:
+    equity, exposure = _portfolio_equity(cash, leg_states, rows)
+    first_row = rows[0]
+    first_state = leg_states[0]
+    use_data: Dict[str, Any] = {
+        "SchemaVersion": "2.0",
+        "NowTime": first_row.get("open_time_utc"),
+        "ts": first_row.get("open_time_utc"),
+        "RunMode": "Backtest",
+        "StrategyId": snapshot.get("run_strategy_id") or snapshot.get("strategy_id"),
+        "StrategyName": snapshot.get("case_name") or "",
+        "StrategyBankroll": initial_cash,
+        "LegCount": len(legs),
+        "Portfolio": {
+            "cash": cash,
+            "equity": equity,
+            "exposure": exposure,
+            "initial_cash": initial_cash,
+            "pnl": equity - initial_cash,
+        },
+    }
+    instruments = []
+    for index, (leg, state, row) in enumerate(zip(legs, leg_states, rows)):
+        close = _finite_float(row.get("close"), 0.0)
+        qty = _finite_float(state.get("qty"), 0.0)
+        entry_price = _finite_float(state.get("entry_price"), close)
+        closes = state.get("closes") if isinstance(state.get("closes"), list) else []
+        leg_exposure = qty * close
+        position_ratio = (leg_exposure / equity) if equity > 0 else 0.0
+        symbol = str(leg.get("symbol") or "").strip().upper()
+        instrument_id = str(leg.get("instrument_id") or symbol).strip()
+        prefix = f"L{index}"
+        use_data.update({
+            f"{prefix}_LegUid": str(leg.get("id") or ""),
+            f"{prefix}_LegKind": str(leg.get("leg_kind") or "external_price_series"),
+            f"{prefix}_AssetClass": str(leg.get("asset_class") or "crypto_spot"),
+            f"{prefix}_Venue": "binance",
+            f"{prefix}_Symbol": symbol,
+            f"{prefix}_InstrumentId": instrument_id,
+            f"{prefix}_BudgetCap": _finite_float(leg.get("budget_cap"), 0.0),
+            f"{prefix}_Open": row.get("open"),
+            f"{prefix}_High": row.get("high"),
+            f"{prefix}_Low": row.get("low"),
+            f"{prefix}_Close": close,
+            f"{prefix}_LastPrice": close,
+            f"{prefix}_Price": close,
+            f"{prefix}_Volume": row.get("volume"),
+            f"{prefix}_CloseSeries": closes[-500:],
+            f"{prefix}_PositionQty": qty,
+            f"{prefix}_PositionAvgPrice": entry_price if qty > 0 else 0.0,
+            f"{prefix}_PositionCost": qty * entry_price if qty > 0 else 0.0,
+            f"{prefix}_PositionValueBid": leg_exposure,
+            f"{prefix}_PositionPct": position_ratio,
+            f"{prefix}_EntryPrice": entry_price,
+            f"{prefix}_PeakPrice": _finite_float(state.get("peak_price"), close),
+            f"{prefix}_DataStatus": "ok",
+            f"Price_{symbol}": close,
+        })
+        instruments.append({
+            "leg_index": index,
+            "symbol": symbol,
+            "instrument_id": instrument_id,
+            "asset_class": str(leg.get("asset_class") or "crypto_spot"),
+            "venue": "binance",
+            "close": close,
+            "position_qty": qty,
+            "position_pct": position_ratio,
+        })
+    use_data["Instruments"] = instruments
+    # Compatibility aliases for older single-leg crypto strategies.
+    use_data.update({
+        "close": _finite_float(first_row.get("close"), 0.0),
+        "open": first_row.get("open"),
+        "high": first_row.get("high"),
+        "low": first_row.get("low"),
+        "volume": first_row.get("volume"),
+        "closes": (first_state.get("closes") if isinstance(first_state.get("closes"), list) else [])[-500:],
+        "position": use_data.get("L0_PositionPct", 0.0),
+        "entry_price": use_data.get("L0_EntryPrice"),
+        "peak_price": use_data.get("L0_PeakPrice"),
+        "symbol": str(legs[0].get("symbol") or "").strip().upper(),
+        "instrument_id": str(legs[0].get("instrument_id") or legs[0].get("symbol") or "").strip(),
+    })
+    return use_data
+
+
+def _execute_multi_binance_backtest(
+    run_id: int,
+    snapshot: Dict[str, Any],
+    strategy_code: str,
+    params: Dict[str, Any],
+    legs: List[Dict[str, Any]],
+    ts: str,
+    finish_failed: Any,
+) -> None:
+    availability = _case_data_availability(legs)
+    start_ms, end_ms = _window_ms_from_snapshot(snapshot)
+    window = snapshot.get("data_window") if isinstance(snapshot.get("data_window"), dict) else {}
+    strict_window = bool(window.get("strict"))
+    auto_download_missing = bool(snapshot.get("auto_download_missing"))
+    min_points = max(80, _safe_int(params.get("slow_window"), 60) + 5)
+    events: List[Dict[str, Any]] = []
+
+    def download_progress(meta: Dict[str, Any]) -> None:
+        pages = _safe_int(meta.get("pages"), 0)
+        progress = min(45.0, 28.0 + pages * 0.20)
+        _mark_backtest_progress(
+            run_id,
+            progress,
+            "downloading_data",
+            f"Downloading Binance klines: page {pages}, stored {meta.get('stored', 0)}, fetched {meta.get('fetched', 0)}.",
+            meta=meta,
+        )
+
+    _mark_backtest_progress(
+        run_id,
+        20,
+        "loading_data",
+        f"Loading local klines for {len(legs)} Binance legs.",
+        meta={"legs": [{"symbol": leg.get("symbol"), "interval": leg.get("interval") or DEFAULT_BINANCE_INTERVAL} for leg in legs]},
+    )
+    leg_rows: List[List[Dict[str, Any]]] = []
+    conn = _connect()
+    try:
+        for leg in legs:
+            symbol = str(leg.get("symbol") or "").upper().strip()
+            interval = str(leg.get("interval") or DEFAULT_BINANCE_INTERVAL).strip() or DEFAULT_BINANCE_INTERVAL
+            rows = _read_binance_kline_rows(conn, symbol, interval, start_ms, end_ms)
+            if len(rows) < min_points and not strict_window:
+                rows = _read_binance_kline_rows(conn, symbol, interval, None, None)
+                if rows:
+                    events.append({
+                        "event_type": "data_window_fallback",
+                        "message": f"{symbol} has not enough klines in the requested window; using available local history.",
+                        "meta": {
+                            "requested_start": _ms_to_iso(start_ms) if start_ms else None,
+                            "requested_end": _ms_to_iso(end_ms) if end_ms else None,
+                            "available_start": rows[0].get("open_time_utc"),
+                            "available_end": rows[-1].get("open_time_utc"),
+                            "points": len(rows),
+                        },
+                    })
+            leg_rows.append(rows)
+    finally:
+        conn.close()
+
+    _mark_backtest_progress(run_id, 25, "checking_data", "Checking multi-leg data coverage and alignment.")
+    for index, (leg, rows) in enumerate(zip(legs, leg_rows)):
+        symbol = str(leg.get("symbol") or "").upper().strip()
+        interval = str(leg.get("interval") or DEFAULT_BINANCE_INTERVAL).strip() or DEFAULT_BINANCE_INTERVAL
+        if strict_window and rows:
+            first_ms = _safe_int(rows[0].get("open_time_ms"), 0)
+            last_ms = _safe_int(rows[-1].get("open_time_ms"), 0)
+            needs_more_before = bool(start_ms and first_ms and first_ms > start_ms + _interval_ms(interval))
+            needs_more_after = bool(end_ms and last_ms and last_ms < end_ms - _interval_ms(interval))
+            if needs_more_before or needs_more_after:
+                if auto_download_missing:
+                    fetch_start = start_ms if needs_more_before else (last_ms + _interval_ms(interval) if last_ms else start_ms)
+                    _mark_backtest_progress(run_id, 30, "downloading_data", f"Downloading strict-window gap for leg {index + 1}: {symbol} {interval}.")
+                    download_result = _maybe_download_binance_for_run(symbol, interval, fetch_start, end_ms, download_progress)
+                    events.append({
+                        "event_type": "data_download",
+                        "message": f"Download strict-window gap for {symbol} {interval}: stored={download_result.get('stored', 0)} fetched={download_result.get('fetched', 0)}",
+                        "meta": {"leg_index": index, **download_result},
+                    })
+                    conn = _connect()
+                    try:
+                        rows = _read_binance_kline_rows(conn, symbol, interval, start_ms, end_ms)
+                    finally:
+                        conn.close()
+                    leg_rows[index] = rows
+                else:
+                    events.append({
+                        "event_type": "data_window_missing_download_required",
+                        "message": f"{symbol} has partial local data in the requested strict window.",
+                        "meta": {
+                            "leg_index": index,
+                            "symbol": symbol,
+                            "interval": interval,
+                            "requested_start": _ms_to_iso(start_ms) if start_ms else None,
+                            "requested_end": _ms_to_iso(end_ms) if end_ms else None,
+                            "actual_start": rows[0].get("open_time_utc") if rows else None,
+                            "actual_end": rows[-1].get("open_time_utc") if rows else None,
+                            "download_required": True,
+                        },
+                    })
+                    finish_failed(f"Missing strict-window Binance kline data for leg {index + 1} {symbol} {interval}.", events)
+                    return
+        if len(rows) < min_points and auto_download_missing:
+            _mark_backtest_progress(run_id, 30, "downloading_data", f"Downloading Binance klines for leg {index + 1}: {symbol} {interval}.")
+            download_result = _maybe_download_binance_for_run(symbol, interval, start_ms, end_ms, download_progress)
+            events.append({
+                "event_type": "data_download",
+                "message": f"Download Binance klines for {symbol} {interval}: stored={download_result.get('stored', 0)} fetched={download_result.get('fetched', 0)}",
+                "meta": {"leg_index": index, **download_result},
+            })
+            conn = _connect()
+            try:
+                rows = _read_binance_kline_rows(conn, symbol, interval, start_ms, end_ms)
+                if len(rows) < min_points and not strict_window:
+                    rows = _read_binance_kline_rows(conn, symbol, interval, None, None)
+            finally:
+                conn.close()
+            leg_rows[index] = rows
+        if len(rows) < min_points:
+            events.append({
+                "event_type": "data_window_missing_download_required",
+                "message": f"{symbol} has not enough local klines for multi-leg backtest.",
+                "meta": {
+                    "leg_index": index,
+                    "symbol": symbol,
+                    "interval": interval,
+                    "points": len(rows),
+                    "download_required": True,
+                },
+            })
+            finish_failed(f"Missing Binance kline data for leg {index + 1} {symbol} {interval}.", events)
+            return
+
+    row_maps = [{_safe_int(row.get("open_time_ms"), 0): row for row in rows} for rows in leg_rows]
+    common_times = sorted(set.intersection(*(set(item.keys()) for item in row_maps)) if row_maps else set())
+    common_times = [value for value in common_times if value > 0]
+    if len(common_times) < min_points:
+        events.append({
+            "event_type": "data_window_no_overlap",
+            "message": f"Multi-leg Binance rows have only {len(common_times)} aligned timestamps.",
+            "meta": {"aligned_points": len(common_times), "min_points": min_points},
+        })
+        finish_failed("Not enough aligned multi-leg Binance data.", events)
+        return
+
+    _mark_backtest_progress(run_id, 50, "data_ready", f"Data ready: {len(common_times)} aligned bars across {len(legs)} legs.")
+    module = _load_strategy_code_module(strategy_code)
+    if module is None:
+        finish_failed(f"StrategyCode file not found or cannot be loaded: {strategy_code}", events)
+        return
+    _mark_backtest_progress(run_id, 58, "strategy_loaded", f"Loaded StrategyCode: {strategy_code}.")
+
+    initial_cash = max(1.0, _finite_float(params.get("initial_cash"), DEFAULT_BACKTEST_CASH))
+    fee_bps = max(0.0, _finite_float(params.get("fee_bps"), DEFAULT_BACKTEST_FEE_BPS))
+    fee_rate = fee_bps / 10_000.0
+    cash = initial_cash
+    leg_states: List[Dict[str, Any]] = [
+        {"qty": 0.0, "entry_price": 0.0, "peak_price": 0.0, "closes": []}
+        for _ in legs
+    ]
+    equity_points: List[Dict[str, Any]] = []
+    orders: List[Dict[str, Any]] = []
+
+    total_rows = max(1, len(common_times))
+    progress_step = max(1, total_rows // 10)
+    for idx, open_time_ms in enumerate(common_times):
+        rows = [row_map[open_time_ms] for row_map in row_maps]
+        if idx == 0 or idx % progress_step == 0:
+            percent = 60.0 + min(25.0, (idx / total_rows) * 25.0)
+            _mark_backtest_progress(run_id, percent, "running_strategy", f"Running multi-leg strategy: {idx}/{total_rows} aligned bars processed.")
+        valid = True
+        for state, row in zip(leg_states, rows):
+            close = _finite_float(row.get("close"), 0.0)
+            if close <= 0:
+                valid = False
+                break
+            closes = state.get("closes") if isinstance(state.get("closes"), list) else []
+            closes.append(close)
+            state["closes"] = closes[-500:]
+            state["peak_price"] = max(_finite_float(state.get("peak_price"), close), close) if _finite_float(state.get("qty"), 0.0) > 0 else close
+        if not valid:
+            continue
+
+        use_data = _multi_binance_usedata(
+            snapshot=snapshot,
+            legs=legs,
+            leg_states=leg_states,
+            rows=rows,
+            cash=cash,
+            initial_cash=initial_cash,
+        )
+        output = _run_strategy_code_once(module, use_data, params)
+        metric_payload = _strategy_output_metric_payload(output)
+        actions = output.get("actions") if isinstance(output.get("actions"), list) else []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            leg_index = _resolve_action_leg_index(action, legs)
+            row = rows[leg_index]
+            state = leg_states[leg_index]
+            close = _finite_float(row.get("close"), 0.0)
+            if close <= 0:
+                continue
+            equity_now, _ = _portfolio_equity(cash, leg_states, rows)
+            current_exposure = _finite_float(state.get("qty"), 0.0) * close
+            current_position = (current_exposure / equity_now) if equity_now > 0 else 0.0
+            target = _action_target_position(action, current_position)
+            if target is None:
+                continue
+            target_exposure = equity_now * target
+            delta_exposure = target_exposure - current_exposure
+            if abs(delta_exposure) < max(1.0, equity_now * 0.0001):
+                continue
+            side = "BUY" if delta_exposure > 0 else "SELL"
+            qty_before = _finite_float(state.get("qty"), 0.0)
+            if side == "BUY":
+                desired_value = max(0.0, delta_exposure)
+                trade_value = min(desired_value, cash / (1.0 + fee_rate)) if fee_rate >= 0 else min(desired_value, cash)
+                fee = trade_value * fee_rate
+                trade_qty = trade_value / close if close > 0 else 0.0
+                if trade_qty <= 0:
+                    continue
+                cash -= trade_value + fee
+                qty_after = qty_before + trade_qty
+                prev_cost = qty_before * _finite_float(state.get("entry_price"), close)
+                state["qty"] = qty_after
+                state["entry_price"] = (prev_cost + trade_value) / qty_after if qty_after > 0 else 0.0
+                state["peak_price"] = close
+            else:
+                trade_qty = min(qty_before, abs(delta_exposure) / close if close > 0 else 0.0)
+                if trade_qty <= 0:
+                    continue
+                trade_value = trade_qty * close
+                fee = trade_value * fee_rate
+                cash += trade_value - fee
+                qty_after = qty_before - trade_qty
+                state["qty"] = qty_after if qty_after > 1e-10 else 0.0
+                if state["qty"] <= 0:
+                    state["entry_price"] = 0.0
+                    state["peak_price"] = close
+            orders.append({
+                "ts_utc": row.get("open_time_utc"),
+                "leg_id": _backtest_leg_id(legs[leg_index], leg_index),
+                "instrument_id": str(legs[leg_index].get("instrument_id") or legs[leg_index].get("symbol") or ""),
+                "side": side,
+                "quantity": trade_qty,
+                "price": close,
+                "fee": fee,
+                "status": "filled",
+                "reason": str(action.get("reason") or action.get("desc") or "strategy_signal"),
+                "meta": {"leg_index": leg_index, "target_position": target, "raw_action": action},
+            })
+
+        equity, exposure = _portfolio_equity(cash, leg_states, rows)
+        equity_points.append({
+            "ts_utc": rows[0].get("open_time_utc"),
+            "equity": equity,
+            "cash": cash,
+            "exposure": exposure,
+            "pnl": equity - initial_cash,
+            "meta": {
+                "engine": "binance_multi_leg",
+                "aligned_open_time_ms": open_time_ms,
+                **metric_payload,
+                "legs": [
+                    {
+                        "leg_index": index,
+                        "symbol": str(leg.get("symbol") or "").upper(),
+                        "close": _finite_float(row.get("close"), 0.0),
+                        "position_qty": _finite_float(state.get("qty"), 0.0),
+                        "position_value": _finite_float(state.get("qty"), 0.0) * _finite_float(row.get("close"), 0.0),
+                    }
+                    for index, (leg, state, row) in enumerate(zip(legs, leg_states, rows))
+                ],
+            },
+        })
+
+    _mark_backtest_progress(run_id, 88, "calculating_metrics", f"Multi-leg evaluation complete: {len(equity_points)} equity points, {len(orders)} orders.")
+    metrics = _calculate_backtest_metrics(equity_points, orders, len(legs))
+    metrics.update({
+        "engine": "binance_multi_leg",
+        "fee_bps": fee_bps,
+        "strategy_code": strategy_code,
+        "symbols": [str(leg.get("symbol") or "").upper() for leg in legs],
+        "requested_start": _ms_to_iso(start_ms) if start_ms else None,
+        "requested_end": _ms_to_iso(end_ms) if end_ms else None,
+        "strict_window": strict_window,
+        "available_start": availability.get("common_start"),
+        "available_end": availability.get("common_end"),
+        "data_availability": availability,
+        "aligned_points": len(common_times),
+        "progress_percent": 95.0,
+        "progress_stage": "writing_report",
+        "progress_message": "Writing multi-leg equity curve, orders, metrics, and events.",
+        "progress_updated_at": _now_iso(),
+    })
+    _mark_backtest_progress(run_id, 95, "writing_report", "Writing multi-leg report data to local database.")
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM backtest_equity_points WHERE run_id = ?", (run_id,))
+        conn.execute("DELETE FROM backtest_orders WHERE run_id = ?", (run_id,))
+        for point in equity_points:
+            conn.execute(
+                """INSERT OR REPLACE INTO backtest_equity_points(run_id, ts_utc, equity, cash, exposure, pnl, meta_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (run_id, point["ts_utc"], point["equity"], point["cash"], point["exposure"], point["pnl"], json.dumps(point["meta"], ensure_ascii=False)),
+            )
+        for order in orders:
+            conn.execute(
+                """INSERT INTO backtest_orders(run_id, ts_utc, leg_id, instrument_id, side, quantity, price, fee, status, reason, meta_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    order["ts_utc"],
+                    order["leg_id"],
+                    order["instrument_id"],
+                    order["side"],
+                    order["quantity"],
+                    order["price"],
+                    order["fee"],
+                    order["status"],
+                    order["reason"],
+                    json.dumps(order["meta"], ensure_ascii=False),
+                ),
+            )
+        for event in events:
+            conn.execute(
+                "INSERT INTO backtest_events(run_id, ts_utc, event_type, message, meta_json) VALUES (?, ?, ?, ?, ?)",
+                (run_id, ts, event.get("event_type") or "info", event.get("message") or "", json.dumps(event.get("meta") or {}, ensure_ascii=False)),
+            )
+        conn.execute(
+            """INSERT INTO backtest_events(run_id, ts_utc, event_type, message, meta_json)
+               VALUES (?, ?, 'complete', ?, ?)""",
+            (run_id, _now_iso(), f"Multi-leg backtest complete: {len(equity_points)} equity points, {len(orders)} orders.", "{}"),
+        )
+        conn.execute(
+            """UPDATE backtest_runs
+               SET status = 'completed', metrics_json = ?, error = NULL, started_at_utc = COALESCE(started_at_utc, ?),
+                   finished_at_utc = ?, updated_at_utc = ?
+               WHERE run_id = ?""",
+            (
+                json.dumps({
+                    **metrics,
+                    "progress_percent": 100.0,
+                    "progress_stage": "completed",
+                    "progress_message": "Backtest completed.",
+                    "progress_updated_at": _now_iso(),
+                }, ensure_ascii=False, sort_keys=True),
+                ts,
+                _now_iso(),
+                _now_iso(),
+                run_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _polymarket_leg_prices(row: Dict[str, Any]) -> Dict[str, float]:
+    raw = _binary_price(row.get("price"), 0.5)
+    if _outcome_side(row.get("price_side"), "Yes") == "No":
+        no = raw
+        yes = _binary_price(1.0 - no, 0.5)
+    else:
+        yes = raw
+        no = _binary_price(1.0 - yes, 0.5)
+    return {"Yes": yes, "No": no}
+
+
+def _polymarket_portfolio_equity(
+    cash: float,
+    leg_states: List[Dict[str, Any]],
+    rows: List[Dict[str, Any]],
+) -> tuple[float, float]:
+    exposure = 0.0
+    for state, row in zip(leg_states, rows):
+        prices = _polymarket_leg_prices(row)
+        exposure += _finite_float(state.get("Yes_qty"), 0.0) * prices["Yes"]
+        exposure += _finite_float(state.get("No_qty"), 0.0) * prices["No"]
+    return cash + exposure, exposure
+
+
+def _leg_end_date(leg: Dict[str, Any]) -> str:
+    if leg.get("end_date"):
+        return str(leg.get("end_date") or "")
+    meta = leg.get("meta") if isinstance(leg.get("meta"), dict) else {}
+    source_leg = meta.get("source_strategy_leg") if isinstance(meta.get("source_strategy_leg"), dict) else {}
+    instrument = source_leg.get("instrument_json") if isinstance(source_leg.get("instrument_json"), dict) else {}
+    return str(source_leg.get("end_date") or instrument.get("end_date") or instrument.get("endDate") or "")
+
+
+def _days_to_end(end_date: str, ts_utc: str) -> float:
+    end_ms = _parse_time_ms(end_date)
+    now_ms = _parse_time_ms(ts_utc)
+    if end_ms is None or now_ms is None:
+        return 9999.0
+    return max(0.0, (end_ms - now_ms) / 86_400_000.0)
+
+
+def _polymarket_usedata(
+    *,
+    snapshot: Dict[str, Any],
+    legs: List[Dict[str, Any]],
+    leg_states: List[Dict[str, Any]],
+    rows: List[Dict[str, Any]],
+    cash: float,
+    initial_cash: float,
+    runtime_state: Dict[str, Any],
+    machine_state: str,
+) -> Dict[str, Any]:
+    equity, exposure = _polymarket_portfolio_equity(cash, leg_states, rows)
+    ts_utc = str(rows[0].get("ts_utc") or "")
+    use_data: Dict[str, Any] = {
+        "SchemaVersion": "2.0",
+        "NowTime": ts_utc,
+        "ts": ts_utc,
+        "RunMode": "Backtest",
+        "StrategyId": snapshot.get("run_strategy_id") or snapshot.get("strategy_id"),
+        "StrategyName": snapshot.get("case_name") or "",
+        "StrategyBankroll": initial_cash,
+        "LegCount": len(legs),
+        "Params": snapshot.get("run_params") if isinstance(snapshot.get("run_params"), dict) else {},
+        "Controls": {},
+        "RuntimeState": runtime_state,
+        "UserState": {},
+        "StrategyState": {"state": machine_state or "auto"},
+        "MachineState": machine_state or "auto",
+        "State": runtime_state,
+        "Portfolio": {
+            "cash": cash,
+            "equity": equity,
+            "exposure": exposure,
+            "initial_cash": initial_cash,
+            "pnl": equity - initial_cash,
+        },
+    }
+    for index, (leg, state, row) in enumerate(zip(legs, leg_states, rows)):
+        prices = _polymarket_leg_prices(row)
+        budget_cap = _finite_float(leg.get("budget_cap"), 0.0)
+        if budget_cap <= 0:
+            budget_cap = initial_cash / max(1, len(legs))
+        end_date = _leg_end_date(leg)
+        day_to_end = _days_to_end(end_date, ts_utc)
+        prefix = f"L{index}"
+        use_data.update({
+            f"{prefix}_ConditionId": leg.get("condition_id") or row.get("condition_id") or "",
+            f"{prefix}_LegUid": str(leg.get("id") or ""),
+            f"{prefix}_LegKind": str(leg.get("leg_kind") or "binary_market"),
+            f"{prefix}_AssetClass": str(leg.get("asset_class") or "polymarket_binary"),
+            f"{prefix}_Venue": "polymarket",
+            f"{prefix}_Symbol": str(leg.get("symbol") or ""),
+            f"{prefix}_InstrumentId": str(leg.get("instrument_id") or leg.get("condition_id") or ""),
+            f"{prefix}_MarketTitle": str(leg.get("display_name") or leg.get("instrument_id") or ""),
+            f"{prefix}_MarketStatus": "open",
+            f"{prefix}_BudgetCap": budget_cap,
+            f"{prefix}_ConfiguredBudgetCap": _finite_float(leg.get("budget_cap"), 0.0),
+            f"{prefix}_EndTime": end_date,
+            f"{prefix}_DayToEnd": day_to_end,
+            f"{prefix}_HourToEnd": day_to_end * 24.0,
+        })
+        for side in ("Yes", "No"):
+            price = prices[side]
+            qty = _finite_float(state.get(f"{side}_qty"), 0.0)
+            avg = _finite_float(state.get(f"{side}_avg"), 0.0)
+            cost = qty * avg
+            value = qty * price
+            pos_pct = (value / budget_cap) if budget_cap > 0 else 0.0
+            use_data.update({
+                f"{prefix}_{side}_TokenId": str(leg.get("yes_token" if side == "Yes" else "no_token") or ""),
+                f"{prefix}_{side}_AskPrice": price,
+                f"{prefix}_{side}_BidPrice": price,
+                f"{prefix}_{side}_LastPrice": price,
+                f"{prefix}_{side}_BestAskQty": 0.0,
+                f"{prefix}_{side}_BestBidQty": 0.0,
+                f"{prefix}_{side}_AskLevels": [{"price": price, "qty": 0.0}],
+                f"{prefix}_{side}_BidLevels": [{"price": price, "qty": 0.0}],
+                f"{prefix}_{side}_PositionQty": qty,
+                f"{prefix}_{side}_PositionAvgPrice": avg,
+                f"{prefix}_{side}_PositionCost": cost,
+                f"{prefix}_{side}_PositionValueBid": value,
+                f"{prefix}_{side}_AvailableSellQty": qty,
+                f"{prefix}_{side}_OpenBuyQty": 0.0,
+                f"{prefix}_{side}_OpenSellQty": 0.0,
+                f"{prefix}_{side}_Now_Pos": pos_pct,
+                f"{prefix}_{side}_position_pct": pos_pct,
+                f"{prefix}_{side}_MaxPos": 1.0,
+                f"{prefix}_{side}_PosCap": 1.0,
+                f"{prefix}_{side}_DataStatus": "ok",
+                f"{prefix}_{side}_LastUpdateAgeSec": 0.0,
+            })
+            if index == 0:
+                use_data.update({
+                    f"{side}_now_ask": price,
+                    f"{side}_now_bid": price,
+                    f"{side}_AskPrice": price,
+                    f"{side}_BidPrice": price,
+                    f"{side}_now_Qty": qty,
+                    f"{side}_Qty": qty,
+                    f"{side}_now_avgPrice": avg,
+                    f"{side}_AvgPrice": avg,
+                    f"{side}_Now_Pos": pos_pct,
+                    f"{side}_Pos": pos_pct,
+                    f"{side}_AvailableSellQty": qty,
+                    f"{side}_MaxPos": 1.0,
+                    f"{side}_PosCap": 1.0,
+                })
+    if legs:
+        use_data["Enddate"] = _leg_end_date(legs[0])
+        use_data["day_to_end"] = use_data.get("L0_DayToEnd", 9999.0)
+        use_data["MarketStatus"] = "open"
+    return use_data
+
+
+def _polymarket_execute_setpos(
+    *,
+    action: Dict[str, Any],
+    leg_index: int,
+    side: str,
+    target: float,
+    rows: List[Dict[str, Any]],
+    legs: List[Dict[str, Any]],
+    leg_states: List[Dict[str, Any]],
+    cash: float,
+    initial_cash: float,
+    fee_rate: float,
+) -> tuple[float, Optional[Dict[str, Any]]]:
+    row = rows[leg_index]
+    leg = legs[leg_index]
+    state = leg_states[leg_index]
+    prices = _polymarket_leg_prices(row)
+    price = prices[side]
+    budget_cap = _finite_float(leg.get("budget_cap"), 0.0)
+    if budget_cap <= 0:
+        budget_cap = initial_cash / max(1, len(legs))
+    qty_key = f"{side}_qty"
+    avg_key = f"{side}_avg"
+    qty_before = _finite_float(state.get(qty_key), 0.0)
+    current_value = qty_before * price
+    target_value = budget_cap * max(0.0, min(1.0, target))
+    delta_value = target_value - current_value
+    if abs(delta_value) < max(0.01, budget_cap * 0.0001):
+        return cash, None
+    verb = "BUY" if delta_value > 0 else "SELL"
+    if verb == "BUY":
+        desired_value = max(0.0, delta_value)
+        per_unit_fee = fee_rate * price * (1.0 - price)
+        max_qty = cash / (price + per_unit_fee) if price + per_unit_fee > 0 else 0.0
+        trade_qty = min(desired_value / price if price > 0 else 0.0, max_qty)
+        if trade_qty <= 0:
+            return cash, None
+        trade_value = trade_qty * price
+        fee = _polymarket_fee(trade_qty, price, fee_rate)
+        cash -= trade_value + fee
+        qty_after = qty_before + trade_qty
+        prev_cost = qty_before * _finite_float(state.get(avg_key), price)
+        state[qty_key] = qty_after
+        state[avg_key] = (prev_cost + trade_value) / qty_after if qty_after > 0 else 0.0
+    else:
+        trade_qty = min(qty_before, abs(delta_value) / price if price > 0 else 0.0)
+        if trade_qty <= 0:
+            return cash, None
+        trade_value = trade_qty * price
+        fee = _polymarket_fee(trade_qty, price, fee_rate)
+        cash += trade_value - fee
+        qty_after = qty_before - trade_qty
+        state[qty_key] = qty_after if qty_after > 1e-10 else 0.0
+        if state[qty_key] <= 0:
+            state[avg_key] = 0.0
+    return cash, {
+        "ts_utc": row.get("ts_utc"),
+        "leg_id": _backtest_leg_id(leg, leg_index),
+        "instrument_id": str(leg.get("instrument_id") or leg.get("condition_id") or ""),
+        "side": f"{verb}_{side.upper()}",
+        "quantity": trade_qty,
+        "price": price,
+        "fee": fee,
+        "status": "filled",
+        "reason": str(action.get("reason") or action.get("desc") or "strategy_signal"),
+        "meta": {"leg_index": leg_index, "outcome": side, "target_pct": target, "raw_action": action},
+    }
+
+
+def _execute_polymarket_backtest(
+    run_id: int,
+    snapshot: Dict[str, Any],
+    strategy_code: str,
+    params: Dict[str, Any],
+    legs: List[Dict[str, Any]],
+    ts: str,
+    finish_failed: Any,
+) -> None:
+    availability = _case_data_availability(legs)
+    start_ms, end_ms = _window_ms_from_snapshot(snapshot)
+    window = snapshot.get("data_window") if isinstance(snapshot.get("data_window"), dict) else {}
+    strict_window = bool(window.get("strict"))
+    min_points = max(20, _safe_int(params.get("min_points"), 20))
+    events: List[Dict[str, Any]] = []
+    _mark_backtest_progress(run_id, 20, "loading_data", f"Loading local Polymarket price history for {len(legs)} legs.")
+    conn = _connect()
+    try:
+        leg_rows = [_read_polymarket_price_rows(conn, leg, start_ms, end_ms) for leg in legs]
+    finally:
+        conn.close()
+
+    for index, (leg, rows) in enumerate(zip(legs, leg_rows)):
+        token_id = str(leg.get("token_id") or leg.get("yes_token") or "").strip()
+        if strict_window and rows:
+            first_ms = _safe_int(rows[0].get("ts"), 0) * 1000
+            last_ms = _safe_int(rows[-1].get("ts"), 0) * 1000
+            if (start_ms and first_ms > start_ms + 60_000) or (end_ms and last_ms < end_ms - 60_000):
+                events.append({
+                    "event_type": "data_window_partial",
+                    "message": f"Polymarket token {token_id} has partial local data in the requested strict window.",
+                    "meta": {
+                        "leg_index": index,
+                        "token_id": token_id,
+                        "requested_start": _ms_to_iso(start_ms) if start_ms else None,
+                        "requested_end": _ms_to_iso(end_ms) if end_ms else None,
+                        "actual_start": rows[0].get("ts_utc") if rows else None,
+                        "actual_end": rows[-1].get("ts_utc") if rows else None,
+                    },
+                })
+                finish_failed(f"Missing strict-window Polymarket price data for leg {index + 1}.", events)
+                return
+        if len(rows) < min_points:
+            events.append({
+                "event_type": "data_window_missing_download_required",
+                "message": f"Polymarket token {token_id} has not enough local price history.",
+                "meta": {"leg_index": index, "token_id": token_id, "points": len(rows), "download_required": True},
+            })
+            finish_failed(f"Missing Polymarket price history for leg {index + 1}.", events)
+            return
+
+    row_maps = [{_safe_int(row.get("ts"), 0): row for row in rows} for rows in leg_rows]
+    common_times = sorted(set.intersection(*(set(item.keys()) for item in row_maps)) if row_maps else set())
+    common_times = [value for value in common_times if value > 0]
+    if len(common_times) < min_points:
+        events.append({
+            "event_type": "data_window_no_overlap",
+            "message": f"Polymarket legs have only {len(common_times)} aligned timestamps.",
+            "meta": {"aligned_points": len(common_times), "min_points": min_points},
+        })
+        finish_failed("Not enough aligned Polymarket price data.", events)
+        return
+
+    module = _load_strategy_code_module(strategy_code)
+    if module is None:
+        finish_failed(f"StrategyCode file not found or cannot be loaded: {strategy_code}", events)
+        return
+    _mark_backtest_progress(run_id, 50, "data_ready", f"Data ready: {len(common_times)} aligned Polymarket points.")
+    _mark_backtest_progress(run_id, 58, "strategy_loaded", f"Loaded StrategyCode: {strategy_code}.")
+
+    initial_cash = max(1.0, _finite_float(params.get("initial_cash"), DEFAULT_BACKTEST_CASH))
+    fee_rate = _polymarket_fee_rate(params)
+    cash = initial_cash
+    leg_states = [{"Yes_qty": 0.0, "Yes_avg": 0.0, "No_qty": 0.0, "No_avg": 0.0} for _ in legs]
+    runtime_state: Dict[str, Any] = {}
+    machine_state = "auto"
+    equity_points: List[Dict[str, Any]] = []
+    orders: List[Dict[str, Any]] = []
+    total_rows = max(1, len(common_times))
+    progress_step = max(1, total_rows // 10)
+    skipped_action_types: set[str] = set()
+
+    for idx, ts_sec in enumerate(common_times):
+        rows = [row_map[ts_sec] for row_map in row_maps]
+        if idx == 0 or idx % progress_step == 0:
+            percent = 60.0 + min(25.0, (idx / total_rows) * 25.0)
+            _mark_backtest_progress(run_id, percent, "running_strategy", f"Running Polymarket replay: {idx}/{total_rows} aligned points processed.")
+        use_data = _polymarket_usedata(
+            snapshot=snapshot,
+            legs=legs,
+            leg_states=leg_states,
+            rows=rows,
+            cash=cash,
+            initial_cash=initial_cash,
+            runtime_state=runtime_state,
+            machine_state=machine_state,
+        )
+        output = _run_strategy_code_once(module, use_data, params)
+        metric_payload = _strategy_output_metric_payload(output)
+        actions = output.get("actions") if isinstance(output.get("actions"), list) else []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            action_type = str(action.get("type") or "").strip().upper()
+            if action_type in {"SETPOS", "SET_TARGET", "SET_POSITION", "SET_BINARY_TARGET"}:
+                leg_index = _resolve_action_leg_index(action, legs)
+                side = _outcome_side(action.get("side") or action.get("outcome") or action.get("asset_side"), "Yes")
+                current_price = _polymarket_leg_prices(rows[leg_index])[side]
+                state = leg_states[leg_index]
+                budget_cap = _finite_float(legs[leg_index].get("budget_cap"), 0.0) or initial_cash / max(1, len(legs))
+                current_value = _finite_float(state.get(f"{side}_qty"), 0.0) * current_price
+                current_position = current_value / budget_cap if budget_cap > 0 else 0.0
+                target = _action_target_position(action, current_position)
+                if target is None:
+                    continue
+                cash, order = _polymarket_execute_setpos(
+                    action=action,
+                    leg_index=leg_index,
+                    side=side,
+                    target=target,
+                    rows=rows,
+                    legs=legs,
+                    leg_states=leg_states,
+                    cash=cash,
+                    initial_cash=initial_cash,
+                    fee_rate=fee_rate,
+                )
+                if order:
+                    orders.append(order)
+                continue
+            if action_type in {"BUY", "SELL"}:
+                leg_index = _resolve_action_leg_index(action, legs)
+                side = _outcome_side(action.get("outcome") or action.get("asset_side") or action.get("side"), "Yes")
+                qty = max(0.0, _finite_float(action.get("qty") or action.get("quantity"), 0.0))
+                if qty <= 0:
+                    continue
+                prices = _polymarket_leg_prices(rows[leg_index])
+                price = prices[side]
+                state = leg_states[leg_index]
+                qty_key = f"{side}_qty"
+                avg_key = f"{side}_avg"
+                if action_type == "BUY":
+                    fee = _polymarket_fee(qty, price, fee_rate)
+                    total_cost = qty * price + fee
+                    if total_cost > cash:
+                        qty = max(0.0, cash / (price + fee_rate * price * (1 - price)))
+                        fee = _polymarket_fee(qty, price, fee_rate)
+                        total_cost = qty * price + fee
+                    if qty <= 0:
+                        continue
+                    prev_qty = _finite_float(state.get(qty_key), 0.0)
+                    prev_cost = prev_qty * _finite_float(state.get(avg_key), price)
+                    cash -= total_cost
+                    state[qty_key] = prev_qty + qty
+                    state[avg_key] = (prev_cost + qty * price) / state[qty_key] if state[qty_key] > 0 else 0.0
+                else:
+                    prev_qty = _finite_float(state.get(qty_key), 0.0)
+                    qty = min(prev_qty, qty)
+                    if qty <= 0:
+                        continue
+                    fee = _polymarket_fee(qty, price, fee_rate)
+                    cash += qty * price - fee
+                    state[qty_key] = prev_qty - qty
+                    if state[qty_key] <= 1e-10:
+                        state[qty_key] = 0.0
+                        state[avg_key] = 0.0
+                orders.append({
+                    "ts_utc": rows[leg_index].get("ts_utc"),
+                    "leg_id": _backtest_leg_id(legs[leg_index], leg_index),
+                    "instrument_id": str(legs[leg_index].get("instrument_id") or legs[leg_index].get("condition_id") or ""),
+                    "side": f"{action_type}_{side.upper()}",
+                    "quantity": qty,
+                    "price": price,
+                    "fee": fee,
+                    "status": "filled",
+                    "reason": str(action.get("reason") or action.get("desc") or "strategy_signal"),
+                    "meta": {"leg_index": leg_index, "outcome": side, "raw_action": action},
+                })
+                continue
+            if action_type and action_type not in skipped_action_types:
+                skipped_action_types.add(action_type)
+                events.append({
+                    "event_type": "unsupported_action",
+                    "message": f"Polymarket backtest skipped unsupported action type {action_type}.",
+                    "meta": {"action_type": action_type},
+                })
+
+        if isinstance(output.get("state_updates"), dict):
+            runtime_state.update(output.get("state_updates") or {})
+        if isinstance(output.get("machine_state_updates"), dict) and output.get("machine_state_updates", {}).get("state"):
+            machine_state = str(output["machine_state_updates"]["state"] or machine_state)
+
+        equity, exposure = _polymarket_portfolio_equity(cash, leg_states, rows)
+        equity_points.append({
+            "ts_utc": rows[0].get("ts_utc"),
+            "equity": equity,
+            "cash": cash,
+            "exposure": exposure,
+            "pnl": equity - initial_cash,
+            "meta": {
+                "engine": "polymarket_binary_replay",
+                "aligned_ts": ts_sec,
+                **metric_payload,
+                "legs": [
+                    {
+                        "leg_index": index,
+                        "condition_id": leg.get("condition_id") or row.get("condition_id") or "",
+                        "yes_price": _polymarket_leg_prices(row)["Yes"],
+                        "no_price": _polymarket_leg_prices(row)["No"],
+                        "yes_qty": _finite_float(state.get("Yes_qty"), 0.0),
+                        "no_qty": _finite_float(state.get("No_qty"), 0.0),
+                    }
+                    for index, (leg, state, row) in enumerate(zip(legs, leg_states, rows))
+                ],
+            },
+        })
+
+    _mark_backtest_progress(run_id, 88, "calculating_metrics", f"Polymarket replay complete: {len(equity_points)} equity points, {len(orders)} orders.")
+    metrics = _calculate_backtest_metrics(equity_points, orders, len(legs))
+    metrics.update({
+        "engine": "polymarket_binary_replay",
+        "fee_rate": fee_rate,
+        "strategy_code": strategy_code,
+        "requested_start": _ms_to_iso(start_ms) if start_ms else None,
+        "requested_end": _ms_to_iso(end_ms) if end_ms else None,
+        "strict_window": strict_window,
+        "available_start": availability.get("common_start"),
+        "available_end": availability.get("common_end"),
+        "data_availability": availability,
+        "aligned_points": len(common_times),
+        "progress_percent": 95.0,
+        "progress_stage": "writing_report",
+        "progress_message": "Writing Polymarket replay report data.",
+        "progress_updated_at": _now_iso(),
+    })
+    _mark_backtest_progress(run_id, 95, "writing_report", "Writing Polymarket replay report data to local database.")
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM backtest_equity_points WHERE run_id = ?", (run_id,))
+        conn.execute("DELETE FROM backtest_orders WHERE run_id = ?", (run_id,))
+        for point in equity_points:
+            conn.execute(
+                """INSERT OR REPLACE INTO backtest_equity_points(run_id, ts_utc, equity, cash, exposure, pnl, meta_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (run_id, point["ts_utc"], point["equity"], point["cash"], point["exposure"], point["pnl"], json.dumps(point["meta"], ensure_ascii=False)),
+            )
+        for order in orders:
+            conn.execute(
+                """INSERT INTO backtest_orders(run_id, ts_utc, leg_id, instrument_id, side, quantity, price, fee, status, reason, meta_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    run_id,
+                    order["ts_utc"],
+                    order["leg_id"],
+                    order["instrument_id"],
+                    order["side"],
+                    order["quantity"],
+                    order["price"],
+                    order["fee"],
+                    order["status"],
+                    order["reason"],
+                    json.dumps(order["meta"], ensure_ascii=False),
+                ),
+            )
+        for event in events:
+            conn.execute(
+                "INSERT INTO backtest_events(run_id, ts_utc, event_type, message, meta_json) VALUES (?, ?, ?, ?, ?)",
+                (run_id, ts, event.get("event_type") or "info", event.get("message") or "", json.dumps(event.get("meta") or {}, ensure_ascii=False)),
+            )
+        conn.execute(
+            """INSERT INTO backtest_events(run_id, ts_utc, event_type, message, meta_json)
+               VALUES (?, ?, 'complete', ?, ?)""",
+            (run_id, _now_iso(), f"Polymarket replay complete: {len(equity_points)} equity points, {len(orders)} orders.", "{}"),
+        )
+        conn.execute(
+            """UPDATE backtest_runs
+               SET status = 'completed', metrics_json = ?, error = NULL, started_at_utc = COALESCE(started_at_utc, ?),
+                   finished_at_utc = ?, updated_at_utc = ?
+               WHERE run_id = ?""",
+            (
+                json.dumps({
+                    **metrics,
+                    "progress_percent": 100.0,
+                    "progress_stage": "completed",
+                    "progress_message": "Backtest completed.",
+                    "progress_updated_at": _now_iso(),
+                }, ensure_ascii=False, sort_keys=True),
+                ts,
+                _now_iso(),
+                _now_iso(),
+                run_id,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _execute_backtest_run(run_id: int) -> None:
     _mark_backtest_progress(run_id, 8, "starting", "Backtest worker started.")
     run = get_backtest_run(run_id)
@@ -1400,7 +2714,13 @@ def _execute_backtest_run(run_id: int) -> None:
         finish_failed("No StrategyCode selected.")
         return
     if len(legs) != 1 or _leg_source(legs[0]) != "binance":
-        finish_failed("First executable version only supports one Binance leg.")
+        if legs and all(_leg_source(leg) == "binance" for leg in legs):
+            _execute_multi_binance_backtest(run_id, snapshot, strategy_code, params, legs, ts, finish_failed)
+            return
+        if legs and all(_leg_source(leg) == "polymarket" for leg in legs):
+            _execute_polymarket_backtest(run_id, snapshot, strategy_code, params, legs, ts, finish_failed)
+            return
+        finish_failed("Backtest execution currently supports all-Binance or all-Polymarket cases. Mixed-source replay is planned.")
         return
 
     _mark_backtest_progress(run_id, 15, "validated", "Strategy and case compatibility passed.")
@@ -1596,6 +2916,7 @@ def _execute_backtest_run(run_id: int) -> None:
             "instrument_id": leg.get("instrument_id"),
         }
         output = _run_strategy_code_once(module, usedata, params)
+        metric_payload = _strategy_output_metric_payload(output)
         actions = output.get("actions") if isinstance(output.get("actions"), list) else []
         for action in actions:
             if not isinstance(action, dict) or str(action.get("type") or "").upper() != "SET_TARGET":
@@ -1651,6 +2972,7 @@ def _execute_backtest_run(run_id: int) -> None:
                 "close": close,
                 "position_qty": qty,
                 "position_ratio": (exposure / equity) if equity > 0 else 0.0,
+                **metric_payload,
             },
         })
 
@@ -1736,10 +3058,16 @@ def _execute_backtest_run(run_id: int) -> None:
         conn.close()
 
 
-def list_backtest_runs(case_id: Optional[int] = None) -> List[Dict[str, Any]]:
+def list_backtest_runs(case_id: Optional[int] = None, batch_id: str = "") -> List[Dict[str, Any]]:
     conn = _connect()
     try:
-        if case_id:
+        batch_id = str(batch_id or "").strip()
+        if batch_id:
+            rows = conn.execute(
+                "SELECT * FROM backtest_runs WHERE batch_id = ? ORDER BY updated_at_utc DESC, run_id DESC",
+                (batch_id,),
+            ).fetchall()
+        elif case_id:
             rows = conn.execute(
                 "SELECT * FROM backtest_runs WHERE case_id = ? ORDER BY updated_at_utc DESC, run_id DESC",
                 (int(case_id),),
@@ -1751,6 +3079,398 @@ def list_backtest_runs(case_id: Optional[int] = None) -> List[Dict[str, Any]]:
         return [_decode_run_row(row) for row in rows]
     finally:
         conn.close()
+
+
+def delete_backtest_run(run_id: int) -> bool:
+    conn = _connect()
+    try:
+        affected = conn.execute(
+            "DELETE FROM backtest_runs WHERE run_id = ?",
+            (int(run_id),),
+        ).rowcount
+        conn.commit()
+        return affected > 0
+    finally:
+        conn.close()
+
+
+def delete_backtest_batch(batch_id: str) -> Dict[str, Any]:
+    batch_id = str(batch_id or "").strip()
+    if not batch_id:
+        raise ValueError("batch_id is required")
+    conn = _connect()
+    try:
+        run_rows = conn.execute(
+            "SELECT run_id FROM backtest_runs WHERE batch_id = ? ORDER BY run_id",
+            (batch_id,),
+        ).fetchall()
+        run_ids = [int(row["run_id"]) for row in run_rows]
+        affected = conn.execute(
+            "DELETE FROM backtest_runs WHERE batch_id = ?",
+            (batch_id,),
+        ).rowcount
+        conn.commit()
+        return {
+            "batch_id": batch_id,
+            "deleted_runs": int(affected or 0),
+            "run_ids": run_ids,
+        }
+    finally:
+        conn.close()
+
+
+def rename_backtest_case(case_id: int, name: str) -> Dict[str, Any]:
+    new_name = str(name or "").strip()
+    if not new_name:
+        raise ValueError("case name is required")
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT * FROM backtest_cases WHERE case_id = ?", (int(case_id),)).fetchone()
+        if not row:
+            raise ValueError("backtest case not found")
+        now = _now_iso()
+        conn.execute(
+            "UPDATE backtest_cases SET case_name = ?, updated_at_utc = ? WHERE case_id = ?",
+            (new_name, now, int(case_id)),
+        )
+        run_rows = conn.execute(
+            "SELECT run_id, case_snapshot_json, metrics_json FROM backtest_runs WHERE case_id = ?",
+            (int(case_id),),
+        ).fetchall()
+        for run_row in run_rows:
+            snapshot = _loads_json(run_row["case_snapshot_json"], {})
+            metrics = _loads_json(run_row["metrics_json"], {})
+            snapshot["case_name"] = new_name
+            if not str(metrics.get("run_name") or "").strip():
+                snapshot["run_name"] = new_name
+            conn.execute(
+                """UPDATE backtest_runs
+                   SET case_snapshot_json = ?, metrics_json = ?, updated_at_utc = ?
+                   WHERE run_id = ?""",
+                (
+                    json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+                    json.dumps(metrics, ensure_ascii=False, sort_keys=True),
+                    now,
+                    int(run_row["run_id"]),
+                ),
+            )
+        conn.commit()
+        updated = conn.execute("SELECT * FROM backtest_cases WHERE case_id = ?", (int(case_id),)).fetchone()
+        return _decode_case_row(updated)
+    finally:
+        conn.close()
+
+
+def rename_backtest_run(run_id: int, name: str) -> Dict[str, Any]:
+    new_name = str(name or "").strip()
+    if not new_name:
+        raise ValueError("run name is required")
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT * FROM backtest_runs WHERE run_id = ?", (int(run_id),)).fetchone()
+        if not row:
+            raise ValueError("backtest run not found")
+        snapshot = _loads_json(row["case_snapshot_json"], {})
+        metrics = _loads_json(row["metrics_json"], {})
+        snapshot["run_name"] = new_name
+        metrics["run_name"] = new_name
+        now = _now_iso()
+        conn.execute(
+            """UPDATE backtest_runs
+               SET case_snapshot_json = ?, metrics_json = ?, updated_at_utc = ?
+               WHERE run_id = ?""",
+            (
+                json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+                json.dumps(metrics, ensure_ascii=False, sort_keys=True),
+                now,
+                int(run_id),
+            ),
+        )
+        conn.commit()
+        updated = conn.execute("SELECT * FROM backtest_runs WHERE run_id = ?", (int(run_id),)).fetchone()
+        return _batch_run_summary(_decode_run_row(updated))
+    finally:
+        conn.close()
+
+
+def rename_backtest_batch(batch_id: str, name: str) -> Dict[str, Any]:
+    batch_id = str(batch_id or "").strip()
+    new_name = str(name or "").strip()
+    if not batch_id:
+        raise ValueError("batch_id is required")
+    if not new_name:
+        raise ValueError("batch name is required")
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT run_id, case_snapshot_json, metrics_json FROM backtest_runs WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchall()
+        if not rows:
+            raise ValueError("backtest batch not found")
+        now = _now_iso()
+        for row in rows:
+            snapshot = _loads_json(row["case_snapshot_json"], {})
+            metrics = _loads_json(row["metrics_json"], {})
+            snapshot["batch_name"] = new_name
+            metrics["batch_name"] = new_name
+            conn.execute(
+                """UPDATE backtest_runs
+                   SET case_snapshot_json = ?, metrics_json = ?, updated_at_utc = ?
+                   WHERE run_id = ?""",
+                (
+                    json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+                    json.dumps(metrics, ensure_ascii=False, sort_keys=True),
+                    now,
+                    int(row["run_id"]),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return get_backtest_batch(batch_id, include_runs=True)
+
+
+def _workspace_leg_payload_from_backtest_leg(leg: Dict[str, Any], index: int, budget_cap: float) -> Dict[str, Any]:
+    source = _leg_source(leg)
+    asset_class = str(leg.get("asset_class") or ("crypto_spot" if source == "binance" else "polymarket_binary")).strip()
+    venue = str(leg.get("venue") or ("binance" if source == "binance" else "polymarket")).strip()
+    instrument_json = leg.get("instrument_json") if isinstance(leg.get("instrument_json"), dict) else {}
+    if not instrument_json:
+        instrument_json = {
+            "source": source,
+            "display_name": leg.get("display_name") or leg.get("question") or leg.get("symbol") or leg.get("instrument_id"),
+        }
+        if source == "binance":
+            instrument_json["interval"] = leg.get("interval") or DEFAULT_BINANCE_INTERVAL
+    params_json = leg.get("params_json") if isinstance(leg.get("params_json"), dict) else leg.get("params")
+    if not isinstance(params_json, dict):
+        params_json = {}
+    return {
+        "leg_index": index,
+        "condition_id": str(leg.get("condition_id") or "").strip(),
+        "yes_token": leg.get("yes_token") or leg.get("token_id") or leg.get("token"),
+        "no_token": leg.get("no_token"),
+        "leg_kind": leg.get("leg_kind") or ("crypto_spot" if source == "binance" else "binary_market"),
+        "asset_class": asset_class,
+        "venue": venue,
+        "symbol": str(leg.get("symbol") or "").strip().upper(),
+        "instrument_id": str(leg.get("instrument_id") or "").strip(),
+        "instrument_json": instrument_json,
+        "budget_cap": budget_cap,
+        "params_json": params_json,
+    }
+
+
+def find_backtest_run_for_workspace_strategy(strategy_id: int) -> Dict[str, Any]:
+    """Return the newest backtest run that owns an imported workspace strategy id."""
+    target_id = _safe_int(strategy_id, 0)
+    if target_id <= 0:
+        return {}
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM backtest_runs
+               WHERE strategy_id = ?
+               ORDER BY COALESCE(NULLIF(updated_at_utc, ''), created_at_utc) DESC, run_id DESC
+               LIMIT 20""",
+            (target_id,),
+        ).fetchall()
+        for row in rows:
+            run = _decode_run_row(row)
+            snapshot = run.get("case_snapshot") if isinstance(run.get("case_snapshot"), dict) else {}
+            metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+            if (
+                _safe_int(run.get("strategy_id"), 0) == target_id
+                or _safe_int(snapshot.get("run_strategy_id"), 0) == target_id
+                or _safe_int(metrics.get("workspace_strategy_id"), 0) == target_id
+            ):
+                return run
+
+        rows = conn.execute(
+            """SELECT * FROM backtest_runs
+               ORDER BY COALESCE(NULLIF(updated_at_utc, ''), created_at_utc) DESC, run_id DESC
+               LIMIT 300"""
+        ).fetchall()
+    finally:
+        conn.close()
+
+    for row in rows:
+        run = _decode_run_row(row)
+        snapshot = run.get("case_snapshot") if isinstance(run.get("case_snapshot"), dict) else {}
+        metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+        snapshot_strategy = snapshot.get("run_strategy_snapshot") if isinstance(snapshot.get("run_strategy_snapshot"), dict) else {}
+        if (
+            _safe_int(snapshot.get("run_strategy_id"), 0) == target_id
+            or _safe_int(metrics.get("workspace_strategy_id"), 0) == target_id
+            or _safe_int(snapshot_strategy.get("strategy_id"), 0) == target_id
+        ):
+            return run
+    return {}
+
+
+def get_backtest_workspace_strategy(strategy_id: int) -> Dict[str, Any]:
+    """Rehydrate an imported workspace strategy from its saved backtest run snapshot."""
+    target_id = _safe_int(strategy_id, 0)
+    run = find_backtest_run_for_workspace_strategy(target_id)
+    if not run:
+        return {}
+    snapshot = run.get("case_snapshot") if isinstance(run.get("case_snapshot"), dict) else {}
+    metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+    strategy = snapshot.get("run_strategy_snapshot") if isinstance(snapshot.get("run_strategy_snapshot"), dict) else {}
+    if strategy:
+        result = dict(strategy)
+        result["strategy_id"] = target_id or _safe_int(result.get("strategy_id"), 0)
+        if isinstance(result.get("input_json"), dict):
+            result["input_json"] = json.dumps(result.get("input_json") or {}, ensure_ascii=False, sort_keys=True)
+        if not isinstance(result.get("legs"), list) or not result.get("legs"):
+            result["legs"] = [
+                _workspace_leg_payload_from_backtest_leg(leg, index, 0.0)
+                for index, leg in enumerate(snapshot.get("legs") or [])
+                if isinstance(leg, dict)
+            ]
+        result["_snapshot_source"] = "backtest_history"
+        result["_snapshot_run_id"] = run.get("run_id")
+        return result
+
+    params = snapshot.get("run_params") if isinstance(snapshot.get("run_params"), dict) else {}
+    if not params and isinstance(snapshot.get("params"), dict):
+        params = snapshot.get("params") or {}
+    initial_cash = _finite_float(
+        params.get("initial_cash")
+        or metrics.get("initial_cash")
+        or metrics.get("initial_capital"),
+        DEFAULT_BACKTEST_CASH,
+    )
+    legs = snapshot.get("legs") if isinstance(snapshot.get("legs"), list) else []
+    budget_cap = initial_cash / max(1, len(legs))
+    return {
+        "strategy_id": target_id,
+        "strategy_name": str(snapshot.get("case_name") or f"Backtest run {run.get('run_id')}").strip(),
+        "strategy_code": str(snapshot.get("run_strategy_code") or metrics.get("strategy_code") or "").strip(),
+        "mode": "Stop",
+        "state": "Stop",
+        "initial_capital": initial_cash,
+        "strategy_bankroll": initial_cash,
+        "profit_roll_ratio": 0,
+        "realized_profit": 0,
+        "input_json": json.dumps(params or {}, ensure_ascii=False, sort_keys=True),
+        "created_at_utc": run.get("created_at_utc") or "",
+        "updated_at_utc": run.get("updated_at_utc") or "",
+        "legs": [
+            _workspace_leg_payload_from_backtest_leg(leg, index, budget_cap)
+            for index, leg in enumerate(legs)
+            if isinstance(leg, dict)
+        ],
+        "_snapshot_source": "backtest_history",
+        "_snapshot_run_id": run.get("run_id"),
+    }
+
+
+def import_backtest_run_to_workspace(run_id: int, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    run_id = int(run_id)
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT * FROM backtest_runs WHERE run_id = ?", (run_id,)).fetchone()
+        run = _decode_run_row(row)
+    finally:
+        conn.close()
+    if not run:
+        raise ValueError("backtest run not found")
+
+    snapshot = run.get("case_snapshot") if isinstance(run.get("case_snapshot"), dict) else {}
+    metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+    requested_strategy_id = _safe_int(payload.get("strategy_id"), 0)
+    existing_strategy_id = requested_strategy_id or _safe_int(run.get("strategy_id"), 0) or _safe_int(snapshot.get("run_strategy_id"), 0)
+    strategy = None
+    created = False
+    if existing_strategy_id:
+        from services.strategy_registry_service import get_strategy
+
+        strategy = get_strategy(existing_strategy_id)
+        if not strategy and requested_strategy_id:
+            raise ValueError(f"strategy {requested_strategy_id} not found")
+
+    if not strategy:
+        from services.strategy_registry_service import create_strategy
+
+        legs = snapshot.get("legs") if isinstance(snapshot.get("legs"), list) else []
+        if not legs:
+            raise ValueError("backtest run has no legs to import")
+        params = snapshot.get("run_params") if isinstance(snapshot.get("run_params"), dict) else {}
+        if not params and isinstance(snapshot.get("params"), dict):
+            params = snapshot.get("params") or {}
+        strategy_code = str(
+            payload.get("strategy_code")
+            or snapshot.get("run_strategy_code")
+            or metrics.get("strategy_code")
+            or ""
+        ).strip()
+        initial_cash = _finite_float(
+            payload.get("strategy_bankroll")
+            or params.get("initial_cash")
+            or metrics.get("initial_cash")
+            or metrics.get("initial_capital"),
+            DEFAULT_BACKTEST_CASH,
+        )
+        initial_cash = max(1.0, initial_cash)
+        budget_cap = initial_cash / max(1, len(legs))
+        strategy_payload = {
+            "strategy_name": str(
+                payload.get("strategy_name")
+                or f"{snapshot.get('case_name') or f'Backtest run {run_id}'} / run {run_id}"
+            ).strip(),
+            "strategy_code": strategy_code,
+            "mode": "Stop",
+            "initial_capital": initial_cash,
+            "strategy_bankroll": initial_cash,
+            "input_json": params,
+            "legs": [
+                _workspace_leg_payload_from_backtest_leg(leg, index, budget_cap)
+                for index, leg in enumerate(legs)
+                if isinstance(leg, dict)
+            ],
+        }
+        strategy = create_strategy(strategy_payload)
+        created = True
+
+    strategy_id = _safe_int((strategy or {}).get("strategy_id"), 0)
+    if strategy_id <= 0:
+        raise ValueError("workspace strategy was not created")
+    now = _now_iso()
+    snapshot["run_strategy_id"] = strategy_id
+    snapshot["run_strategy_snapshot"] = strategy
+    snapshot["workspace_imported_at"] = now
+    metrics["workspace_strategy_id"] = strategy_id
+    metrics["workspace_imported_at"] = now
+    conn = _connect()
+    try:
+        conn.execute(
+            """UPDATE backtest_runs
+               SET strategy_id = ?, case_snapshot_json = ?, metrics_json = ?, updated_at_utc = ?
+               WHERE run_id = ?""",
+            (
+                strategy_id,
+                json.dumps(snapshot, ensure_ascii=False, sort_keys=True),
+                json.dumps(metrics, ensure_ascii=False, sort_keys=True),
+                now,
+                run_id,
+            ),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM backtest_runs WHERE run_id = ?", (run_id,)).fetchone()
+        updated_run = _decode_run_row(row)
+    finally:
+        conn.close()
+    return {
+        "run_id": run_id,
+        "strategy_id": strategy_id,
+        "created": created,
+        "strategy": strategy,
+        "workspace_url": f"/strategies/{strategy_id}/workspace?source=backtest&run_id={run_id}",
+        "run": _batch_run_summary(updated_run),
+    }
 
 
 def get_backtest_run(
@@ -1782,9 +3502,8 @@ def get_backtest_run(
                      WHERE run_id = ?
                    )
                    WHERE rn = 1 OR rn = total_rows OR ((rn - 1) % ?) = 0
-                   ORDER BY ts_utc
-                   LIMIT ?""",
-                (int(run_id), stride, int(equity_limit)),
+                   ORDER BY ts_utc""",
+                (int(run_id), stride),
             ).fetchall()
         else:
             equity_rows = conn.execute(
@@ -1846,6 +3565,224 @@ def get_backtest_run(
         return run
     finally:
         conn.close()
+
+
+def _batch_run_summary(run: Dict[str, Any]) -> Dict[str, Any]:
+    metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+    snapshot = run.get("case_snapshot") if isinstance(run.get("case_snapshot"), dict) else {}
+    return {
+        "run_id": run.get("run_id"),
+        "case_id": run.get("case_id"),
+        "run_name": metrics.get("run_name") or snapshot.get("run_name") or snapshot.get("case_name"),
+        "case_name": snapshot.get("case_name"),
+        "strategy_id": run.get("strategy_id") or snapshot.get("run_strategy_id"),
+        "strategy_code": metrics.get("strategy_code") or snapshot.get("run_strategy_code"),
+        "status": run.get("status"),
+        "error": run.get("error"),
+        "created_at_utc": run.get("created_at_utc"),
+        "updated_at_utc": run.get("updated_at_utc"),
+        "finished_at_utc": run.get("finished_at_utc"),
+        "engine": metrics.get("engine"),
+        "total_return": metrics.get("total_return"),
+        "max_drawdown": metrics.get("max_drawdown"),
+        "sharpe": metrics.get("sharpe"),
+        "orders": metrics.get("orders"),
+        "equity_points": metrics.get("equity_points"),
+        "progress_percent": metrics.get("progress_percent"),
+        "progress_stage": metrics.get("progress_stage"),
+        "report_url": f"/backtests/{run.get('run_id')}",
+        "workspace_url": (
+            f"/strategies/{snapshot.get('run_strategy_id') or run.get('strategy_id')}/workspace?source=backtest&run_id={run.get('run_id')}"
+            if (snapshot.get("run_strategy_id") or run.get("strategy_id"))
+            else None
+        ),
+    }
+
+
+def _summarize_backtest_batch(batch_id: str, runs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    status_counts: Dict[str, int] = {}
+    returns: List[float] = []
+    sharpes: List[float] = []
+    drawdowns: List[float] = []
+    completed = 0
+    for run in runs:
+        status = str(run.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+        if status == "completed":
+            completed += 1
+            if metrics.get("total_return") is not None:
+                returns.append(_finite_float(metrics.get("total_return"), 0.0))
+            if metrics.get("sharpe") is not None:
+                sharpes.append(_finite_float(metrics.get("sharpe"), 0.0))
+            if metrics.get("max_drawdown") is not None:
+                drawdowns.append(_finite_float(metrics.get("max_drawdown"), 0.0))
+    summaries = [_batch_run_summary(run) for run in runs]
+    best = max(summaries, key=lambda item: _finite_float(item.get("total_return"), -1e18), default=None)
+    worst = min(summaries, key=lambda item: _finite_float(item.get("total_return"), 1e18), default=None)
+    return {
+        "batch_id": batch_id,
+        "run_count": len(runs),
+        "completed_count": completed,
+        "status_counts": status_counts,
+        "avg_total_return": (sum(returns) / len(returns)) if returns else None,
+        "best_total_return": max(returns) if returns else None,
+        "worst_total_return": min(returns) if returns else None,
+        "avg_sharpe": (sum(sharpes) / len(sharpes)) if sharpes else None,
+        "worst_max_drawdown": min(drawdowns) if drawdowns else None,
+        "best_run": best,
+        "worst_run": worst,
+        "runs": summaries,
+    }
+
+
+def _select_backtest_cases_for_batch(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_ids = payload.get("case_ids")
+    cases: List[Dict[str, Any]] = []
+    if isinstance(raw_ids, list) and raw_ids:
+        seen: set[int] = set()
+        for raw_id in raw_ids:
+            case_id = _safe_int(raw_id, 0)
+            if case_id <= 0 or case_id in seen:
+                continue
+            seen.add(case_id)
+            case = get_backtest_case(case_id)
+            if not case:
+                raise ValueError(f"backtest case not found: {case_id}")
+            cases.append(case)
+        return cases
+
+    collection_name = str(payload.get("collection_name") or payload.get("dataset") or "").strip()
+    strategy_id = _safe_int(payload.get("strategy_id"), 0)
+    limit = max(1, min(_safe_int(payload.get("limit"), 200), 500))
+    if not collection_name and not strategy_id:
+        raise ValueError("case_ids, collection_name, or strategy_id is required for batch backtest")
+    conn = _connect()
+    try:
+        where: List[str] = []
+        params: List[Any] = []
+        if collection_name:
+            where.append("collection_name = ?")
+            params.append(collection_name)
+        if strategy_id:
+            where.append("strategy_id = ?")
+            params.append(strategy_id)
+        params.append(limit)
+        rows = conn.execute(
+            f"""SELECT * FROM backtest_cases
+                WHERE {' AND '.join(where)}
+                ORDER BY updated_at_utc DESC, case_id DESC
+                LIMIT ?""",
+            params,
+        ).fetchall()
+        coverage_cache: Dict[str, Dict[str, Any]] = {}
+        return [_decode_case_row(row, coverage_cache=coverage_cache) for row in rows]
+    finally:
+        conn.close()
+
+
+def create_backtest_batch(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    cases = _select_backtest_cases_for_batch(payload)
+    if not cases:
+        raise ValueError("no backtest cases matched the batch request")
+    max_cases = max(1, min(_safe_int(payload.get("max_cases"), 100), 500))
+    if len(cases) > max_cases:
+        cases = cases[:max_cases]
+    batch_id = str(payload.get("batch_id") or "").strip()
+    if not batch_id:
+        batch_id = f"bt_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    batch_name = str(payload.get("batch_name") or payload.get("name") or payload.get("collection_name") or batch_id).strip()
+    common_params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    params_by_case = payload.get("params_by_case") if isinstance(payload.get("params_by_case"), dict) else {}
+    run_mode = str(payload.get("run_mode") or "async").strip().lower()
+    if run_mode not in {"sync", "async"}:
+        run_mode = "async"
+    runs: List[Dict[str, Any]] = []
+    for case in cases:
+        case_id = int(case.get("case_id") or 0)
+        case_params = params_by_case.get(str(case_id)) if isinstance(params_by_case.get(str(case_id)), dict) else {}
+        run_payload = {
+            "strategy_id": payload.get("strategy_id") or case.get("strategy_id"),
+            "strategy_code": payload.get("strategy_code"),
+            "params": {**common_params, **case_params},
+            "auto_download": bool(payload.get("auto_download") or payload.get("auto_download_missing")),
+            "run_mode": run_mode,
+            "batch_id": batch_id,
+            "batch_name": batch_name,
+        }
+        runs.append(create_backtest_run(case_id, run_payload))
+    return {
+        "ok": True,
+        "batch_id": batch_id,
+        "batch_name": batch_name,
+        "run_mode": run_mode,
+        "case_count": len(cases),
+        "summary": _summarize_backtest_batch(batch_id, runs),
+        "runs": [_batch_run_summary(run) for run in runs],
+    }
+
+
+def list_backtest_batches(limit: int = 50) -> List[Dict[str, Any]]:
+    limit = max(1, min(int(limit or 50), 200))
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM backtest_runs
+               WHERE batch_id != ''
+               ORDER BY updated_at_utc DESC, run_id DESC
+               LIMIT ?""",
+            (limit * 20,),
+        ).fetchall()
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            run = _decode_run_row(row)
+            batch_id = str(run.get("batch_id") or "")
+            if not batch_id:
+                continue
+            grouped.setdefault(batch_id, []).append(run)
+        batches = []
+        for batch_id, runs in grouped.items():
+            summary = _summarize_backtest_batch(batch_id, runs)
+            latest = max((str(run.get("updated_at_utc") or "") for run in runs), default="")
+            first_metrics = runs[0].get("metrics") if isinstance(runs[0].get("metrics"), dict) else {}
+            batches.append({
+                "batch_id": batch_id,
+                "batch_name": first_metrics.get("batch_name") or batch_id,
+                "updated_at_utc": latest,
+                "summary": {key: value for key, value in summary.items() if key != "runs"},
+            })
+        batches.sort(key=lambda item: str(item.get("updated_at_utc") or ""), reverse=True)
+        return batches[:limit]
+    finally:
+        conn.close()
+
+
+def get_backtest_batch(batch_id: str, include_runs: bool = True) -> Dict[str, Any]:
+    batch_id = str(batch_id or "").strip()
+    if not batch_id:
+        raise ValueError("batch_id is required")
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM backtest_runs WHERE batch_id = ? ORDER BY updated_at_utc DESC, run_id DESC",
+            (batch_id,),
+        ).fetchall()
+        runs = [_decode_run_row(row) for row in rows]
+    finally:
+        conn.close()
+    if not runs:
+        return {}
+    summary = _summarize_backtest_batch(batch_id, runs)
+    if not include_runs:
+        summary.pop("runs", None)
+    first_metrics = runs[0].get("metrics") if isinstance(runs[0].get("metrics"), dict) else {}
+    return {
+        "batch_id": batch_id,
+        "batch_name": first_metrics.get("batch_name") or batch_id,
+        "summary": summary,
+        "runs": summary.get("runs", []) if include_runs else [],
+    }
 
 
 def get_binance_coverage(symbol: str, interval: str = DEFAULT_BINANCE_INTERVAL) -> Dict[str, Any]:

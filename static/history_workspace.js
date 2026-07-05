@@ -5,6 +5,8 @@
   watchlist: [],
   cases: [],
   collections: [],
+  batches: [],
+  runs: [],
   strategies: [],
   strategyInputs: [],
   selectedWatchIds: new Set(),
@@ -44,6 +46,8 @@ const els = {
   runSelectedBtn: $("historyRunSelectedBtn"),
   runParams: $("historyRunParams"),
   runCases: $("historyRunCases"),
+  batches: $("historyBatches"),
+  runRecords: $("historyRunRecords"),
   preview: $("historyPreview"),
   previewMeta: $("historyPreviewMeta"),
   coverage: $("historyCoverage"),
@@ -167,6 +171,126 @@ async function loadCollections() {
   renderRunCases();
 }
 
+function renderBatches() {
+  const rows = historyState.batches || [];
+  if (!els.batches) return;
+  if (!rows.length) {
+    els.batches.innerHTML = `<div class="status">还没有批量回测记录。</div>`;
+    return;
+  }
+  els.batches.innerHTML = `
+    <div class="history-case-group">
+      <div class="history-case-group-head">
+        <strong>最近批量回测</strong>
+        <span class="muted">${escapeHtml(rows.length)} batches</span>
+      </div>
+      <div class="table-scroll">
+        <table class="history-table">
+          <tr><th>Batch</th><th>Status</th><th>Avg Return</th><th>Best</th><th>Runs</th><th>Actions</th></tr>
+          <tbody>
+            ${rows.map((row) => {
+              const summary = row.summary || {};
+              const counts = summary.status_counts || {};
+              const runs = summary.runs || [];
+              const firstRun = runs[0] || summary.best_run || null;
+              const statusText = Object.entries(counts).map(([key, value]) => `${key}:${value}`).join(" / ") || "-";
+              return `
+                <tr>
+                  <td><strong>${editableName("batch", row.batch_id, row.batch_name || row.batch_id, row.batch_id)}</strong><div class="muted mono">${escapeHtml(row.batch_id || "")}</div></td>
+                  <td>${escapeHtml(statusText)}</td>
+                  <td>${escapeHtml(formatPercent(summary.avg_total_return))}</td>
+                  <td>${escapeHtml(formatPercent(summary.best_total_return))}</td>
+                  <td>${escapeHtml(summary.run_count ?? runs.length ?? "-")}</td>
+                  <td class="table-actions">
+                    <button class="mini ghost" data-batch-load="${escapeHtml(row.batch_id)}" type="button">详情</button>
+                    ${firstRun?.report_url ? `<a class="mini ghost" href="${escapeHtml(firstRun.report_url)}" target="_blank" rel="noopener noreferrer">首个报告</a>` : ""}
+                    <button class="mini danger" data-batch-delete="${escapeHtml(row.batch_id)}" type="button">删除</button>
+                  </td>
+                </tr>
+                ${row.expanded ? `
+                  <tr>
+                    <td colspan="6">
+                      <div class="history-batch-runs">
+                        ${(runs || []).map((run) => `
+                          <a class="history-batch-run ${statusTone(run.status)}" href="${escapeHtml(run.report_url || `/backtests/${run.run_id}`)}" target="_blank" rel="noopener noreferrer">
+                            <span>run ${escapeHtml(run.run_id)}</span>
+                            <span>${escapeHtml(run.status || "-")}</span>
+                            <span>${escapeHtml(formatPercent(run.total_return))}</span>
+                          </a>
+                        `).join("") || "<span class='muted'>No run summaries.</span>"}
+                      </div>
+                    </td>
+                  </tr>
+                ` : ""}
+              `;
+            }).join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+async function loadBatches() {
+  const payload = await apiJson("/api/history/backtest-batches?limit=20");
+  historyState.batches = payload.data || [];
+  renderBatches();
+}
+
+function renderRunRecords() {
+  const rows = historyState.runs || [];
+  if (!els.runRecords) return;
+  if (!rows.length) {
+    els.runRecords.innerHTML = `<div class="status">还没有回测记录。运行样例后会显示在这里。</div>`;
+    return;
+  }
+  els.runRecords.innerHTML = `
+    <div class="history-case-group">
+      <div class="history-case-group-head">
+        <strong>回测记录</strong>
+        <span class="muted">${escapeHtml(rows.length)} runs</span>
+      </div>
+      <div class="table-scroll">
+        <table class="history-table">
+          <tr><th>Run</th><th>Case / Batch</th><th>Status</th><th>Return</th><th>Updated</th><th>Actions</th></tr>
+          <tbody>
+            ${rows.map((row) => {
+              const snapshot = row.case_snapshot || {};
+              const metrics = row.metrics || {};
+              const workspaceUrl = runWorkspaceUrl(row);
+              const strategyText = snapshot.run_strategy_code || metrics.strategy_code || row.strategy_id || "-";
+              const displayName = metrics.run_name || snapshot.run_name || row.run_name || snapshot.case_name || `Case ${row.case_id || "-"}`;
+              return `
+                <tr>
+                  <td><strong>run ${escapeHtml(row.run_id)}</strong><div class="muted mono">strategy=${escapeHtml(strategyText)}</div></td>
+                  <td>
+                    <strong>${editableName("run", row.run_id, displayName, `Run ${row.run_id}`)}</strong>
+                    <div class="muted mono">case_id=${escapeHtml(row.case_id || "-")}${row.batch_id ? ` / batch=${escapeHtml(row.batch_id)}` : ""}</div>
+                  </td>
+                  <td><span class="badge ${escapeHtml(statusTone(row.status))}">${escapeHtml(row.status || "-")}</span></td>
+                  <td>${escapeHtml(formatPercent(metrics.total_return))}</td>
+                  <td>${escapeHtml(row.updated_at_utc || row.finished_at_utc || row.created_at_utc || "-")}</td>
+                  <td class="table-actions">
+                    <a class="mini ghost" href="/backtests/${escapeHtml(row.run_id)}" target="_blank" rel="noopener noreferrer">报告</a>
+                    ${workspaceUrl ? `<a class="mini ghost" href="${escapeHtml(workspaceUrl)}" target="_blank" rel="noopener noreferrer">工作台</a>` : `<button class="mini ghost" data-run-import="${escapeHtml(row.run_id)}" type="button">导入工作台</button>`}
+                    <button class="mini danger" data-run-delete="${escapeHtml(row.run_id)}" type="button">删除</button>
+                  </td>
+                </tr>
+              `;
+            }).join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+async function loadRuns() {
+  const payload = await apiJson("/api/history/backtest-runs");
+  historyState.runs = payload.data || [];
+  renderRunRecords();
+}
+
 function selectedInstrumentId(row) {
   if (historyState.source === "binance") {
     return row.instrument_id || `crypto_spot:binance:${row.symbol || ""}`;
@@ -195,6 +319,36 @@ function coverageText(coverage) {
   const local = coverage.local_market_deltas || {};
   const downloaded = coverage.downloaded_price_history || {};
   return `local ${local.count || 0} points / official ${downloaded.count || 0} points`;
+}
+
+function formatNumber(value, digits = 2) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num.toLocaleString(undefined, { maximumFractionDigits: digits }) : "-";
+}
+
+function formatPercent(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? `${(num * 100).toFixed(2)}%` : "-";
+}
+
+function statusTone(status) {
+  const text = String(status || "").toLowerCase();
+  if (text === "completed") return "good";
+  if (text === "failed") return "error";
+  return "pending";
+}
+
+function editableName(kind, id, value, fallback = "-") {
+  const text = String(value || fallback || "-").trim();
+  return `<button class="editable-name" type="button" data-rename-kind="${escapeHtml(kind)}" data-rename-id="${escapeHtml(id)}" data-rename-value="${escapeHtml(text)}" title="点击重命名">${escapeHtml(text)}</button>`;
+}
+
+function runWorkspaceUrl(run) {
+  if (run?.workspace_url) return run.workspace_url;
+  const snapshot = run?.case_snapshot || {};
+  const strategyId = snapshot.run_strategy_id || run?.strategy_id || snapshot.strategy_id;
+  if (!strategyId || !run?.run_id) return "";
+  return `/strategies/${encodeURIComponent(strategyId)}/workspace?source=backtest&run_id=${encodeURIComponent(run.run_id)}`;
 }
 
 function applySelectedCoverage(coverage) {
@@ -373,7 +527,7 @@ function renderCases() {
               return `
                 <tr>
                   <td><input type="checkbox" data-pool-case-check="${escapeHtml(row.case_id)}" ${historyState.selectedPoolCaseIds.has(Number(row.case_id)) ? "checked" : ""}></td>
-                  <td><strong>${escapeHtml(row.case_name || `Case ${row.case_id}`)}</strong><div class="muted mono">case_id=${escapeHtml(row.case_id)}${row.strategy_id ? ` / strategy=${escapeHtml(row.strategy_id)}` : ""}</div></td>
+                  <td><strong>${editableName("case", row.case_id, row.case_name || `Case ${row.case_id}`, `Case ${row.case_id}`)}</strong><div class="muted mono">case_id=${escapeHtml(row.case_id)}${row.strategy_id ? ` / strategy=${escapeHtml(row.strategy_id)}` : ""}</div></td>
                   <td>${escapeHtml(legs.length)} legs<div class="muted">${escapeHtml(legs.map((leg) => leg.display_name || leg.symbol || leg.instrument_id).slice(0, 3).join(" | "))}</div><div class="muted mono">有效时间轴：${escapeHtml(availabilityText(row))}</div></td>
                   <td><span class="badge ${escapeHtml(checkClass)}">${escapeHtml(check.summary || "unchecked")}</span></td>
                   <td><span class="badge pending">${escapeHtml(row.status || "draft")}</span></td>
@@ -416,7 +570,7 @@ function renderRunCases() {
             return `
               <tr>
                 <td><input type="checkbox" data-run-case-check="${escapeHtml(row.case_id)}" ${historyState.selectedRunCaseIds.has(Number(row.case_id)) ? "checked" : ""}></td>
-                <td><strong>${escapeHtml(row.case_name || `Case ${row.case_id}`)}</strong><div class="muted mono">case_id=${escapeHtml(row.case_id)}</div></td>
+                <td><strong>${editableName("case", row.case_id, row.case_name || `Case ${row.case_id}`, `Case ${row.case_id}`)}</strong><div class="muted mono">case_id=${escapeHtml(row.case_id)}</div></td>
                 <td>${escapeHtml(row.collection_name || "Default")}</td>
                 <td>${escapeHtml(legs.length)} legs<div class="muted mono">有效时间轴：${escapeHtml(availabilityText(row))}</div></td>
                 <td><span class="badge ${escapeHtml(checkClass)}">${escapeHtml(check.summary || "unchecked")}</span></td>
@@ -625,6 +779,104 @@ async function createCollectionFromSelection() {
 async function deleteCase(id) {
   await apiJson(`/api/history/backtest-cases/${id}`, { method: "DELETE" });
   await loadCases();
+  await Promise.all([loadCollections(), loadRuns(), loadBatches()]);
+}
+
+async function deleteRun(id) {
+  if (!window.confirm(`删除回测 run ${id}？相关资金曲线、订单和事件明细也会一起删除。`)) return;
+  await apiJson(`/api/history/backtest-runs/${encodeURIComponent(id)}`, { method: "DELETE" });
+  await Promise.all([loadRuns(), loadBatches()]);
+  setStatus(`Backtest run ${id} deleted.`);
+}
+
+async function deleteBatch(batchId) {
+  if (!window.confirm(`删除批量回测 ${batchId}？该批次下所有 run 记录都会删除。`)) return;
+  const payload = await apiJson(`/api/history/backtest-batches/${encodeURIComponent(batchId)}`, { method: "DELETE" });
+  await Promise.all([loadRuns(), loadBatches()]);
+  setStatus(`Batch ${batchId} deleted (${payload.data?.deleted_runs || 0} runs).`);
+}
+
+async function importRunToWorkspace(id) {
+  const payload = await apiJson(`/api/history/backtest-runs/${encodeURIComponent(id)}/workspace`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  await Promise.all([loadRuns(), loadBatches()]);
+  const workspaceUrl = payload.data?.workspace_url || "";
+  setStatus(`Backtest run ${id} imported to workspace strategy ${payload.data?.strategy_id || "-"}.`);
+  if (workspaceUrl) {
+    window.open(workspaceUrl, "_blank", "noopener,noreferrer");
+  }
+}
+
+async function renameHistoryItem(kind, id, name) {
+  const clean = String(name || "").trim();
+  if (!clean) {
+    setStatus("Name cannot be empty.");
+    return;
+  }
+  const routes = {
+    case: `/api/history/backtest-cases/${encodeURIComponent(id)}`,
+    run: `/api/history/backtest-runs/${encodeURIComponent(id)}`,
+    batch: `/api/history/backtest-batches/${encodeURIComponent(id)}`,
+  };
+  const url = routes[kind];
+  if (!url) return;
+  await apiJson(url, {
+    method: "PATCH",
+    body: JSON.stringify({ name: clean }),
+  });
+  if (kind === "case") {
+    await Promise.all([loadCases(), loadRuns(), loadBatches(), loadCollections()]);
+  } else {
+    await Promise.all([loadRuns(), loadBatches()]);
+  }
+  setStatus(`${kind} ${id} renamed.`);
+}
+
+function startInlineRename(button) {
+  if (!button || button.dataset.editing === "1") return;
+  const kind = button.dataset.renameKind || "";
+  const id = button.dataset.renameId || "";
+  const original = button.dataset.renameValue || button.textContent || "";
+  const input = document.createElement("input");
+  input.className = "inline-rename-input";
+  input.value = original;
+  input.setAttribute("aria-label", "Rename");
+  input.style.minWidth = `${Math.max(160, Math.min(420, original.length * 10 + 40))}px`;
+  button.dataset.editing = "1";
+  button.replaceWith(input);
+  input.focus();
+  input.select();
+  let finished = false;
+  const finish = async (save) => {
+    if (finished) return;
+    finished = true;
+    const next = input.value.trim();
+    if (!save || !next || next === original) {
+      input.replaceWith(button);
+      button.dataset.editing = "";
+      return;
+    }
+    try {
+      await renameHistoryItem(kind, id, next);
+    } catch (error) {
+      setStatus(error.message);
+      input.replaceWith(button);
+      button.dataset.editing = "";
+    }
+  };
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      finish(true);
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      finish(false);
+    }
+  });
+  input.addEventListener("blur", () => finish(true));
 }
 
 async function createBacktestRun(caseId, strategyCode = "", params = {}) {
@@ -637,6 +889,7 @@ async function createBacktestRun(caseId, strategyCode = "", params = {}) {
     throw new Error("backtest run was not created");
   }
   setStatus(`Backtest run ${run.run_id} created. Opening report...`);
+  await Promise.all([loadRuns(), loadBatches()]);
   window.open(`/backtests/${run.run_id}`, "_blank", "noopener,noreferrer");
 }
 
@@ -651,28 +904,32 @@ async function runSelectedCases() {
     setStatus("Select at least one backtest case first.");
     return;
   }
-  const runs = [];
   const params = collectRunParams();
-  for (const caseId of caseIds) {
-    const payload = await apiJson(`/api/history/backtest-cases/${caseId}/runs`, {
-      method: "POST",
-      body: JSON.stringify({ strategy_code: strategyCode, params }),
-    });
-    if (payload.data?.run_id) {
-      runs.push(payload.data);
-    }
-  }
+  const collection = els.runCollection.value || "Selected cases";
+  const payload = await apiJson("/api/history/backtest-batches", {
+    method: "POST",
+    body: JSON.stringify({
+      case_ids: caseIds,
+      batch_name: `${strategyCode} · ${collection} · ${new Date().toISOString().slice(0, 19).replace("T", " ")}`,
+      strategy_code: strategyCode,
+      params,
+    }),
+  });
+  const batch = payload.data || {};
   renderCoverage({
-    status: "runs_created",
+    status: "batch_created",
     strategy_code: strategyCode,
     params,
-    run_count: runs.length,
-    reports: runs.map((run) => ({ run_id: run.run_id, url: `/backtests/${run.run_id}` })),
+    batch_id: batch.batch_id,
+    run_count: batch.runs?.length || batch.case_count || caseIds.length,
+    reports: (batch.runs || []).map((run) => ({ run_id: run.run_id, url: `/backtests/${run.run_id}` })),
   });
-  if (runs[0]?.run_id) {
-    window.open(`/backtests/${runs[0].run_id}`, "_blank", "noopener,noreferrer");
+  await Promise.all([loadBatches(), loadRuns()]);
+  const firstRun = batch.runs?.[0];
+  if (firstRun?.run_id) {
+    window.open(`/backtests/${firstRun.run_id}`, "_blank", "noopener,noreferrer");
   }
-  setStatus(`Created ${runs.length} backtest runs. The first report has been opened.`);
+  setStatus(`Batch ${batch.batch_id || ""} created with ${batch.runs?.length || caseIds.length} runs.`);
 }
 
 async function refreshSelectedCoverage() {
@@ -882,6 +1139,11 @@ els.watchlist.addEventListener("click", async (event) => {
   }
 });
 els.runCases.addEventListener("click", (event) => {
+  const rename = event.target.closest("button[data-rename-kind]");
+  if (rename) {
+    startInlineRename(rename);
+    return;
+  }
   const selectAll = event.target.closest("input[type='checkbox'][data-run-select-all]");
   if (selectAll) {
     const rows = filteredRunCases();
@@ -903,7 +1165,55 @@ els.runCases.addEventListener("click", (event) => {
   }
   renderRunCases();
 });
+els.batches?.addEventListener("click", async (event) => {
+  const rename = event.target.closest("button[data-rename-kind]");
+  if (rename) {
+    startInlineRename(rename);
+    return;
+  }
+  const deleteTarget = event.target.closest("button[data-batch-delete]");
+  if (deleteTarget) {
+    await deleteBatch(deleteTarget.dataset.batchDelete || "");
+    return;
+  }
+  const target = event.target.closest("button[data-batch-load]");
+  if (!target) return;
+  const batchId = target.dataset.batchLoad || "";
+  const payload = await apiJson(`/api/history/backtest-batches/${encodeURIComponent(batchId)}?include_runs=1`);
+  const detail = payload.data || {};
+  historyState.batches = (historyState.batches || []).map((row) => (
+    row.batch_id === batchId
+      ? {
+          ...row,
+          expanded: !row.expanded,
+          summary: detail.summary || row.summary || {},
+          batch_name: detail.batch_name || row.batch_name,
+        }
+      : row
+  ));
+  renderBatches();
+});
+els.runRecords?.addEventListener("click", async (event) => {
+  const rename = event.target.closest("button[data-rename-kind]");
+  if (rename) {
+    startInlineRename(rename);
+    return;
+  }
+  const importTarget = event.target.closest("button[data-run-import]");
+  if (importTarget) {
+    await importRunToWorkspace(Number(importTarget.dataset.runImport));
+    return;
+  }
+  const target = event.target.closest("button[data-run-delete]");
+  if (!target) return;
+  await deleteRun(Number(target.dataset.runDelete));
+});
 els.cases.addEventListener("click", async (event) => {
+  const rename = event.target.closest("button[data-rename-kind]");
+  if (rename) {
+    startInlineRename(rename);
+    return;
+  }
   const target = event.target.closest("button");
   const checkbox = event.target.closest("input[type='checkbox'][data-pool-case-check]");
   if (checkbox) {
@@ -930,6 +1240,7 @@ async function initHistoryWorkspace() {
   await Promise.all([loadHealth(), loadWatchlist()]);
   await loadCases();
   await Promise.all([loadCollections(), loadStrategies()]);
+  await Promise.all([loadBatches(), loadRuns()]);
   renderCases();
   renderRunCases();
 }

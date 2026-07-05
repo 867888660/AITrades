@@ -13,6 +13,34 @@
     const n = Number(value);
     return Number.isFinite(n) ? n.toLocaleString(undefined, { maximumFractionDigits: digits }) : "-";
   };
+  const fmtPct = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? `${(n * 100).toFixed(2)}%` : "-";
+  };
+  const fmtMoney = (value, suffix = "") => {
+    const text = fmtNum(value, 2);
+    return text === "-" || !suffix ? text : `${text} ${suffix}`;
+  };
+  const isBinanceTarget = (target = {}) => {
+    const text = [
+      target.type,
+      target.source,
+      target.venue,
+      target.asset_class,
+      target.instrument_id,
+    ].map((value) => String(value || "").toLowerCase()).join("|");
+    return text.includes("binance") || text.includes("crypto_spot");
+  };
+  const latestEquityPoint = (run = {}) => {
+    const points = Array.isArray(run?.equity) ? run.equity : [];
+    return points.length ? points[points.length - 1] : null;
+  };
+  const backtestOrderCount = (run = {}) => {
+    const metrics = run?.metrics || {};
+    if (Array.isArray(metrics.orders)) return metrics.orders.length;
+    if (metrics.orders !== undefined && metrics.orders !== null) return metrics.orders;
+    return Array.isArray(run?.orders) ? run.orders.length : null;
+  };
 
   const drawerToggle = document.getElementById("workspaceDrawerToggle");
   const drawer = document.getElementById("workspaceDrawer");
@@ -185,10 +213,49 @@
   window.renderSummary = function renderSummaryV3(strategy) {
     const bar = document.getElementById("workspaceLegsBar");
     if (!bar) return;
+    const markets = Array.isArray(window.workspaceTrackedMarkets) ? window.workspaceTrackedMarkets : [];
+    const primary = markets[0] || {};
     const validModes = ["Stop", "Virtual", "Real"];
     const legacyState = validModes.includes(strategy?.state) ? strategy.state : "";
     const mode = strategy?.mode || legacyState || "Stop";
     const machineState = strategy?.machine_state || (!validModes.includes(strategy?.state) ? strategy?.state : "") || "auto";
+    if (isBinanceTarget(primary)) {
+      const run = window.selectedBacktestResults?.selected_run || window.workspaceState?.backtest?.latest_run || {};
+      const metrics = run?.metrics || run || {};
+      const latest = latestEquityPoint(run) || {};
+      const latestMeta = latest?.meta || {};
+      const equity = metrics.final_equity ?? latest.equity ?? strategy?.strategy_bankroll;
+      const initial = metrics.initial_equity ?? metrics.initial_cash;
+      const pnl = Number(latest?.pnl);
+      const pnlClass = pnl > 0 ? "positive" : pnl < 0 ? "negative" : "";
+      const positionRatio = latestMeta.position_ratio;
+      const orders = backtestOrderCount(run);
+      bar.innerHTML = `
+        <div class="ws3-strat-summary crypto">
+          <div class="ws3-leg-title">策略汇总 <span class="ws3-leg-direction observe">crypto</span></div>
+          <div class="ws3-leg-row"><span>Instrument</span><span class="val">${esc(primary.symbol || primary.label || "-")}</span></div>
+          <div class="ws3-leg-row"><span>Equity</span><span class="val">${esc(fmtMoney(equity, "USDT"))}</span></div>
+          <div class="ws3-leg-row"><span>PnL</span><span class="val ws3-leg-pnl ${pnlClass}">${esc(fmtMoney(Number.isFinite(pnl) ? pnl : null, "USDT"))}</span></div>
+          <div class="ws3-leg-row"><span>Mode</span><span class="val">${esc(mode)}</span></div>
+          <div class="ws3-leg-row"><span>State</span><span class="val">${esc(machineState)}</span></div>
+        </div>
+        <div class="ws3-leg-card crypto">
+          <div class="ws3-leg-title">主标的 <span class="ws3-leg-direction observe">Binance</span></div>
+          <div class="ws3-leg-row"><span>K线</span><span class="val">${esc(primary.symbol || "-")} · ${esc(primary.interval || "1m")}</span></div>
+          <div class="ws3-leg-row"><span>Return / DD</span><span class="val">${esc(fmtPct(metrics.total_return))} / ${esc(fmtPct(metrics.max_drawdown))}</span></div>
+          <div class="ws3-leg-row"><span>Position</span><span class="val">${esc(fmtPct(positionRatio))} · ${esc(fmtNum(latestMeta.position_qty, 8))} BTC</span></div>
+          <div class="ws3-leg-row"><span>Mark</span><span class="val">${esc(fmtMoney(latestMeta.close, "USDT"))}</span></div>
+          <div class="ws3-leg-row"><span>Trades</span><span class="val">${esc(fmtNum(orders, 0))}</span></div>
+        </div>
+      `;
+      if (window.syncWorkspaceStateControl) {
+        window.syncWorkspaceStateControl(strategy || {});
+      }
+      if (window.syncWorkspaceMachineStateControl) {
+        window.syncWorkspaceMachineStateControl(strategy || {}, window.workspaceStateStore || null);
+      }
+      return;
+    }
     const pnl = Number(strategy?.strategy_pnl);
     const pnlClass = pnl > 0 ? "positive" : pnl < 0 ? "negative" : "";
     const yesQty = Number(strategy?.yes_qty || 0);
@@ -225,7 +292,13 @@
   window.renderHeader = function renderHeaderV3(strategy) {
     const title = document.getElementById("workspaceTitle");
     const subtitle = document.getElementById("workspaceSubtitle");
+    const markets = Array.isArray(window.workspaceTrackedMarkets) ? window.workspaceTrackedMarkets : [];
+    const primary = markets[0] || {};
     if (title) title.textContent = strategy?.display_name || strategy?.strategy || "Unnamed";
-    if (subtitle) subtitle.textContent = `${strategy?.question || "-"} | Row ${strategy?.row_id || "-"}`;
+    if (subtitle) {
+      subtitle.textContent = isBinanceTarget(primary)
+        ? `${primary.symbol || primary.label || "-"} · ${primary.interval || "1m"} · Row ${strategy?.row_id || "-"}`
+        : `${strategy?.question || "-"} | Row ${strategy?.row_id || "-"}`;
+    }
   };
 })();

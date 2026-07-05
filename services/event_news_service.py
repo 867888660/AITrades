@@ -679,8 +679,31 @@ def _ingest_items(
                 _json_text(raw),
             ),
         )
-        if conn.total_changes > before:
+        observation_inserted = conn.total_changes > before
+        if observation_inserted:
             stats["observations_inserted"] += 1
+        else:
+            existing_links = conn.execute(
+                """SELECT event_id
+                   FROM event_graph_event_observations
+                   WHERE observation_id = ?""",
+                (observation_id,),
+            ).fetchall()
+            if existing_links:
+                for link in existing_links:
+                    _refresh_event_rollup(conn, str(link["event_id"] or ""))
+                continue
+            existing_observation = conn.execute(
+                """SELECT clean_title, summary, published_at_utc, heat
+                   FROM event_graph_observations
+                   WHERE observation_id = ?""",
+                (observation_id,),
+            ).fetchone()
+            if existing_observation:
+                clean_title = str(existing_observation["clean_title"] or clean_title)
+                summary = str(existing_observation["summary"] or summary)
+                published_at = str(existing_observation["published_at_utc"] or published_at)
+                heat = float(existing_observation["heat"] or heat)
 
         canonical_key = _canonical_key(clean_title)
         event_id = _hash_id("news_evt", canonical_key, 16)
@@ -901,11 +924,221 @@ def list_observations(*, event_id: str = "", q: str = "", limit: int = 80) -> Li
         conn.close()
 
 
+def _duplicate_observation_link_count(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        """SELECT COUNT(*) AS c
+           FROM (
+             SELECT observation_id
+             FROM event_graph_event_observations
+             GROUP BY observation_id
+             HAVING COUNT(DISTINCT event_id) > 1
+           )"""
+    ).fetchone()
+    return int(row["c"] if row else 0)
+
+
+def _orphan_derived_event_count(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        """SELECT COUNT(*) AS c
+           FROM event_graph_events e
+           LEFT JOIN event_graph_event_observations l ON l.event_id = e.event_id
+           WHERE l.event_id IS NULL"""
+    ).fetchone()
+    return int(row["c"] if row else 0)
+
+
+def _choose_derived_event_keeper(conn: sqlite3.Connection, event_ids: List[str]) -> str:
+    placeholders = ",".join("?" for _ in event_ids)
+    rows = conn.execute(
+        f"""SELECT e.*,
+                  COUNT(l.observation_id) AS actual_observation_count
+           FROM event_graph_events e
+           LEFT JOIN event_graph_event_observations l ON l.event_id = e.event_id
+           WHERE e.event_id IN ({placeholders})
+           GROUP BY e.event_id""",
+        event_ids,
+    ).fetchall()
+    if not rows:
+        return sorted(event_ids)[0]
+
+    def sort_key(row: sqlite3.Row) -> tuple:
+        return (
+            -int(row["actual_observation_count"] or 0),
+            -int(row["source_count"] or 0),
+            -float(row["heat"] or 0.0),
+            str(row["first_seen_utc"] or ""),
+            str(row["event_id"] or ""),
+        )
+
+    return str(sorted(rows, key=sort_key)[0]["event_id"])
+
+
+def deduplicate_derived_events(*, dry_run: bool = False, limit: int = 500) -> Dict[str, Any]:
+    """Merge duplicate news-derived events that share the same observation.
+
+    This operates only on the derived/news layer tables:
+    event_graph_events and event_graph_event_observations. Graph Core tables
+    are intentionally untouched.
+    """
+    conn = _connect()
+    try:
+        limit_num = _safe_int(limit, 500, 1, 5000)
+        before_duplicate_observations = _duplicate_observation_link_count(conn)
+        before_orphan_events = _orphan_derived_event_count(conn)
+        rows = conn.execute(
+            """SELECT observation_id, GROUP_CONCAT(event_id) AS event_ids
+               FROM event_graph_event_observations
+               GROUP BY observation_id
+               HAVING COUNT(DISTINCT event_id) > 1
+               LIMIT ?""",
+            (limit_num,),
+        ).fetchall()
+
+        parent: Dict[str, str] = {}
+
+        def find(value: str) -> str:
+            parent.setdefault(value, value)
+            if parent[value] != value:
+                parent[value] = find(parent[value])
+            return parent[value]
+
+        def union(left: str, right: str) -> None:
+            left_root = find(left)
+            right_root = find(right)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        for row in rows:
+            event_ids = [part for part in str(row["event_ids"] or "").split(",") if part]
+            if not event_ids:
+                continue
+            first = event_ids[0]
+            find(first)
+            for event_id in event_ids[1:]:
+                union(first, event_id)
+
+        grouped: Dict[str, List[str]] = {}
+        for event_id in list(parent):
+            grouped.setdefault(find(event_id), []).append(event_id)
+        components = [sorted(set(event_ids)) for event_ids in grouped.values() if len(set(event_ids)) > 1]
+
+        report_components: List[Dict[str, Any]] = []
+        moved_links = 0
+        deleted_links = 0
+        deleted_events = 0
+        refreshed_events: List[str] = []
+        now = _now_iso()
+
+        for event_ids in components:
+            keeper = _choose_derived_event_keeper(conn, event_ids)
+            sources = [event_id for event_id in event_ids if event_id != keeper]
+            component_report = {
+                "keeper_event_id": keeper,
+                "merged_event_ids": sources,
+                "moved_links": 0,
+                "deleted_links": 0,
+                "deleted_events": 0,
+            }
+            if dry_run:
+                source_placeholders = ",".join("?" for _ in sources)
+                if source_placeholders:
+                    row = conn.execute(
+                        f"""SELECT COUNT(*) AS c
+                            FROM event_graph_event_observations
+                            WHERE event_id IN ({source_placeholders})""",
+                        sources,
+                    ).fetchone()
+                    component_report["moved_links"] = int(row["c"] if row else 0)
+                    component_report["deleted_links"] = component_report["moved_links"]
+                    component_report["deleted_events"] = len(sources)
+                report_components.append(component_report)
+                continue
+
+            for source_event_id in sources:
+                link_rows = conn.execute(
+                    """SELECT observation_id, confidence, reason, created_at_utc
+                       FROM event_graph_event_observations
+                       WHERE event_id = ?""",
+                    (source_event_id,),
+                ).fetchall()
+                for link in link_rows:
+                    insert_before = conn.total_changes
+                    conn.execute(
+                        """INSERT OR IGNORE INTO event_graph_event_observations(
+                            event_id, observation_id, confidence, reason, created_at_utc
+                        ) VALUES (?,?,?,?,?)""",
+                        (
+                            keeper,
+                            link["observation_id"],
+                            float(link["confidence"] or 0.65),
+                            str(link["reason"] or f"Merged duplicate derived event {source_event_id}."),
+                            str(link["created_at_utc"] or now),
+                        ),
+                    )
+                    if conn.total_changes > insert_before:
+                        moved_links += 1
+                        component_report["moved_links"] += 1
+                cursor = conn.execute(
+                    "DELETE FROM event_graph_event_observations WHERE event_id = ?",
+                    (source_event_id,),
+                )
+                deleted = max(0, cursor.rowcount)
+                deleted_links += deleted
+                component_report["deleted_links"] += deleted
+                cursor = conn.execute("DELETE FROM event_graph_events WHERE event_id = ?", (source_event_id,))
+                deleted = max(0, cursor.rowcount)
+                deleted_events += deleted
+                component_report["deleted_events"] += deleted
+
+            _refresh_event_rollup(conn, keeper)
+            refreshed_events.append(keeper)
+            report_components.append(component_report)
+
+        orphan_deleted = 0
+        if not dry_run:
+            cursor = conn.execute(
+                """DELETE FROM event_graph_events
+                   WHERE event_id NOT IN (
+                     SELECT DISTINCT event_id FROM event_graph_event_observations
+                   )"""
+            )
+            orphan_deleted = max(0, cursor.rowcount)
+            conn.commit()
+
+        after_duplicate_observations = _duplicate_observation_link_count(conn)
+        after_orphan_events = _orphan_derived_event_count(conn)
+        return {
+            "ok": True,
+            "dry_run": bool(dry_run),
+            "limited_to_duplicate_observations": limit_num,
+            "before": {
+                "duplicate_observations": before_duplicate_observations,
+                "orphan_events": before_orphan_events,
+            },
+            "after": {
+                "duplicate_observations": after_duplicate_observations,
+                "orphan_events": after_orphan_events,
+            },
+            "components_found": len(components),
+            "components": report_components[:50],
+            "moved_links": moved_links,
+            "deleted_links": deleted_links,
+            "deleted_events": deleted_events,
+            "orphan_events_deleted": orphan_deleted,
+            "refreshed_event_ids": refreshed_events[:50],
+            "scope": "derived_news_only",
+        }
+    finally:
+        conn.close()
+
+
 def get_status(limit: int = 10) -> Dict[str, Any]:
     conn = _connect()
     try:
         events = conn.execute("SELECT COUNT(*) AS c FROM event_graph_events").fetchone()["c"]
         observations = conn.execute("SELECT COUNT(*) AS c FROM event_graph_observations").fetchone()["c"]
+        duplicate_observations = _duplicate_observation_link_count(conn)
+        orphan_events = _orphan_derived_event_count(conn)
         last_rows = conn.execute(
             """SELECT * FROM event_graph_refresh_runs
                ORDER BY started_at_utc DESC
@@ -922,6 +1155,8 @@ def get_status(limit: int = 10) -> Dict[str, Any]:
             "db_path": str(EVENT_DB_PATH),
             "events": events,
             "observations": observations,
+            "duplicate_observations": duplicate_observations,
+            "orphan_events": orphan_events,
             "sources": GLOBAL_NEWS_FEEDS,
             "scheduler": event_news_scheduler.state(),
             "runs": runs,

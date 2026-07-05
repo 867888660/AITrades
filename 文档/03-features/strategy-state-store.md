@@ -1,5 +1,7 @@
 # Strategy State Store
 
+补充规范：`State Lanes`、`Strategy Metrics`、策略状态机与 `stop_loss_locked` 的准确定义见 [state-lanes-and-metrics.md](state-lanes-and-metrics.md)。
+
 本文记录策略状态分层与默认值机制。核心原则是：**默认值写在策略代码里，数据库只保存 override**。
 
 ## 分层

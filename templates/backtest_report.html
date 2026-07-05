@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Backtest Report</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='workspace_v3.css') }}?v=20260629_backtest_download_prompt1">
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260629_backtest_download_prompt1">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260702_backtest_workspace_import1">
   </head>
   <body>
     <div class="app-shell">
@@ -36,6 +36,8 @@
             <p id="reportMeta" class="muted">加载中...</p>
           </div>
           <div class="table-actions">
+            <a id="reportWorkspaceLink" class="mini ghost" href="#" target="_blank" rel="noopener noreferrer" hidden>在工作台查看</a>
+            <button id="reportWorkspaceImportBtn" class="mini ghost" type="button" hidden>导入工作台</button>
             <a class="mini ghost" href="/history" target="_blank" rel="noopener noreferrer">返回历史工作台</a>
             <button id="reportRefreshBtn" class="mini" type="button">刷新</button>
           </div>
@@ -130,6 +132,6 @@
       window.BACKTEST_RUN_ID = {{ run_id | tojson }};
     </script>
     <script src="{{ url_for('static', filename='echarts.min.js') }}" onerror="this.src='https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js'"></script>
-    <script src="{{ url_for('static', filename='backtest_report.js') }}?v=20260629_backtest_download_prompt1"></script>
+    <script src="{{ url_for('static', filename='backtest_report.js') }}?v=20260702_workspace_import1"></script>
   </body>
 </html>

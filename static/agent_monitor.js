@@ -53,6 +53,9 @@ const graphChangePatch = document.getElementById("graphChangePatch");
 const graphChangeValidateBtn = document.getElementById("graphChangeValidateBtn");
 const graphChangeValidation = document.getElementById("graphChangeValidation");
 const graphChangeMeta = document.getElementById("graphChangeMeta");
+const graphChangeApproveApplyReadyBtn = document.getElementById("graphChangeApproveApplyReadyBtn");
+const graphChangeApplyApprovedBtn = document.getElementById("graphChangeApplyApprovedBtn");
+const graphChangeRejectBlockedBtn = document.getElementById("graphChangeRejectBlockedBtn");
 
 let hasLoadedAgentDashboard = false;
 let activeAgentApproval = null;
@@ -64,6 +67,22 @@ let agentGraphChangeRows = [];
 const AGENT_ACTIVITY_PIN_KEY = "agent_monitor_activity_pinned_category";
 
 const AGENT_APPROVAL_MODES = ["Stop", "Virtual", "Real"];
+const EVENT_GRAPH_APPLY_ACTIONS = new Set([
+  "event_create",
+  "event_update",
+  "event_archive",
+  "event_merge",
+  "finance_create",
+  "finance_update",
+  "finance_archive",
+  "edge_create",
+  "edge_update",
+  "edge_delete",
+  "finance_mapping_create",
+  "expression_create",
+  "expression_update",
+  "expression_archive",
+]);
 const AGENT_DEADLINE_PARAM = {
   name: "Enddate",
   kind: "String",
@@ -554,6 +573,47 @@ function normalizeAgentApprovalParamKey(value) {
   return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
+function agentApprovalHasDeadlineParam(params = {}) {
+  return Object.entries(params || {}).some(([key, value]) =>
+    AGENT_DEADLINE_ALIASES.has(normalizeAgentApprovalParamKey(key)) && String(value ?? "").trim()
+  );
+}
+
+function readAgentApprovalMarketEndDate(market = {}) {
+  return String(
+    market?.end_date
+    || market?.endDate
+    || market?.Enddate
+    || market?.EndDate
+    || market?.raw?.endDate
+    || market?.raw?.umaEndDate
+    || ""
+  ).trim();
+}
+
+function firstAgentApprovalEndDate(snapshot = {}) {
+  const markets = Array.isArray(snapshot.markets) ? snapshot.markets : [];
+  for (const market of markets) {
+    const endDate = readAgentApprovalMarketEndDate(market);
+    if (endDate) return endDate;
+  }
+  const sourceMarkets = Array.isArray(snapshot.source_markets) ? snapshot.source_markets : [];
+  for (const market of sourceMarkets) {
+    const endDate = readAgentApprovalMarketEndDate(market);
+    if (endDate) return endDate;
+  }
+  return String(snapshot.end_date || snapshot.endDate || "").trim();
+}
+
+function withAgentApprovalDeadlineParam(params = {}, snapshot = {}) {
+  const clean = { ...(params && typeof params === "object" ? params : {}) };
+  if (!agentApprovalHasDeadlineParam(clean)) {
+    const endDate = firstAgentApprovalEndDate(snapshot);
+    if (endDate) clean.Enddate = endDate;
+  }
+  return clean;
+}
+
 function ensureAgentApprovalDeadlineInput(inputs = []) {
   const list = Array.isArray(inputs) ? inputs : [];
   const hasDeadline = list.some((inp) => AGENT_DEADLINE_ALIASES.has(normalizeAgentApprovalParamKey(inp?.name)));
@@ -840,6 +900,8 @@ function collectAgentApprovalDraftPayload() {
   const form = document.getElementById("agentApprovalForm");
   const fd = new FormData(form);
   const legs = collectAgentApprovalLegs();
+  const snapshot = agentApprovalSnapshot();
+  const inputJson = withAgentApprovalDeadlineParam(collectAgentApprovalParams(), snapshot);
   return {
     actor_type: "human",
     actor_id: "local_user",
@@ -848,7 +910,7 @@ function collectAgentApprovalDraftPayload() {
     strategy_code: String(fd.get("strategy_code") || "").trim(),
     mode: String(fd.get("mode") || "Stop").trim(),
     strategy_bankroll: String(fd.get("strategy_bankroll") || "").trim(),
-    input_json: collectAgentApprovalParams(),
+    input_json: inputJson,
     legs,
     condition_id: legs[0]?.condition_id || "",
   };
@@ -860,7 +922,7 @@ function openAgentApprovalModal(approval) {
   const snapshot = agentApprovalSnapshot(approval);
   const draft = approval?.draft || {};
   const title = agentApprovalTitle(approval);
-  const params = snapshot.params || {};
+  const params = withAgentApprovalDeadlineParam(snapshot.params || {}, snapshot);
   const budget = snapshot.budget || {};
   const markets = Array.isArray(snapshot.markets) ? snapshot.markets : [];
   const risk = approval.risk_report || approval?.snapshot?.risk || draft.last_risk_report || {};
@@ -1329,10 +1391,51 @@ function graphChangeStatusChip(status) {
     APPROVED: "已批准",
     REJECTED: "已拒绝",
     APPLIED: "已应用",
+    APPLY_FAILED: "应用失败",
     SUPERSEDED: "已替代",
   }[value] || value;
-  const tone = value === "NEEDS_CHANGES" || value === "REJECTED" ? "error" : value === "APPROVED" || value === "APPLIED" ? "good" : "pending";
+  const tone = value === "NEEDS_CHANGES" || value === "REJECTED" || value === "APPLY_FAILED" ? "error" : value === "APPROVED" || value === "APPLIED" ? "good" : "pending";
   return `<span class="state-chip ${tone}">${escapeHtml(label)}</span>`;
+}
+
+function graphChangePatchItems(item = {}) {
+  const patch = item.patch && typeof item.patch === "object" ? item.patch : {};
+  return Array.isArray(patch.items) ? patch.items : [];
+}
+
+function graphChangeValidationErrors(item = {}) {
+  const errors = item.validation?.errors;
+  return Array.isArray(errors) ? errors : [];
+}
+
+function graphChangeUnsupportedActions(item = {}) {
+  return [...new Set(graphChangePatchItems(item)
+    .map((patchItem) => String(patchItem?.action || "").trim().toLowerCase())
+    .filter((action) => !EVENT_GRAPH_APPLY_ACTIONS.has(action)))];
+}
+
+function parseGraphChangeApplyError(item = {}) {
+  const raw = item.apply_error_json;
+  if (!raw || raw === "{}") return "";
+  if (typeof raw === "object") return raw.message || JSON.stringify(raw);
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed.message || JSON.stringify(parsed);
+  } catch {
+    return String(raw);
+  }
+}
+
+function graphChangeApplyProblem(item = {}) {
+  const validationErrors = graphChangeValidationErrors(item);
+  if (validationErrors.length) {
+    return validationErrors[0]?.message || validationErrors[0]?.code || "Patch validation failed";
+  }
+  const items = graphChangePatchItems(item);
+  if (!items.length) return "patch.items is empty";
+  const unsupported = graphChangeUnsupportedActions(item);
+  if (unsupported.length) return `Unsupported action: ${unsupported.join(", ")}`;
+  return "";
 }
 
 function graphChangeActionButtons(item = {}) {
@@ -1340,19 +1443,107 @@ function graphChangeActionButtons(item = {}) {
   if (!requestId) return "";
   const escapedId = escapeHtml(requestId);
   const status = String(item.status || "").toUpperCase();
+  const problem = graphChangeApplyProblem(item);
   const reviewButtons = status === "PENDING" ? `
-    <button class="mini primary" type="button" data-agent-graph-approve="${escapedId}">批准</button>
+    ${problem
+      ? `<button class="mini" type="button" disabled title="${escapeHtml(problem)}">无法应用</button>`
+      : `<button class="mini primary" type="button" data-agent-graph-approve-apply="${escapedId}">批准并应用</button>`}
     <button class="mini ghost" type="button" data-agent-graph-change="${escapedId}">要求修改</button>
     <button class="mini danger" type="button" data-agent-graph-reject="${escapedId}">拒绝</button>
   ` : "";
   const applyButton = status === "APPROVED" ? `
-    <button class="mini primary" type="button" data-agent-graph-apply="${escapedId}">应用</button>
+    ${problem
+      ? `<button class="mini" type="button" disabled title="${escapeHtml(problem)}">无法应用</button>`
+      : `<button class="mini primary" type="button" data-agent-graph-apply="${escapedId}">应用</button>`}
+  ` : "";
+  const retryButton = status === "APPLY_FAILED" && !problem ? `
+    <button class="mini primary" type="button" data-agent-graph-approve-apply="${escapedId}">重试应用</button>
+  ` : "";
+  const rejectBlockedButton = status !== "PENDING" && problem && !["APPLIED", "REJECTED"].includes(status) ? `
+    <button class="mini danger" type="button" data-agent-graph-reject="${escapedId}">拒绝</button>
   ` : "";
   return `
+    ${retryButton}
     ${applyButton}
     ${reviewButtons}
+    ${rejectBlockedButton}
     <button class="mini ghost" type="button" data-agent-view-change="${escapedId}">详情</button>
   `;
+}
+
+function readyGraphChangesForApproveApply(rows = agentGraphChangeRows) {
+  return rows.filter((item) => String(item.status || "").toUpperCase() === "PENDING" && !graphChangeApplyProblem(item));
+}
+
+function readyGraphChangesForApply(rows = agentGraphChangeRows) {
+  return rows.filter((item) => String(item.status || "").toUpperCase() === "APPROVED" && !graphChangeApplyProblem(item));
+}
+
+function readyGraphChangesForRejectBlocked(rows = agentGraphChangeRows) {
+  return rows.filter((item) => {
+    const status = String(item.status || "").toUpperCase();
+    return ["PENDING", "APPROVED", "APPLY_FAILED"].includes(status) && Boolean(graphChangeApplyProblem(item));
+  });
+}
+
+function updateGraphChangeBulkActions(rows = agentGraphChangeRows) {
+  const approveApplyCount = readyGraphChangesForApproveApply(rows).length;
+  const applyCount = readyGraphChangesForApply(rows).length;
+  const rejectBlockedCount = readyGraphChangesForRejectBlocked(rows).length;
+  if (graphChangeApproveApplyReadyBtn) {
+    graphChangeApproveApplyReadyBtn.disabled = approveApplyCount === 0;
+    graphChangeApproveApplyReadyBtn.textContent = approveApplyCount ? `批量批准并应用 ${approveApplyCount}` : "批量批准并应用";
+  }
+  if (graphChangeApplyApprovedBtn) {
+    graphChangeApplyApprovedBtn.disabled = applyCount === 0;
+    graphChangeApplyApprovedBtn.textContent = applyCount ? `应用已批准 ${applyCount}` : "应用已批准";
+  }
+  if (graphChangeRejectBlockedBtn) {
+    graphChangeRejectBlockedBtn.disabled = rejectBlockedCount === 0;
+    graphChangeRejectBlockedBtn.textContent = rejectBlockedCount ? `拒绝不可应用 ${rejectBlockedCount}` : "拒绝不可应用";
+  }
+}
+
+async function runGraphChangeBulkAction(mode, button) {
+  const rows = mode === "apply"
+    ? readyGraphChangesForApply()
+    : mode === "rejectBlocked"
+      ? readyGraphChangesForRejectBlocked()
+      : readyGraphChangesForApproveApply();
+  if (!rows.length) return;
+  const label = mode === "apply"
+    ? "应用已批准请求"
+    : mode === "rejectBlocked"
+      ? "拒绝不可应用请求"
+      : "批准并应用待审核请求";
+  if (!confirm(`${label}：${rows.length} 条。继续？`)) return;
+  if (button) button.disabled = true;
+  const failures = [];
+  for (const item of rows) {
+    const requestId = String(item.request_id || "").trim();
+    if (!requestId) continue;
+    try {
+      const endpoint = mode === "apply"
+        ? `/api/event-graph/change-requests/${encodeURIComponent(requestId)}/apply`
+        : mode === "rejectBlocked"
+          ? `/api/event-graph/change-requests/${encodeURIComponent(requestId)}/reject`
+          : `/api/event-graph/change-requests/${encodeURIComponent(requestId)}/approve-and-apply`;
+      const payload = {
+        actor_type: "human",
+        actor_id: "local_user",
+      };
+      if (mode === "rejectBlocked") {
+        payload.reason = `Cannot apply EventGraph patch: ${graphChangeApplyProblem(item) || "invalid patch"}`;
+      }
+      await postAgentAction(endpoint, payload);
+    } catch (error) {
+      failures.push(`${requestId}: ${error.message || String(error)}`);
+    }
+  }
+  await loadAgentDashboard({ silent: true });
+  if (failures.length) {
+    alert(`部分请求处理失败：\n${failures.slice(0, 6).join("\n")}${failures.length > 6 ? "\n..." : ""}`);
+  }
 }
 
 function renderGraphChangeValidation(result = {}) {
@@ -1404,6 +1595,7 @@ function renderAgentGraphChanges(payload = {}, auditRows = []) {
   const rows = Array.isArray(payload.items) ? payload.items : [];
   agentGraphChangeRows = rows;
   if (agentInternalCount) agentInternalCount.textContent = String(rows.length);
+  updateGraphChangeBulkActions(rows);
   if (!agentInternalList) return;
   if (!rows.length) {
     const recent = auditRows.filter((row) => agentAuditCategory(row) === "event_graph").slice(0, 8);
@@ -1417,6 +1609,8 @@ function renderAgentGraphChanges(payload = {}, auditRows = []) {
     const targetRefs = Array.isArray(item.target_refs) ? item.target_refs : [];
     const title = item.title || item.summary || item.change_type || item.request_id;
     const evidence = item.evidence_summary || item.reason || item.payload?.evidence_summary || "";
+    const applyError = parseGraphChangeApplyError(item);
+    const applyProblem = graphChangeApplyProblem(item);
     return `
       <div class="agent-item graph-change-item">
         <div class="agent-item-main">
@@ -1429,6 +1623,8 @@ function renderAgentGraphChanges(payload = {}, auditRows = []) {
             <span>${formatShortTime(item.created_at_utc)}</span>
           </div>
           <div class="agent-item-note">${escapeHtml(compactText(evidence || "无 evidence summary", 220))}</div>
+          ${applyError ? `<div class="graph-change-issue">Apply failed: ${escapeHtml(compactText(applyError, 220))}</div>` : ""}
+          ${applyProblem ? `<div class="graph-change-issue muted-issue">Not applyable: ${escapeHtml(compactText(applyProblem, 220))}</div>` : ""}
           <div class="graph-change-ref-row">
             <span>run ${escapeHtml(item.run_id || "-")}</span>
             <span>targets ${escapeHtml(targetRefs.length)}</span>
@@ -1447,6 +1643,8 @@ function renderAgentGraphChanges(payload = {}, auditRows = []) {
 function openGraphChangeModal(requestId, detailItem = null) {
   const item = detailItem || agentGraphChangeRows.find((row) => row.request_id === requestId);
   if (!item || !agentAuditModal || !agentAuditBody) return;
+  const applyError = parseGraphChangeApplyError(item);
+  const applyProblem = graphChangeApplyProblem(item);
   if (agentAuditTitle) agentAuditTitle.textContent = `EventGraph Change ${item.request_id || ""}`;
   if (agentAuditSubtitle) {
     agentAuditSubtitle.textContent = `${item.status || "-"} · ${item.change_type || "-"} · ${item.requester_type || "agent"}:${item.requester_id || item.requester || "-"}`;
@@ -1465,6 +1663,8 @@ function openGraphChangeModal(requestId, detailItem = null) {
         <div><span>Updated</span><strong>${escapeHtml(item.updated_at_utc || "-")}</strong></div>
       </div>
       <div class="agent-audit-summary">${escapeHtml(item.evidence_summary || item.reason || item.summary || "无摘要")}</div>
+      ${applyError ? `<div class="graph-change-issue">Apply failed: ${escapeHtml(applyError)}</div>` : ""}
+      ${applyProblem ? `<div class="graph-change-issue muted-issue">Not applyable: ${escapeHtml(applyProblem)}</div>` : ""}
     </section>
     ${agentAuditJsonBlock("Patch", item.patch || {})}
     ${agentAuditJsonBlock("Validation", item.validation || {})}
@@ -1683,8 +1883,21 @@ document.querySelector(".agent-workbench")?.addEventListener("click", async (eve
   const graphToReject = button.dataset.agentGraphReject;
   const graphToChange = button.dataset.agentGraphChange;
   const graphToApply = button.dataset.agentGraphApply;
+  const graphToApproveApply = button.dataset.agentGraphApproveApply;
   const activityCategory = button.dataset.agentActivityCategory;
   try {
+    if (button.id === "graphChangeApproveApplyReadyBtn") {
+      await runGraphChangeBulkAction("approveApply", button);
+      return;
+    }
+    if (button.id === "graphChangeApplyApprovedBtn") {
+      await runGraphChangeBulkAction("apply", button);
+      return;
+    }
+    if (button.id === "graphChangeRejectBlockedBtn") {
+      await runGraphChangeBulkAction("rejectBlocked", button);
+      return;
+    }
     if (activityCategory) {
       if (agentActivityCategory) agentActivityCategory.value = activityCategory;
       renderAgentActivity(agentAuditRows);
@@ -1700,8 +1913,30 @@ document.querySelector(".agent-workbench")?.addEventListener("click", async (eve
       openGraphChangeModal(changeToView, detail);
       return;
     }
+    if (graphToApproveApply) {
+      const item = agentGraphChangeRows.find((row) => row.request_id === graphToApproveApply);
+      const problem = graphChangeApplyProblem(item || {});
+      if (problem) {
+        alert(`这个请求不能应用：${problem}`);
+        return;
+      }
+      if (!confirm("批准并应用这个 EventGraph 变更？系统会在一次操作中通过审核并写入 Graph Core 版本记录。")) return;
+      button.disabled = true;
+      await postAgentAction(`/api/event-graph/change-requests/${encodeURIComponent(graphToApproveApply)}/approve-and-apply`, {
+        actor_type: "human",
+        actor_id: "local_user",
+      });
+      await loadAgentDashboard({ silent: true });
+      return;
+    }
     if (graphToApprove) {
-      if (!confirm("批准这个 EventGraph 变更请求？批准后仍需点击应用才会写入 Graph Core。")) return;
+      const item = agentGraphChangeRows.find((row) => row.request_id === graphToApprove);
+      const problem = graphChangeApplyProblem(item || {});
+      if (problem) {
+        alert(`这个请求不能批准：${problem}`);
+        return;
+      }
+      if (!confirm("仅批准这个 EventGraph 变更请求？批准后仍需单独应用才会写入 Graph Core。")) return;
       button.disabled = true;
       await postAgentAction(`/api/event-graph/change-requests/${encodeURIComponent(graphToApprove)}/approve`, {
         actor_type: "human",
@@ -1735,6 +1970,12 @@ document.querySelector(".agent-workbench")?.addEventListener("click", async (eve
       return;
     }
     if (graphToApply) {
+      const item = agentGraphChangeRows.find((row) => row.request_id === graphToApply);
+      const problem = graphChangeApplyProblem(item || {});
+      if (problem) {
+        alert(`这个请求不能应用：${problem}`);
+        return;
+      }
       if (!confirm("应用这个 EventGraph 变更到 Graph Core？系统会写入 event 当前态和版本记录。")) return;
       button.disabled = true;
       await postAgentAction(`/api/event-graph/change-requests/${encodeURIComponent(graphToApply)}/apply`, {
