@@ -1,4 +1,4 @@
 interface:
   display_name: "DataTube"
-  short_description: "Run and test controlled DataTube research workflows"
-  default_prompt: "Use $datatube to research a Polymarket question with controlled market data, including PIT-safe Factor Evaluation or an explicitly labeled pre-market proxy snapshot."
+  short_description: "Run controlled market research and Qlib stock factors"
+  default_prompt: "Use $datatube for controlled Polymarket, crypto, or US-equity research, including PIT-safe Factor Evaluation, explicitly labeled pre-market proxy snapshots, or Qlib Alpha158-compatible stock factors without fabricated VWAP."

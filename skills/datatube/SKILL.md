@@ -5,20 +5,22 @@ description: >
   Polymarket research/strategy workflow with Binance market data. Use for setup
   and status; Research workspace UI/API and regression tests; Factor Evaluation,
   Alpha Evaluation, formal Research Backtest, and legacy Hybrid Run inspection;
-  Polymarket/Binance research and controlled US-equity pre-market ranking
-  snapshots; EventGraph inspection and change requests; strategy drafts, risk
-  checks, simulations, and human-approval handoff; historical backtests, batches,
+  Polymarket/Binance research, controlled US-equity data preparation and
+  pre-market ranking snapshots, and Qlib Alpha158-compatible factor computation;
+  EventGraph inspection and change requests; strategy drafts, risk checks,
+  simulations, and human-approval handoff; historical backtests, batches,
   optimization, and history; approval review, strategy status, and Agent audits.
   Trigger examples include "test DataTube", "test the Research workspace",
   "replace manual Research clicks", "research BTC markets", "create a strategy
-  draft", "run a backtest", "review approvals", and "DataTube status".
+  draft", "run a backtest", "run Qlib Alpha158 on stocks", "test Alpha158
+  without VWAP", "review approvals", and "DataTube status".
 ---
 
 # DataTube
 
-DataTube v1.0 is a local workflow surface for Polymarket strategy research with
-Binance crypto market context. Keep the user experience simple: install or start
-the runtime when needed, then work through controlled local APIs.
+DataTube v1.0 is a local workflow surface for Polymarket, crypto, and controlled
+US-equity research. Keep the user experience simple: install or start the runtime
+when needed, then work through controlled local APIs.
 
 ## Golden Rules
 
@@ -48,6 +50,9 @@ the runtime when needed, then work through controlled local APIs.
 - Label immutable historical `ALPHA_EVALUATION` Runs that contain portfolio or
   backtest artifacts as `Legacy Hybrid Run`; preserve them without treating
   their schema as the current Alpha Evaluation contract.
+- Never synthesize or guess VWAP for Qlib. The current stock MVP is exactly
+  `Qlib Alpha158-compatible (VWAP excluded)`, contains 157 factors, and has
+  `is_standard_alpha158=false`. Do not shorten that label to standard Alpha158.
 
 ## Runtime First
 
@@ -94,6 +99,10 @@ Choose one workflow family from the user's request:
   Preview, Frozen Bundle, Factor Evaluation, Alpha Evaluation, and formal
   Research Backtest objects. Use
   [references/research-agent-workflow.md](references/research-agent-workflow.md).
+- **Qlib Alpha158**: compute the current 157-factor, no-VWAP stock compatibility
+  pack from READY DataTube equity daily Manifests, verify its immutable cache,
+  or diagnose its optional Python runtime. Use
+  [references/qlib-alpha158.md](references/qlib-alpha158.md).
 - **EventGraph**: inspect graph/news/event data, run news search, reason about
   strict logic vs scenario/impact relations, validate graph patches, create
   change requests, or review pending graph changes. Use [references/eventgraph.md](references/eventgraph.md).

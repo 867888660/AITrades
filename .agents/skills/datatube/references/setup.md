@@ -46,10 +46,19 @@ services/
 templates/
 static/
 requirements.txt
+requirements-qlib.txt
+integrations/qlib/
+scripts/run_qlib_alpha158.py
+scripts/verify_qlib_alpha158.py
 config.example.json
 web_settings.example.json
 README.md
 ```
+
+`requirements-qlib.txt` is optional. Do not install it into the main DataTube
+runtime merely to start the app. Install it in a separate `.qlib-venv` only when
+the user asks for Qlib Alpha158-compatible computation; follow
+[qlib-alpha158.md](qlib-alpha158.md).
 
 ## Bootstrap Commands
 
