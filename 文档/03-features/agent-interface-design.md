@@ -1,10 +1,15 @@
 # Agent 能力接口设计
 
-更新日期：2026-06-29
+> Research 接入状态（2026-08-01）：`research.*` Agent 写接口已经接入持久化 Research Session。用户以自然语言 START，或从 Session/Project/Run/Preview/Bundle/Factor/Alpha RESUME；服务端自动生成固定研究边界，Agent 后续只传 `session_id`。Context Resolver 恢复研究上下文，Iteration 保存 Hypothesis、Intervention Set、Invalidation Plan 与 KEEP/REJECT 决策。Agent 不得增加 Session 额度、发布 Global Library、扩大范围、删除历史或用历史 Bundle 授权绕过当前检查。
+
+更新日期：2026-08-01
 
 本文定义供 AI agent 访问的受控能力接口。目标是让 agent 可以协助筛选市场、生成策略草案、解释风险、提交审批和跟踪执行结果，但不能绕过权限、预算、人工确认或审计系统。
 
 如果目标是让 agent 直接接入和调用系统，请先阅读：[Agent 接入手册](../02-usage/agent-access-guide.md)。本文更偏接口设计和权限模型说明。
+
+Research Agent 的完整 START/RESUME、Session、Iteration 和 AgentMonitor 设计见：
+[Research Agent Skill](research-agent-skill.md)。
 
 核心原则：
 
@@ -23,6 +28,7 @@
 | 角色 | 能做什么 | 不能做什么 |
 |---|---|---|
 | Agent | 读市场、读有限账户视图、生成策略草案、修改草案、运行风险检查、运行模拟、提交审批、提出调整建议 | 批准策略、提高自己的权限、修改资金上限、绕过风控、直接写密钥、直接执行未批准订单 |
+| Research Agent | START/RESUME Research Session；在固定研究边界内创建/验证/Pin 定义、编译 Requirements、解析 Preview、创建并执行 Research Run、记录可解释迭代 | 增加 Session 额度、Global Library 发布、删除历史、跨入策略/实盘、频繁要求用户确认普通研究选择 |
 | 人类用户 | 审批、拒绝、要求修改、配置资金、暂停/恢复/终止策略、管理权限 | 不应绕过审计直接改数据库 |
 | 执行器 | 按已批准策略生成执行计划、执行订单、记录结果、执行前重新风控 | 不接受 agent 手写的裸订单 |
 | 设置端 | 管理 agent 权限、预算、白名单、审批阈值、紧急停止 | 不参与策略推理 |

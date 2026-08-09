@@ -33,6 +33,7 @@ from services.strategy_stats_store import (
     sync_all_strategy_stats,
 )
 from services.strategy_schema_service import strategy_state_payload
+from services.virtual_liquidation import liquidate_position, normalize_book_levels
 
 
 _CONFIG = load_config()
@@ -73,6 +74,9 @@ _LIVE_POS_REFRESH_LOCK = threading.Lock()
 _LIVE_POS_REFRESH_RUNNING = False
 _LOCAL_ORDER_CACHE: Dict[str, Any] = {"ts": 0.0, "data": {}}
 _LOCAL_ORDER_TTL_SECONDS = 15.0
+_VIRTUAL_TICK_PRICE_CACHE: Dict[int, Dict[str, Any]] = {}
+_VIRTUAL_TICK_PRICE_CACHE_TTL_SECONDS = 1.0
+_VIRTUAL_TICK_PRICE_MAX_AGE_SECONDS = 180.0
 STRATEGY_EDITABLE_FIELDS = [
     "Inputs1",
     "Inputs2",
@@ -95,10 +99,13 @@ _STRATEGY_MAIN_ALLOWED = ["yes_mid", "no_mid"]
 _STRATEGY_SUB_ALLOWED = [
     "yes_position",
     "no_position",
+    "position",
     "yes_qty",
     "no_qty",
+    "qty",
     "yes_avg",
     "no_avg",
+    "avg",
     "strategy_pnl",
 ]
 
@@ -134,6 +141,24 @@ def get_strategy_chart_capabilities(detail: Dict[str, Any] | None = None) -> Dic
             metric_catalog = list_metric_catalog(int(row_id))
     except Exception:
         metric_catalog = {"items": [], "numeric": [], "state": []}
+    strategy_code = str(
+        (detail or {}).get("strategy_code")
+        or ((detail or {}).get("raw") or {}).get("Code")
+        or ""
+    ).strip()
+    if strategy_code == "Stragy_Fllow_Stock_Value":
+        market_cap_gap_keys = {"gap_up", "gap_down", "hold_buffer_yes", "recover_buffer_no"}
+        for catalog_key in ("items", "numeric"):
+            for item in metric_catalog.get(catalog_key) or []:
+                if str(item.get("key") or "") not in market_cap_gap_keys:
+                    continue
+                item["unit"] = "compact_currency"
+                item["panel"] = "market_mcap"
+                item["meta"] = {
+                    **(item.get("meta") or {}),
+                    "unit": "compact_currency",
+                    "panel": "market_mcap",
+                }
     return {
         "main_allowed": list(_STRATEGY_MAIN_ALLOWED),
         "sub_allowed": list(_STRATEGY_SUB_ALLOWED),
@@ -1796,7 +1821,7 @@ def get_overview(wallet: str | None = None, allow_remote_positions: bool = False
         local_strategy = _load_strategy_monitoring_rows(
             enrich_tokens=False,
             allow_remote_positions=allow_remote_positions,
-            include_realtime_prices=False,
+            include_realtime_prices=True,
         )
         ts1 = time.perf_counter()
         strategy_items = local_strategy.get("data") or []
@@ -2154,37 +2179,13 @@ def _resolve_strategy_market_prices(
     no_token: str | None = None,
     allow_clob_book: bool = True,
 ) -> Dict[str, Any]:
-    clob_quotes: Dict[str, Any] = {}
-    if allow_clob_book:
-        try:
-            clob_quotes = fetch_binary_orderbook_quotes(str(yes_token or ""), str(no_token or ""))
-        except Exception:
-            clob_quotes = {}
-    if clob_quotes and any(
-        clob_quotes.get(key) is not None
-        for key in ("yes_bid", "yes_ask", "no_bid", "no_ask")
-    ):
-        yes_bid = _safe_float(clob_quotes.get("yes_bid"))
-        yes_ask = _safe_float(clob_quotes.get("yes_ask"))
-        no_bid = _safe_float(clob_quotes.get("no_bid"))
-        no_ask = _safe_float(clob_quotes.get("no_ask"))
-        return {
-            "yes_bid": yes_bid,
-            "yes_ask": yes_ask,
-            "no_bid": no_bid,
-            "no_ask": no_ask,
-            "yes_last_price": yes_ask if yes_ask is not None else yes_bid,
-            "no_last_price": no_ask if no_ask is not None else no_bid,
-            "price_source": "clob_book",
-            "updated_at": clob_quotes.get("updated_at"),
-            "snapshot_db_path": None,
-        }
-
     if ws_snapshot:
         best_bid = _safe_float((ws_snapshot.get("depth_metrics") or {}).get("best_bid"))
         best_ask = _safe_float((ws_snapshot.get("depth_metrics") or {}).get("best_ask"))
         raw_clob = (ws_snapshot.get("raw_clob_json") or {}) if isinstance(ws_snapshot.get("raw_clob_json"), dict) else {}
         market_json = (ws_snapshot.get("market_json") or {}) if isinstance(ws_snapshot.get("market_json"), dict) else {}
+        bid_levels = normalize_book_levels(raw_clob.get("bids") or raw_clob.get("bid_levels") or [], side="bid")
+        ask_levels = normalize_book_levels(raw_clob.get("asks") or raw_clob.get("ask_levels") or [], side="ask")
         raw_last = _safe_float(
             raw_clob.get("price")
             or raw_clob.get("last_trade_price")
@@ -2199,6 +2200,10 @@ def _resolve_strategy_market_prices(
                 no_ask = best_ask
                 yes_bid = None
                 yes_ask = None
+                yes_bid_levels = []
+                yes_ask_levels = []
+                no_bid_levels = bid_levels
+                no_ask_levels = ask_levels
                 no_last = raw_last
                 yes_last = _clamp_binary_price(1.0 - raw_last) if raw_last is not None else None
             else:
@@ -2206,6 +2211,10 @@ def _resolve_strategy_market_prices(
                 yes_ask = best_ask
                 no_bid = None
                 no_ask = None
+                yes_bid_levels = bid_levels
+                yes_ask_levels = ask_levels
+                no_bid_levels = []
+                no_ask_levels = []
                 yes_last = raw_last
                 no_last = _clamp_binary_price(1.0 - raw_last) if raw_last is not None else None
             return {
@@ -2213,6 +2222,14 @@ def _resolve_strategy_market_prices(
                 "yes_ask": yes_ask,
                 "no_bid": no_bid,
                 "no_ask": no_ask,
+                "yes_bid_levels": yes_bid_levels,
+                "yes_ask_levels": yes_ask_levels,
+                "no_bid_levels": no_bid_levels,
+                "no_ask_levels": no_ask_levels,
+                "yes_bid_size": yes_bid_levels[0]["qty"] if yes_bid_levels else None,
+                "yes_ask_size": yes_ask_levels[0]["qty"] if yes_ask_levels else None,
+                "no_bid_size": no_bid_levels[0]["qty"] if no_bid_levels else None,
+                "no_ask_size": no_ask_levels[0]["qty"] if no_ask_levels else None,
                 "yes_last_price": yes_last,
                 "no_last_price": no_last,
                 "price_source": "websocket",
@@ -2220,52 +2237,248 @@ def _resolve_strategy_market_prices(
                 "snapshot_db_path": ws_snapshot.get("db_path"),
             }
 
+    market_fallback: Dict[str, Any] | None = None
+    if matched_market:
+        yes_bid = _safe_float(matched_market.get("best_bid"))
+        yes_ask = _safe_float(matched_market.get("best_ask"))
+        yes_last = _safe_float(matched_market.get("yes_price"))
+        no_last = _safe_float(matched_market.get("no_price"))
+        no_bid = _safe_float(matched_market.get("no_bid"))
+        no_ask = _safe_float(matched_market.get("no_ask"))
+        if any(value is not None for value in (yes_bid, yes_ask, no_bid, no_ask, yes_last, no_last)):
+            market_fallback = {
+                "yes_bid": yes_bid,
+                "yes_ask": yes_ask,
+                "no_bid": no_bid,
+                "no_ask": no_ask,
+                "yes_bid_levels": [],
+                "yes_ask_levels": [],
+                "no_bid_levels": [],
+                "no_ask_levels": [],
+                "yes_bid_size": None,
+                "yes_ask_size": None,
+                "no_bid_size": None,
+                "no_ask_size": None,
+                "yes_last_price": yes_last,
+                "no_last_price": no_last,
+                "price_source": "market",
+                "updated_at": ((matched_market or {}).get("raw") or {}).get("updatedAt"),
+                "snapshot_db_path": None,
+            }
+
+    if allow_clob_book:
+        clob_quotes: Dict[str, Any] = {}
+        try:
+            clob_quotes = fetch_binary_orderbook_quotes(str(yes_token or ""), str(no_token or ""))
+        except Exception:
+            clob_quotes = {}
+        if clob_quotes and any(
+            clob_quotes.get(key) is not None
+            for key in ("yes_bid", "yes_ask", "no_bid", "no_ask")
+        ):
+            yes_bid = _safe_float(clob_quotes.get("yes_bid"))
+            yes_ask = _safe_float(clob_quotes.get("yes_ask"))
+            no_bid = _safe_float(clob_quotes.get("no_bid"))
+            no_ask = _safe_float(clob_quotes.get("no_ask"))
+            return {
+                "yes_bid": yes_bid,
+                "yes_ask": yes_ask,
+                "no_bid": no_bid,
+                "no_ask": no_ask,
+                "yes_bid_levels": normalize_book_levels(clob_quotes.get("yes_bids") or [], side="bid"),
+                "yes_ask_levels": normalize_book_levels(clob_quotes.get("yes_asks") or [], side="ask"),
+                "no_bid_levels": normalize_book_levels(clob_quotes.get("no_bids") or [], side="bid"),
+                "no_ask_levels": normalize_book_levels(clob_quotes.get("no_asks") or [], side="ask"),
+                "yes_bid_size": _safe_float(clob_quotes.get("yes_bid_size")),
+                "yes_ask_size": _safe_float(clob_quotes.get("yes_ask_size")),
+                "no_bid_size": _safe_float(clob_quotes.get("no_bid_size")),
+                "no_ask_size": _safe_float(clob_quotes.get("no_ask_size")),
+                "yes_last_price": yes_ask if yes_ask is not None else yes_bid,
+                "no_last_price": no_ask if no_ask is not None else no_bid,
+                "price_source": "clob_book",
+                "updated_at": clob_quotes.get("updated_at"),
+                "snapshot_db_path": None,
+            }
+
+    if market_fallback is not None:
+        return market_fallback
+
     if not matched_market:
         return {
             "yes_bid": None,
             "yes_ask": None,
             "no_bid": None,
             "no_ask": None,
+            "yes_bid_levels": [],
+            "yes_ask_levels": [],
+            "no_bid_levels": [],
+            "no_ask_levels": [],
+            "yes_bid_size": None,
+            "yes_ask_size": None,
+            "no_bid_size": None,
+            "no_ask_size": None,
             "yes_last_price": None,
             "no_last_price": None,
             "price_source": None,
             "updated_at": None,
             "snapshot_db_path": None,
         }
-
-    yes_bid = _safe_float(matched_market.get("best_bid"))
-    yes_ask = _safe_float(matched_market.get("best_ask"))
-    yes_last = _safe_float(matched_market.get("yes_price"))
-    no_last = _safe_float(matched_market.get("no_price"))
-
-    no_bid = _safe_float(matched_market.get("no_bid"))
-    no_ask = _safe_float(matched_market.get("no_ask"))
-
     return {
-        "yes_bid": yes_bid,
-        "yes_ask": yes_ask,
-        "no_bid": no_bid,
-        "no_ask": no_ask,
-        "yes_last_price": yes_last,
-        "no_last_price": no_last,
-        "price_source": "market",
-        "updated_at": ((matched_market or {}).get("raw") or {}).get("updatedAt"),
+        "yes_bid": None,
+        "yes_ask": None,
+        "no_bid": None,
+        "no_ask": None,
+        "yes_bid_levels": [],
+        "yes_ask_levels": [],
+        "no_bid_levels": [],
+        "no_ask_levels": [],
+        "yes_bid_size": None,
+        "yes_ask_size": None,
+        "no_bid_size": None,
+        "no_ask_size": None,
+        "yes_last_price": None,
+        "no_last_price": None,
+        "price_source": None,
+        "updated_at": None,
         "snapshot_db_path": None,
     }
 
 
-def _inject_virtual_positions(item: Dict[str, Any], strategy_id: int) -> None:
-    """For Virtual mode strategies, read positions from strategy_virtual_positions."""
+def _latest_virtual_tick_price_snapshot(
+    strategy_id: int | None,
+    *,
+    leg_index: int = 0,
+    max_age_seconds: float = _VIRTUAL_TICK_PRICE_MAX_AGE_SECONDS,
+) -> Dict[str, Any]:
+    """Return the recent order book that the virtual strategy actually received."""
+    if not strategy_id:
+        return {}
+    strategy_key = int(strategy_id)
+    now = time.time()
+    cached = _VIRTUAL_TICK_PRICE_CACHE.get(strategy_key)
+    if cached and now - float(cached.get("_cache_ts") or 0.0) <= _VIRTUAL_TICK_PRICE_CACHE_TTL_SECONDS:
+        payload = cached.get("payload") if isinstance(cached.get("payload"), dict) else {}
+        run_at_utc = cached.get("run_at_utc")
+    else:
+        try:
+            conn = strategy_data_source.connect(readonly=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                row = conn.execute(
+                    """
+                    SELECT run_at_utc, mode_output
+                    FROM strategy_virtual_ticks
+                    WHERE strategy_id = ?
+                    ORDER BY run_at_utc DESC, tick_id DESC
+                    LIMIT 1
+                    """,
+                    (strategy_key,),
+                ).fetchone()
+            finally:
+                conn.close()
+        except Exception:
+            row = None
+        if not row:
+            return {}
+        run_at_utc = row["run_at_utc"]
+        try:
+            mode_payload = json.loads(row["mode_output"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            mode_payload = {}
+        payload = mode_payload.get("price_snapshot") if isinstance(mode_payload, dict) else {}
+        if not isinstance(payload, dict):
+            payload = {}
+        _VIRTUAL_TICK_PRICE_CACHE[strategy_key] = {
+            "_cache_ts": now,
+            "run_at_utc": run_at_utc,
+            "payload": payload,
+        }
+    timestamp_text = str(payload.get("captured_at_utc") or run_at_utc or "").strip()
+    if timestamp_text:
+        try:
+            parsed = datetime.fromisoformat(timestamp_text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds() > max_age_seconds:
+                return {}
+        except (TypeError, ValueError):
+            return {}
+    legs = payload.get("legs") if isinstance(payload.get("legs"), list) else []
+    selected = next(
+        (
+            item
+            for item in legs
+            if isinstance(item, dict) and int(item.get("leg_index") or 0) == int(leg_index)
+        ),
+        None,
+    )
+    if not isinstance(selected, dict):
+        selected = payload if int(leg_index) == 0 else {}
+    yes_bid_levels = normalize_book_levels(selected.get("yes_bid_levels") or [], side="bid")
+    yes_ask_levels = normalize_book_levels(selected.get("yes_ask_levels") or [], side="ask")
+    no_bid_levels = normalize_book_levels(selected.get("no_bid_levels") or [], side="bid")
+    no_ask_levels = normalize_book_levels(selected.get("no_ask_levels") or [], side="ask")
+    result = {
+        "yes_bid": _safe_float(selected.get("yes_bid")),
+        "yes_ask": _safe_float(selected.get("yes_ask")),
+        "no_bid": _safe_float(selected.get("no_bid")),
+        "no_ask": _safe_float(selected.get("no_ask")),
+        "yes_bid_levels": yes_bid_levels,
+        "yes_ask_levels": yes_ask_levels,
+        "no_bid_levels": no_bid_levels,
+        "no_ask_levels": no_ask_levels,
+        "yes_bid_size": yes_bid_levels[0]["qty"] if yes_bid_levels else None,
+        "yes_ask_size": yes_ask_levels[0]["qty"] if yes_ask_levels else None,
+        "no_bid_size": no_bid_levels[0]["qty"] if no_bid_levels else None,
+        "no_ask_size": no_ask_levels[0]["qty"] if no_ask_levels else None,
+        "yes_last_price": _safe_float(selected.get("yes_ask") or selected.get("yes_bid")),
+        "no_last_price": _safe_float(selected.get("no_ask") or selected.get("no_bid")),
+        "price_source": "virtual_tick_orderbook",
+        "updated_at": timestamp_text or run_at_utc,
+        "snapshot_db_path": str(strategy_data_source.get_db_path()),
+    }
+    if not any(result.get(key) is not None for key in ("yes_bid", "yes_ask", "no_bid", "no_ask")):
+        return {}
+    return result
+
+
+def _inject_virtual_positions(
+    item: Dict[str, Any],
+    strategy_id: int,
+    prefetched_positions: Dict[tuple[int, int], Dict[str, Dict[str, Any]]] | None = None,
+) -> None:
+    """For Virtual mode strategies, read positions from strategy_virtual_positions.
+
+    Multi-leg strategies must only hydrate the matching leg_index; otherwise the
+    same virtual YES/NO inventory is copied into every leg snapshot and both the
+    per-leg PnL table and total strategy PnL drift upward incorrectly.
+    """
     try:
-        conn = strategy_data_source.connect(readonly=True)
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT * FROM strategy_virtual_positions WHERE strategy_id = ?",
-            (strategy_id,),
-        ).fetchall()
-        conn.close()
-        for r in rows:
-            d = dict(r)
+        target_leg_index = item.get("leg_index")
+        rows: List[Dict[str, Any]] = []
+        if prefetched_positions is not None:
+            if target_leg_index not in (None, ""):
+                rows = list(
+                    (prefetched_positions.get((int(strategy_id), int(target_leg_index))) or {}).values()
+                )
+            else:
+                for (sid, _leg_index), side_rows in prefetched_positions.items():
+                    if int(sid) != int(strategy_id):
+                        continue
+                    rows.extend(side_rows.values())
+        else:
+            conn = strategy_data_source.connect(readonly=True)
+            conn.row_factory = sqlite3.Row
+            try:
+                query = "SELECT * FROM strategy_virtual_positions WHERE strategy_id = ?"
+                params: list[Any] = [int(strategy_id)]
+                if target_leg_index not in (None, ""):
+                    query += " AND leg_index = ?"
+                    params.append(int(target_leg_index))
+                rows = [dict(row) for row in conn.execute(query, params).fetchall()]
+            finally:
+                conn.close()
+        for d in rows:
             side = str(d.get("side") or "").upper()
             qty = float(d.get("qty") or 0.0)
             avg_price = d.get("avg_price")
@@ -2346,7 +2559,12 @@ def _virtual_realized_pnl_for_leg(strategy_id: int, leg_index: int) -> float:
         return 0.0
 
 
-def _load_virtual_account(strategy_id: int) -> Dict[str, Any] | None:
+def _load_virtual_account(
+    strategy_id: int,
+    prefetched_accounts: Dict[int, Dict[str, Any]] | None = None,
+) -> Dict[str, Any] | None:
+    if prefetched_accounts is not None:
+        return prefetched_accounts.get(int(strategy_id))
     try:
         conn = strategy_data_source.connect(readonly=True)
         conn.row_factory = sqlite3.Row
@@ -2360,10 +2578,86 @@ def _load_virtual_account(strategy_id: int) -> Dict[str, Any] | None:
         return None
 
 
+def _virtual_expiry_account_snapshot(
+    strategy_id: int,
+    end_at: datetime,
+    initial_cash: float,
+) -> Dict[str, Any] | None:
+    """Replay only filled binary orders at or before the market deadline."""
+    try:
+        conn = strategy_data_source.connect(readonly=True)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT leg_index, action, side, qty, price, fee, net_cash_change,
+                      created_at_utc
+               FROM strategy_virtual_orders
+               WHERE strategy_id = ? AND status = 'filled'
+               ORDER BY created_at_utc ASC, id ASC""",
+            (int(strategy_id),),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return None
+
+    cash = float(initial_cash)
+    positions: Dict[tuple[int, str], Dict[str, float]] = {}
+    included_orders = 0
+    for raw_row in rows:
+        row = dict(raw_row)
+        created_at = _parse_iso_datetime(row.get("created_at_utc"))
+        if created_at is None:
+            continue
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        if created_at.astimezone(timezone.utc) > end_at.astimezone(timezone.utc):
+            continue
+
+        action = str(row.get("action") or "BUY").strip().upper()
+        side = str(row.get("side") or "YES").strip().upper()
+        leg_index = int(_safe_float(row.get("leg_index")) or 0)
+        qty = _safe_float(row.get("qty")) or 0.0
+        price = _safe_float(row.get("price")) or 0.0
+        if qty <= 0 or price <= 0 or side not in {"YES", "NO"}:
+            continue
+
+        net_cash_change = _safe_float(row.get("net_cash_change"))
+        fee = _safe_float(row.get("fee")) or 0.0
+        if net_cash_change is None:
+            gross = qty * price
+            net_cash_change = -(gross + fee) if action == "BUY" else gross - fee
+        cash += net_cash_change
+
+        position = positions.setdefault((leg_index, side), {"qty": 0.0, "avg": 0.0})
+        if action == "BUY":
+            next_qty = position["qty"] + qty
+            position["avg"] = (
+                ((position["qty"] * position["avg"]) + (qty * price)) / next_qty
+                if next_qty > 0
+                else 0.0
+            )
+            position["qty"] = next_qty
+        else:
+            position["qty"] = max(0.0, position["qty"] - qty)
+            if position["qty"] <= 0:
+                position["avg"] = 0.0
+        included_orders += 1
+
+    open_cost = sum(position["qty"] * position["avg"] for position in positions.values())
+    return {
+        "cash": cash,
+        "open_cost": open_cost,
+        "equity": cash + open_cost,
+        "positions": positions,
+        "included_orders": included_orders,
+        "cutoff_at": end_at.astimezone(timezone.utc).isoformat(),
+    }
+
+
 def _virtual_total_pnl_from_account(
     strategy_item: Dict[str, Any],
     strategy_id: int,
     positions: List[Dict[str, Any]] | None = None,
+    account: Dict[str, Any] | None = None,
 ) -> None:
     """Overlay Virtual summary PnL with account-equity PnL.
 
@@ -2372,7 +2666,8 @@ def _virtual_total_pnl_from_account(
     """
     if str(strategy_item.get("mode") or strategy_item.get("state") or "").strip().lower() != "virtual":
         return
-    account = _load_virtual_account(strategy_id)
+    if account is None:
+        account = _load_virtual_account(strategy_id)
     if not account:
         return
 
@@ -2385,6 +2680,7 @@ def _virtual_total_pnl_from_account(
                 "avg": _safe_float(strategy_item.get("yes_avg")),
                 "bid": _safe_float(strategy_item.get("yes_bid")),
                 "ask": _safe_float(strategy_item.get("yes_ask")),
+                "bid_levels": strategy_item.get("yes_bid_levels") or [],
             },
             {
                 "side": "NO",
@@ -2392,46 +2688,153 @@ def _virtual_total_pnl_from_account(
                 "avg": _safe_float(strategy_item.get("no_avg")),
                 "bid": _safe_float(strategy_item.get("no_bid")),
                 "ask": _safe_float(strategy_item.get("no_ask")),
+                "bid_levels": strategy_item.get("no_bid_levels") or [],
             },
         ]
+
+    raw_strategy = strategy_item.get("raw") if isinstance(strategy_item.get("raw"), dict) else {}
+    editable = strategy_item.get("editable") if isinstance(strategy_item.get("editable"), dict) else {}
+    end_at = _parse_iso_datetime(
+        strategy_item.get("end_date")
+        or raw_strategy.get("Enddate")
+        or raw_strategy.get("end_date")
+        or editable.get("Enddate")
+        or editable.get("end_date")
+    )
+    if end_at is not None and end_at.tzinfo is None:
+        end_at = end_at.replace(tzinfo=timezone.utc)
+    market_expired = bool(
+        end_at is not None
+        and datetime.now(timezone.utc) >= end_at.astimezone(timezone.utc)
+    )
 
     open_cost = 0.0
     liquidation_value = 0.0
     estimated_exit_fees = 0.0
+    liquidation_requested_qty = 0.0
+    liquidation_filled_qty = 0.0
+    liquidation_fills: List[Dict[str, Any]] = []
     missing_open_mark = False
+    missing_open_cost = 0.0
     for pos in positions:
         qty = _safe_float(pos.get("qty")) or 0.0
         avg = _safe_float(pos.get("avg"))
         if qty <= 0 or avg is None:
             continue
+        open_cost += qty * avg
+        if market_expired:
+            missing_open_mark = True
+            missing_open_cost += qty * avg
+            continue
         mark = _safe_float(pos.get("bid"))
         if mark is None:
             mark = _safe_float(pos.get("ask"))
-        if mark is None:
+        liquidation = liquidate_position(
+            qty,
+            mark,
+            fee_rate,
+            bid_levels=pos.get("bid_levels") or pos.get("levels") or [],
+        )
+        if liquidation["filled_qty"] <= 0:
             missing_open_mark = True
+            missing_open_cost += qty * avg
             continue
-        open_cost += qty * avg
-        liquidation_value += qty * mark
-        estimated_exit_fees += _virtual_fee(qty, mark, fee_rate)
+        liquidation_value += liquidation["gross"]
+        estimated_exit_fees += liquidation["fee"]
+        liquidation_requested_qty += liquidation["requested_qty"]
+        liquidation_filled_qty += liquidation["filled_qty"]
+        liquidation_fills.append(
+            {
+                "side": str(pos.get("side") or "").upper(),
+                "requested_qty": liquidation["requested_qty"],
+                "filled_qty": liquidation["filled_qty"],
+                "gross": liquidation["gross"],
+                "fee": liquidation["fee"],
+                "vwap": liquidation["vwap"],
+                "levels_used": liquidation["levels_used"],
+                "used_depth": liquidation["used_depth"],
+                "depth_limited": liquidation["depth_limited"],
+                "fills": liquidation["fills"],
+            }
+        )
 
     initial_cash = _safe_float(account.get("initial_cash")) or 0.0
     cash = _safe_float(account.get("cash")) or 0.0
     realized_pnl = _safe_float(account.get("realized_pnl")) or 0.0
     fees_paid = _safe_float(account.get("total_fees_paid")) or 0.0
-    cached_equity = _safe_float(account.get("equity"))
-    cached_unrealized = _safe_float(account.get("unrealized_pnl"))
-    if missing_open_mark and cached_equity is not None:
-        equity = cached_equity
-        total_pnl = equity - initial_cash
-        unrealized_pnl = cached_unrealized if cached_unrealized is not None else equity - cash
-        liquidation_value = max(0.0, equity - cash)
-        estimated_exit_fees = 0.0
-        pnl_source = "virtual_account_cached_equity"
+    if market_expired and end_at is not None:
+        expiry_snapshot = _virtual_expiry_account_snapshot(strategy_id, end_at, initial_cash)
+        if expiry_snapshot is not None:
+            equity = float(expiry_snapshot.get("equity") or 0.0)
+            total_pnl = equity - initial_cash
+            expiry_positions = expiry_snapshot.get("positions") or {}
+            yes_qty = sum(
+                float(position.get("qty") or 0.0)
+                for (_leg, side), position in expiry_positions.items()
+                if str(side).upper() == "YES"
+            )
+            no_qty = sum(
+                float(position.get("qty") or 0.0)
+                for (_leg, side), position in expiry_positions.items()
+                if str(side).upper() == "NO"
+            )
+            yes_cost = sum(
+                float(position.get("qty") or 0.0) * float(position.get("avg") or 0.0)
+                for (_leg, side), position in expiry_positions.items()
+                if str(side).upper() == "YES"
+            )
+            no_cost = sum(
+                float(position.get("qty") or 0.0) * float(position.get("avg") or 0.0)
+                for (_leg, side), position in expiry_positions.items()
+                if str(side).upper() == "NO"
+            )
+            allocation_base = max(0.0, float(expiry_snapshot.get("cash") or 0.0)) + yes_cost + no_cost
+            strategy_item.update(
+                {
+                    "yes_qty": yes_qty,
+                    "no_qty": no_qty,
+                    "yes_avg": yes_cost / yes_qty if yes_qty > 0 else 0.0,
+                    "no_avg": no_cost / no_qty if no_qty > 0 else 0.0,
+                    "yes_position": yes_cost / allocation_base if allocation_base > 0 else 0.0,
+                    "no_position": no_cost / allocation_base if allocation_base > 0 else 0.0,
+                    "yes_current_pct": yes_cost / allocation_base if allocation_base > 0 else 0.0,
+                    "no_current_pct": no_cost / allocation_base if allocation_base > 0 else 0.0,
+                    "strategy_pnl": total_pnl,
+                    "virtual_total_pnl": total_pnl,
+                    "virtual_unrealized_pnl": 0.0,
+                    "virtual_realized_pnl": realized_pnl,
+                    "virtual_fees_paid": fees_paid,
+                    "virtual_cash": float(expiry_snapshot.get("cash") or 0.0),
+                    "virtual_equity": equity,
+                    "virtual_initial_cash": initial_cash,
+                    "virtual_liquidation_value": float(expiry_snapshot.get("open_cost") or 0.0),
+                    "virtual_estimated_exit_fees": 0.0,
+                    "virtual_liquidation_requested_qty": 0.0,
+                    "virtual_liquidation_filled_qty": 0.0,
+                    "virtual_liquidation_vwap": None,
+                    "virtual_liquidation_fills": [],
+                    "virtual_expiry_cutoff_at": expiry_snapshot.get("cutoff_at"),
+                    "virtual_expiry_included_orders": int(expiry_snapshot.get("included_orders") or 0),
+                    "pnl_source": "virtual_account_expired_order_cutoff",
+                }
+            )
+            return
+    # A temporarily missing quote on one leg must not replace the entire
+    # multi-leg valuation with an unrelated cached account snapshot. Value the
+    # unmarked open leg at cost (neutral PnL) while preserving live marks for
+    # every other leg.
+    if missing_open_mark:
+        liquidation_value += missing_open_cost
+        pnl_source = (
+            "virtual_account_expired_cost_fallback"
+            if market_expired
+            else "virtual_account_partial_cost_fallback"
+        )
     else:
-        unrealized_pnl = liquidation_value - open_cost - estimated_exit_fees
-        equity = cash + liquidation_value - estimated_exit_fees
-        total_pnl = equity - initial_cash
         pnl_source = "virtual_account_equity"
+    unrealized_pnl = liquidation_value - open_cost - estimated_exit_fees
+    equity = cash + liquidation_value - estimated_exit_fees
+    total_pnl = equity - initial_cash
 
     strategy_item.update(
         {
@@ -2445,12 +2848,21 @@ def _virtual_total_pnl_from_account(
             "virtual_initial_cash": initial_cash,
             "virtual_liquidation_value": liquidation_value,
             "virtual_estimated_exit_fees": estimated_exit_fees,
+            "virtual_liquidation_requested_qty": liquidation_requested_qty,
+            "virtual_liquidation_filled_qty": liquidation_filled_qty,
+            "virtual_liquidation_vwap": (
+                liquidation_value / liquidation_filled_qty if liquidation_filled_qty > 0 else None
+            ),
+            "virtual_liquidation_fills": liquidation_fills,
             "pnl_source": pnl_source,
         }
     )
 
 
-def _recompute_strategy_metrics(strategy_item: Dict[str, Any]) -> None:
+def _recompute_strategy_metrics(
+    strategy_item: Dict[str, Any],
+    virtual_account: Dict[str, Any] | None = None,
+) -> None:
     yes_qty = _safe_float(strategy_item.get("yes_qty")) or 0.0
     no_qty = _safe_float(strategy_item.get("no_qty")) or 0.0
     yes_avg = _safe_float(strategy_item.get("yes_avg"))
@@ -2471,7 +2883,7 @@ def _recompute_strategy_metrics(strategy_item: Dict[str, Any]) -> None:
     strategy_item["unrealized_pnl"] = pnl_yes + pnl_no
     row_id = _safe_float(strategy_item.get("strategy_id") or strategy_item.get("row_id"))
     if row_id is not None:
-        _virtual_total_pnl_from_account(strategy_item, int(row_id))
+        _virtual_total_pnl_from_account(strategy_item, int(row_id), account=virtual_account)
 
 
 def _strategy_leg_side(yes_qty: float, no_qty: float) -> str:
@@ -2506,40 +2918,59 @@ def _strategy_leg_net_pnl(
     yes_avg: float | None,
     yes_bid: float | None,
     yes_ask: float | None,
+    yes_bid_levels: Any,
     no_qty: float,
     no_avg: float | None,
     no_bid: float | None,
     no_ask: float | None,
+    no_bid_levels: Any,
     fee_rate: float,
+    prefetched_virtual_leg_stats: Dict[str, Dict[tuple[int, int], float]] | None = None,
 ) -> Dict[str, Any]:
-    realized_pnl = _virtual_realized_pnl_for_leg(strategy_id, leg_index)
+    leg_key = (int(strategy_id), int(leg_index))
+    realized_pnl = _safe_float((prefetched_virtual_leg_stats or {}).get("realized", {}).get(leg_key))
+    if realized_pnl is None:
+        realized_pnl = _virtual_realized_pnl_for_leg(strategy_id, leg_index)
     gross_pnl = 0.0
     liquidation_value = 0.0
     estimated_exit_fees = 0.0
-    paid_fees = _virtual_filled_fees_for_leg(strategy_id, leg_index)
+    paid_fees = _safe_float((prefetched_virtual_leg_stats or {}).get("fees", {}).get(leg_key))
+    if paid_fees is None:
+        paid_fees = _virtual_filled_fees_for_leg(strategy_id, leg_index)
     missing_open_mark = False
+    liquidation_requested_qty = 0.0
+    liquidation_filled_qty = 0.0
+    liquidation_fills: List[Dict[str, Any]] = []
 
     if yes_qty > 0 and yes_avg is not None:
         gross_mark = yes_ask if yes_ask is not None else yes_bid
         exit_mark = yes_bid if yes_bid is not None else yes_ask
         if gross_mark is not None:
             gross_pnl += (gross_mark - yes_avg) * yes_qty
-        if exit_mark is not None:
-            liquidation_value += yes_qty * exit_mark
-            estimated_exit_fees += _virtual_fee(yes_qty, exit_mark, fee_rate)
-        else:
+        liquidation = liquidate_position(yes_qty, exit_mark, fee_rate, bid_levels=yes_bid_levels)
+        if liquidation["filled_qty"] <= 0:
             missing_open_mark = True
+        else:
+            liquidation_value += liquidation["gross"]
+            estimated_exit_fees += liquidation["fee"]
+            liquidation_requested_qty += liquidation["requested_qty"]
+            liquidation_filled_qty += liquidation["filled_qty"]
+            liquidation_fills.append({"side": "YES", **liquidation})
 
     if no_qty > 0 and no_avg is not None:
         gross_mark = no_ask if no_ask is not None else no_bid
         exit_mark = no_bid if no_bid is not None else no_ask
         if gross_mark is not None:
             gross_pnl += (gross_mark - no_avg) * no_qty
-        if exit_mark is not None:
-            liquidation_value += no_qty * exit_mark
-            estimated_exit_fees += _virtual_fee(no_qty, exit_mark, fee_rate)
-        else:
+        liquidation = liquidate_position(no_qty, exit_mark, fee_rate, bid_levels=no_bid_levels)
+        if liquidation["filled_qty"] <= 0:
             missing_open_mark = True
+        else:
+            liquidation_value += liquidation["gross"]
+            estimated_exit_fees += liquidation["fee"]
+            liquidation_requested_qty += liquidation["requested_qty"]
+            liquidation_filled_qty += liquidation["filled_qty"]
+            liquidation_fills.append({"side": "NO", **liquidation})
 
     open_cost = (yes_qty * (yes_avg or 0.0)) + (no_qty * (no_avg or 0.0))
     net_pnl = None if missing_open_mark else realized_pnl + liquidation_value - open_cost - paid_fees - estimated_exit_fees
@@ -2550,6 +2981,10 @@ def _strategy_leg_net_pnl(
         "paid_fees": paid_fees,
         "estimated_exit_fees": estimated_exit_fees,
         "liquidation_value": liquidation_value,
+        "liquidation_requested_qty": liquidation_requested_qty,
+        "liquidation_filled_qty": liquidation_filled_qty,
+        "liquidation_vwap": liquidation_value / liquidation_filled_qty if liquidation_filled_qty > 0 else None,
+        "liquidation_fills": liquidation_fills,
         "missing_open_mark": missing_open_mark,
     }
 
@@ -2587,14 +3022,28 @@ def _build_strategy_leg_snapshot(
     matched_market: Dict[str, Any] | None,
     row_id: int,
     include_realtime_prices: bool,
+    allow_clob_book: bool | None = None,
+    prefetched_virtual_positions: Dict[tuple[int, int], Dict[str, Dict[str, Any]]] | None = None,
+    prefetched_virtual_leg_stats: Dict[str, Dict[tuple[int, int], float]] | None = None,
 ) -> Dict[str, Any]:
     leg_index = int(leg.get("leg_index") or 0)
     flat = strategy_data_source.strategy_to_flat_dict(strategy, leg_index=leg_index)
     flat_row_id = flat.pop("row_id", row_id)
     # Virtual 模式：注入虚拟持仓
     if str(strategy.get("mode") or strategy.get("state") or "").strip().lower() == "virtual":
-        _inject_virtual_positions(flat, int(strategy.get("strategy_id") or row_id))
-    item = _build_strategy_item(flat, matched_market, row_id=flat_row_id, include_realtime_prices=include_realtime_prices)
+        _inject_virtual_positions(
+            flat,
+            int(strategy.get("strategy_id") or row_id),
+            prefetched_positions=prefetched_virtual_positions,
+        )
+    item = _build_strategy_item(
+        flat,
+        matched_market,
+        row_id=flat_row_id,
+        include_realtime_prices=include_realtime_prices,
+        allow_clob_book=allow_clob_book,
+        leg_index=leg_index,
+    )
     yes_qty = _safe_float(item.get("yes_qty")) or 0.0
     no_qty = _safe_float(item.get("no_qty")) or 0.0
     yes_avg = _safe_float(item.get("yes_avg"))
@@ -2603,6 +3052,16 @@ def _build_strategy_leg_snapshot(
     no_price = _safe_float(item.get("no_ask"))
     yes_bid = _safe_float(item.get("yes_bid"))
     no_bid = _safe_float(item.get("no_bid"))
+    if no_bid is None:
+        no_bid = _complement_price(yes_price)
+    if no_price is None:
+        no_price = _complement_price(yes_bid)
+    if yes_bid is None:
+        yes_bid = _complement_price(no_price)
+    if yes_price is None:
+        yes_price = _complement_price(no_bid)
+    yes_bid_levels = normalize_book_levels(item.get("yes_bid_levels") or [], side="bid")
+    no_bid_levels = normalize_book_levels(item.get("no_bid_levels") or [], side="bid")
     side = _strategy_leg_side(yes_qty, no_qty)
     exposure = _strategy_leg_exposure(yes_qty, yes_avg, no_qty, no_avg)
     pnl_detail = _strategy_leg_net_pnl(
@@ -2613,12 +3072,22 @@ def _build_strategy_leg_snapshot(
         yes_avg,
         yes_bid,
         yes_price,
+        yes_bid_levels,
         no_qty,
         no_avg,
         no_bid,
         no_price,
+        no_bid_levels,
         _virtual_fee_rate(item.get("market_category")),
+        prefetched_virtual_leg_stats=prefetched_virtual_leg_stats,
     )
+    bankroll = resolve_strategy_bankroll(item)
+    if bankroll and bankroll > 0:
+        yes_position = (yes_qty * (yes_avg if yes_avg is not None else (yes_price or 0.0))) / bankroll
+        no_position = (no_qty * (no_avg if no_avg is not None else (no_price or 0.0))) / bankroll
+    else:
+        yes_position = _safe_float(item.get("yes_position")) or 0.0
+        no_position = _safe_float(item.get("no_position")) or 0.0
     params, params_summary = _summarize_leg_params(leg.get("params_json"))
     market_raw = (matched_market or {}).get("raw") or {}
     question = (
@@ -2650,9 +3119,15 @@ def _build_strategy_leg_snapshot(
         "yes_avg": yes_avg,
         "no_avg": no_avg,
         "yes_mark": yes_price,
+        "yes_ask": yes_price,
         "no_mark": no_price,
+        "no_ask": no_price,
         "yes_bid": yes_bid,
         "no_bid": no_bid,
+        "yes_position": yes_position,
+        "no_position": no_position,
+        "yes_bid_levels": yes_bid_levels,
+        "no_bid_levels": no_bid_levels,
         "exposure": exposure,
         "pnl": pnl_detail["pnl"],
         "realized_pnl": pnl_detail["realized_pnl"],
@@ -2660,10 +3135,105 @@ def _build_strategy_leg_snapshot(
         "paid_fees": pnl_detail["paid_fees"],
         "estimated_exit_fees": pnl_detail["estimated_exit_fees"],
         "liquidation_value": pnl_detail["liquidation_value"],
+        "liquidation_requested_qty": pnl_detail["liquidation_requested_qty"],
+        "liquidation_filled_qty": pnl_detail["liquidation_filled_qty"],
+        "liquidation_vwap": pnl_detail["liquidation_vwap"],
+        "liquidation_fills": pnl_detail["liquidation_fills"],
         "pnl_source": "missing_mark" if pnl_detail.get("missing_open_mark") else "bid_net_after_fees",
         "missing_open_mark": pnl_detail.get("missing_open_mark", False),
+        "price_source": item.get("price_source"),
+        "market_updated_at": item.get("market_updated_at"),
+        "position_updated_at": leg.get("position_updated_at") or updated_at,
         "updated_at": updated_at,
     }
+
+
+def get_strategy_leg_snapshots(
+    row_id: int,
+    strategy: Dict[str, Any] | None = None,
+    *,
+    include_realtime_prices: bool = True,
+    allow_clob_book: bool | None = None,
+) -> List[Dict[str, Any]]:
+    """Build every Polymarket leg from one cached market index and one position read."""
+    source_strategy = strategy
+    if source_strategy is None:
+        try:
+            source_strategy = strategy_data_source.get_strategy(int(row_id))
+        except Exception:
+            source_strategy = None
+    if not source_strategy:
+        return []
+
+    legs = sorted(
+        source_strategy.get("legs") or [],
+        key=lambda item: int(item.get("leg_index") or 0),
+    )
+    if not legs:
+        return []
+
+    strategy_id = int(source_strategy.get("strategy_id") or row_id)
+    active_index = _cached_market_index_from_markets(_known_markets())
+    dictionary_index = _load_dictionary_market_index()
+    is_virtual = str(source_strategy.get("mode") or source_strategy.get("state") or "").strip().lower() == "virtual"
+    virtual_ids = [strategy_id] if is_virtual else []
+    prefetched_positions, prefetched_realized = _read_virtual_positions_many(virtual_ids)
+    prefetched_leg_stats = {
+        "realized": prefetched_realized,
+        "fees": _read_virtual_fee_totals_many(virtual_ids),
+    }
+
+    snapshots: List[Dict[str, Any]] = []
+    for leg in legs:
+        venue = str(leg.get("venue") or "").strip().lower()
+        asset_class = str(leg.get("asset_class") or "polymarket_binary").strip().lower()
+        is_binary = bool(
+            venue == "polymarket"
+            or asset_class in {"polymarket_binary", "binary", "binary_market"}
+            or leg.get("condition_id")
+            or leg.get("yes_token")
+            or leg.get("no_token")
+        )
+        if not is_binary:
+            continue
+        leg_index = int(leg.get("leg_index") or 0)
+        flat = strategy_data_source.strategy_to_flat_dict(source_strategy, leg_index=leg_index)
+        flat_row_id = int(flat.pop("row_id", strategy_id) or strategy_id)
+        matched_market, match_source = _match_strategy_market_with_source(flat, active_index, dictionary_index)
+        snapshot = _build_strategy_leg_snapshot(
+            source_strategy,
+            leg,
+            matched_market,
+            flat_row_id,
+            include_realtime_prices=include_realtime_prices,
+            allow_clob_book=allow_clob_book,
+            prefetched_virtual_positions=prefetched_positions,
+            prefetched_virtual_leg_stats=prefetched_leg_stats,
+        )
+        snapshot["market_match_source"] = match_source
+        snapshots.append(snapshot)
+    return snapshots
+
+
+def _apply_multi_leg_snapshot_pnl(strategy_item: Dict[str, Any], snapshots: List[Dict[str, Any]]) -> None:
+    if len(snapshots) <= 1:
+        return
+    missing_active_leg = False
+    total_pnl = 0.0
+    for snapshot in snapshots:
+        qty = (_safe_float(snapshot.get("yes_qty")) or 0.0) + (_safe_float(snapshot.get("no_qty")) or 0.0)
+        pnl = _safe_float(snapshot.get("pnl"))
+        if pnl is None:
+            missing_active_leg = missing_active_leg or qty > 0
+            continue
+        total_pnl += pnl
+    strategy_item["legs_snapshot"] = snapshots
+    strategy_item["legs_count"] = len(snapshots)
+    strategy_item["strategy_pnl"] = total_pnl
+    strategy_item["virtual_total_pnl"] = total_pnl
+    strategy_item["pnl_source"] = (
+        "multi_leg_liquidation_sum_partial" if missing_active_leg else "multi_leg_liquidation_sum"
+    )
 
 
 def _recent_strategy_events(strategy_id: int, limit: int = 5) -> List[Dict[str, Any]]:
@@ -2676,7 +3246,7 @@ def _recent_strategy_events(strategy_id: int, limit: int = 5) -> List[Dict[str, 
             """SELECT event_type, content, repeat_count, last_seen_utc, created_at_utc
                FROM strategy_virtual_events
                WHERE strategy_id = ?
-               ORDER BY COALESCE(NULLIF(last_seen_utc, ''), created_at_utc) DESC, id DESC
+               ORDER BY last_seen_utc DESC, id DESC
                LIMIT ?""",
             (strategy_id, max(1, int(limit))),
         ).fetchall()
@@ -2695,12 +3265,206 @@ def _recent_strategy_events(strategy_id: int, limit: int = 5) -> List[Dict[str, 
         conn.close()
 
 
+def _recent_strategy_events_many(strategy_ids: List[int], limit: int = 5) -> Dict[int, List[Dict[str, Any]]]:
+    ids = sorted({int(strategy_id) for strategy_id in strategy_ids if int(strategy_id or 0) > 0})
+    if not ids:
+        return {}
+    try:
+        conn = strategy_data_source.connect(readonly=True)
+    except Exception:
+        return {strategy_id: [] for strategy_id in ids}
+    conn.row_factory = sqlite3.Row
+    output: Dict[int, List[Dict[str, Any]]] = {strategy_id: [] for strategy_id in ids}
+    try:
+        for strategy_id in ids:
+            rows = conn.execute(
+                """SELECT event_type, content, repeat_count, last_seen_utc, created_at_utc
+                   FROM strategy_virtual_events
+                   WHERE strategy_id = ?
+                   ORDER BY last_seen_utc DESC, id DESC
+                   LIMIT ?""",
+                (strategy_id, max(1, int(limit))),
+            ).fetchall()
+            output[strategy_id] = [
+                {
+                    "time": row["last_seen_utc"] or row["created_at_utc"],
+                    "type": row["event_type"],
+                    "content": row["content"],
+                    "repeat_count": row["repeat_count"],
+                }
+                for row in rows
+            ]
+        return output
+    except Exception:
+        return {strategy_id: _recent_strategy_events(strategy_id, limit=limit) for strategy_id in ids}
+    finally:
+        conn.close()
+
+
+def _read_strategy_state_bundles_many(strategy_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    ids = sorted({int(strategy_id) for strategy_id in strategy_ids if int(strategy_id or 0) > 0})
+    if not ids:
+        return {}
+
+    def _empty_bundle() -> Dict[str, Any]:
+        return {
+            "runtime": {},
+            "user": {},
+            "machine": {},
+            "system": {},
+            "legacy": {},
+        }
+
+    try:
+        conn = strategy_data_source.connect(readonly=True)
+    except Exception:
+        return {strategy_id: _empty_bundle() for strategy_id in ids}
+    conn.row_factory = sqlite3.Row
+    bundles: Dict[int, Dict[str, Any]] = {strategy_id: _empty_bundle() for strategy_id in ids}
+    runtime_overrides: Dict[int, Dict[str, Any]] = {strategy_id: {} for strategy_id in ids}
+    placeholders = ",".join("?" for _ in ids)
+    try:
+        rows = conn.execute(
+            f"""SELECT strategy_id, namespace, key, value_json
+                FROM strategy_state
+                WHERE strategy_id IN ({placeholders})
+                ORDER BY strategy_id, namespace, key""",
+            ids,
+        ).fetchall()
+        for row in rows:
+            strategy_id = int(row["strategy_id"] or 0)
+            if strategy_id not in bundles:
+                continue
+            namespace = str(row["namespace"] or "").strip().lower() or strategy_data_source.RUNTIME_STATE_NAMESPACE
+            key = str(row["key"] or "").strip()
+            if not key:
+                continue
+            try:
+                value = json.loads(row["value_json"])
+            except (TypeError, ValueError):
+                value = row["value_json"]
+            if namespace == strategy_data_source.LEGACY_STATE_NAMESPACE:
+                bundles[strategy_id]["legacy"][key] = value
+            elif namespace == strategy_data_source.RUNTIME_STATE_NAMESPACE:
+                runtime_overrides[strategy_id][key] = value
+            elif namespace == strategy_data_source.USER_STATE_NAMESPACE:
+                bundles[strategy_id]["user"][key] = value
+            elif namespace == strategy_data_source.MACHINE_STATE_NAMESPACE:
+                bundles[strategy_id]["machine"][key] = value
+            elif namespace == "system":
+                bundles[strategy_id]["system"][key] = value
+        for strategy_id in ids:
+            runtime_state = dict(bundles[strategy_id]["legacy"])
+            runtime_state.update(runtime_overrides.get(strategy_id) or {})
+            bundles[strategy_id]["runtime"] = runtime_state
+        return bundles
+    except Exception:
+        return {strategy_id: strategy_data_source.read_strategy_state_bundle(strategy_id) for strategy_id in ids}
+    finally:
+        conn.close()
+
+
+def _read_virtual_accounts_many(strategy_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    ids = sorted({int(strategy_id) for strategy_id in strategy_ids if int(strategy_id or 0) > 0})
+    if not ids:
+        return {}
+    try:
+        conn = strategy_data_source.connect(readonly=True)
+    except Exception:
+        return {}
+    conn.row_factory = sqlite3.Row
+    placeholders = ",".join("?" for _ in ids)
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM strategy_virtual_account WHERE strategy_id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        return {int(row["strategy_id"]): dict(row) for row in rows}
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+
+
+def _read_virtual_positions_many(
+    strategy_ids: List[int],
+) -> tuple[Dict[tuple[int, int], Dict[str, Dict[str, Any]]], Dict[tuple[int, int], float]]:
+    ids = sorted({int(strategy_id) for strategy_id in strategy_ids if int(strategy_id or 0) > 0})
+    if not ids:
+        return {}, {}
+    try:
+        conn = strategy_data_source.connect(readonly=True)
+    except Exception:
+        return {}, {}
+    conn.row_factory = sqlite3.Row
+    placeholders = ",".join("?" for _ in ids)
+    by_leg: Dict[tuple[int, int], Dict[str, Dict[str, Any]]] = {}
+    realized_by_leg: Dict[tuple[int, int], float] = {}
+    try:
+        rows = conn.execute(
+            f"""SELECT strategy_id, leg_index, side, qty, avg_price, cost, realized_pnl, updated_at_utc
+                FROM strategy_virtual_positions
+                WHERE strategy_id IN ({placeholders})""",
+            ids,
+        ).fetchall()
+        for row in rows:
+            strategy_id = int(row["strategy_id"] or 0)
+            leg_index = int(row["leg_index"] or 0)
+            side = str(row["side"] or "").upper()
+            if not side:
+                continue
+            key = (strategy_id, leg_index)
+            payload = dict(row)
+            payload["side"] = side
+            by_leg.setdefault(key, {})[side] = payload
+            realized_by_leg[key] = (realized_by_leg.get(key) or 0.0) + (_safe_float(row["realized_pnl"]) or 0.0)
+        return by_leg, realized_by_leg
+    except Exception:
+        return {}, {}
+    finally:
+        conn.close()
+
+
+def _read_virtual_fee_totals_many(strategy_ids: List[int]) -> Dict[tuple[int, int], float]:
+    ids = sorted({int(strategy_id) for strategy_id in strategy_ids if int(strategy_id or 0) > 0})
+    if not ids:
+        return {}
+    try:
+        conn = strategy_data_source.connect(readonly=True)
+    except Exception:
+        return {}
+    placeholders = ",".join("?" for _ in ids)
+    try:
+        rows = conn.execute(
+            f"""SELECT strategy_id, leg_index, COALESCE(SUM(fee), 0) AS fee_total
+                FROM strategy_virtual_orders
+                WHERE strategy_id IN ({placeholders})
+                  AND status = 'filled'
+                GROUP BY strategy_id, leg_index""",
+            ids,
+        ).fetchall()
+        return {
+            (int(row[0] or 0), int(row[1] or 0)): _safe_float(row[2]) or 0.0
+            for row in rows
+        }
+    except Exception:
+        return {}
+    finally:
+        conn.close()
+
+
 def _decorate_strategy_overview(
     strategy_item: Dict[str, Any],
     strategy: Dict[str, Any],
     active_index: Dict[str, Any],
     dictionary_index: Dict[str, Any],
     include_realtime_prices: bool,
+    allow_clob_book: bool | None = None,
+    prefetched_recent_events: Dict[int, List[Dict[str, Any]]] | None = None,
+    prefetched_state_bundles: Dict[int, Dict[str, Any]] | None = None,
+    prefetched_virtual_positions: Dict[tuple[int, int], Dict[str, Dict[str, Any]]] | None = None,
+    prefetched_virtual_accounts: Dict[int, Dict[str, Any]] | None = None,
+    prefetched_virtual_leg_stats: Dict[str, Dict[tuple[int, int], float]] | None = None,
 ) -> Dict[str, Any]:
     row_id = int(strategy.get("strategy_id") or strategy_item.get("row_id") or 0)
     legs = strategy.get("legs") or []
@@ -2709,11 +3473,24 @@ def _decorate_strategy_overview(
         flat = strategy_data_source.strategy_to_flat_dict(strategy, leg_index=int(leg.get("leg_index") or 0))
         _flat_row_id = flat.pop("row_id", None)
         matched_market, _source = _match_strategy_market_with_source(flat, active_index, dictionary_index)
-        snapshots.append(_build_strategy_leg_snapshot(strategy, leg, matched_market, row_id, include_realtime_prices))
+        snapshots.append(
+            _build_strategy_leg_snapshot(
+                strategy,
+                leg,
+                matched_market,
+                row_id,
+                include_realtime_prices,
+                allow_clob_book=allow_clob_book,
+                prefetched_virtual_positions=prefetched_virtual_positions,
+                prefetched_virtual_leg_stats=prefetched_virtual_leg_stats,
+            )
+        )
 
     total_exposure = sum(_safe_float(item.get("exposure")) or 0.0 for item in snapshots)
     total_pnl = sum(_safe_float(item.get("pnl")) or 0.0 for item in snapshots)
-    events = _recent_strategy_events(row_id, limit=30)
+    events = (prefetched_recent_events or {}).get(row_id)
+    if events is None:
+        events = _recent_strategy_events(row_id, limit=30)
     last_event = events[0] if events else None
     last_action = (last_event or {}).get("content") or "No signal"
     updated_candidates = [
@@ -2726,6 +3503,7 @@ def _decorate_strategy_overview(
         {
             "strategy_id": row_id,
             "strategy_code": strategy.get("strategy_code") or strategy_item.get("raw", {}).get("Code") or "",
+            "signal_source": strategy.get("signal_source") or {},
             "strategy_name": strategy.get("strategy_name") or strategy_item.get("strategy") or "",
             "mode": strategy.get("mode") or strategy.get("state") or strategy_item.get("mode") or "Stop",
             "legs_count": len(legs) or 1,
@@ -2738,10 +3516,12 @@ def _decorate_strategy_overview(
             "updated_at": next((value for value in reversed(updated_candidates) if value), None),
         }
     )
-    try:
-        state_bundle = strategy_data_source.read_strategy_state_bundle(row_id)
-    except Exception:
-        state_bundle = {}
+    state_bundle = (prefetched_state_bundles or {}).get(row_id)
+    if state_bundle is None:
+        try:
+            state_bundle = strategy_data_source.read_strategy_state_bundle(row_id)
+        except Exception:
+            state_bundle = {}
     state_payload = strategy_state_payload(strategy.get("strategy_code") or strategy_item.get("strategy_code") or "", state_bundle)
     machine_state = str(state_payload.get("machine_state") or "auto")
     strategy_item["state"] = machine_state
@@ -2757,6 +3537,7 @@ def _decorate_strategy_overview(
                     "avg": snap.get("yes_avg"),
                     "bid": snap.get("yes_bid"),
                     "ask": snap.get("yes_mark"),
+                    "bid_levels": snap.get("yes_bid_levels") or [],
                 },
                 {
                     "side": "NO",
@@ -2764,10 +3545,17 @@ def _decorate_strategy_overview(
                     "avg": snap.get("no_avg"),
                     "bid": snap.get("no_bid"),
                     "ask": snap.get("no_mark"),
+                    "bid_levels": snap.get("no_bid_levels") or [],
                 },
             ]
         )
-    _virtual_total_pnl_from_account(strategy_item, row_id, virtual_positions)
+    _virtual_total_pnl_from_account(
+        strategy_item,
+        row_id,
+        virtual_positions,
+        account=(prefetched_virtual_accounts or {}).get(row_id),
+    )
+    _apply_multi_leg_snapshot_pnl(strategy_item, snapshots)
     if (
         len(snapshots) == 1
         and str(strategy.get("mode") or strategy.get("state") or "").strip().lower() == "virtual"
@@ -2779,6 +3567,10 @@ def _decorate_strategy_overview(
             snapshots[0]["pnl_source"] = strategy_item.get("pnl_source")
             snapshots[0]["liquidation_value"] = strategy_item.get("virtual_liquidation_value")
             snapshots[0]["estimated_exit_fees"] = strategy_item.get("virtual_estimated_exit_fees")
+            snapshots[0]["liquidation_requested_qty"] = strategy_item.get("virtual_liquidation_requested_qty")
+            snapshots[0]["liquidation_filled_qty"] = strategy_item.get("virtual_liquidation_filled_qty")
+            snapshots[0]["liquidation_vwap"] = strategy_item.get("virtual_liquidation_vwap")
+            snapshots[0]["liquidation_fills"] = strategy_item.get("virtual_liquidation_fills")
             snapshots[0]["missing_open_mark"] = False
     return strategy_item
 
@@ -3061,28 +3853,71 @@ def _load_strategy_monitoring_rows(
     except Exception:
         _new_strategies = []
     if _new_strategies:
+        try:
+            from services.history_data_service import list_backtest_workspace_only_strategy_ids
+
+            workspace_only_ids = list_backtest_workspace_only_strategy_ids()
+        except Exception:
+            workspace_only_ids = set()
+        _new_strategies = [
+            strategy
+            for strategy in _new_strategies
+            if int(strategy.get("strategy_id") or 0) not in workspace_only_ids
+        ]
         flat_rows = [strategy_data_source.strategy_to_flat_dict(s) for s in _new_strategies]
         # Virtual 模式：注入虚拟持仓到 flat dict
-        for i, s in enumerate(_new_strategies):
-            if str(s.get("mode") or s.get("state") or "").strip().lower() == "virtual":
-                _inject_virtual_positions(flat_rows[i], int(s.get("strategy_id") or 0))
         if limit is not None:
             flat_rows = flat_rows[:max(1, int(limit))]
+        visible_strategy_ids = [
+            int(item.get("row_id") or 0)
+            for item in flat_rows
+            if int(item.get("row_id") or 0) > 0
+        ]
+        visible_strategy_id_set = set(visible_strategy_ids)
+        strategies_by_id = {
+            int(s.get("strategy_id")): s
+            for s in _new_strategies
+            if s.get("strategy_id") is not None and int(s.get("strategy_id")) in visible_strategy_id_set
+        }
+        virtual_strategy_ids = [
+            strategy_id
+            for strategy_id in visible_strategy_ids
+            if str((strategies_by_id.get(strategy_id) or {}).get("mode") or "").strip().lower() == "virtual"
+        ]
+        prefetched_recent_events = _recent_strategy_events_many(visible_strategy_ids, limit=30)
+        prefetched_state_bundles = _read_strategy_state_bundles_many(visible_strategy_ids)
+        prefetched_virtual_positions, prefetched_virtual_realized = _read_virtual_positions_many(virtual_strategy_ids)
+        prefetched_virtual_accounts = _read_virtual_accounts_many(virtual_strategy_ids)
+        prefetched_virtual_leg_stats = {
+            "realized": prefetched_virtual_realized,
+            "fees": _read_virtual_fee_totals_many(virtual_strategy_ids),
+        }
+        virtual_strategy_id_set = set(virtual_strategy_ids)
+        for item in flat_rows:
+            row_id = int(item.get("row_id") or 0)
+            if row_id in virtual_strategy_id_set:
+                _inject_virtual_positions(item, row_id, prefetched_positions=prefetched_virtual_positions)
         live_ctx = _get_live_position_cache(allow_remote=allow_remote_positions)
         active_index = _cached_market_index_from_markets(_known_markets())
         dictionary_index = _load_dictionary_market_index()
         items: List[Dict[str, Any]] = []
-        strategies_by_id = {int(s.get("strategy_id")): s for s in _new_strategies if s.get("strategy_id") is not None}
         for item in flat_rows:
             row_id = item.pop("row_id", None)
             matched_market, _match_source = _match_strategy_market_with_source(item, active_index, dictionary_index)
             if enrich_tokens and _has_minimum_binary_identity(item, matched_market) and not _has_binary_yes_no_tokens(item, matched_market):
                 item, matched_market = _enrich_monitoring_row_tokens(item, matched_market, {})
             strategy_item = _build_strategy_item(
-                item, matched_market, row_id=row_id, include_realtime_prices=include_realtime_prices,
+                item,
+                matched_market,
+                row_id=row_id,
+                include_realtime_prices=include_realtime_prices,
+                allow_clob_book=bool(allow_remote_positions),
             )
             _apply_wallet_live_positions(strategy_item, live_ctx)
-            _recompute_strategy_metrics(strategy_item)
+            _recompute_strategy_metrics(
+                strategy_item,
+                virtual_account=prefetched_virtual_accounts.get(int(row_id or 0)),
+            )
             strategy_item["display_name"] = _build_strategy_display_name(strategy_item, row_id=row_id)
             source_strategy = strategies_by_id.get(int(row_id or 0))
             if source_strategy:
@@ -3092,6 +3927,12 @@ def _load_strategy_monitoring_rows(
                     active_index,
                     dictionary_index,
                     include_realtime_prices,
+                    allow_clob_book=bool(allow_remote_positions),
+                    prefetched_recent_events=prefetched_recent_events,
+                    prefetched_state_bundles=prefetched_state_bundles,
+                    prefetched_virtual_positions=prefetched_virtual_positions,
+                    prefetched_virtual_accounts=prefetched_virtual_accounts,
+                    prefetched_virtual_leg_stats=prefetched_virtual_leg_stats,
                 )
             items.append(strategy_item)
         total_ms = (time.perf_counter() - t0) * 1000
@@ -3185,6 +4026,7 @@ def _load_strategy_monitoring_rows(
                 matched_market,
                 row_id=row_id,
                 include_realtime_prices=include_realtime_prices,
+                allow_clob_book=bool(allow_remote_positions),
             )
             _apply_wallet_live_positions(strategy_item, live_ctx)
             if matched_market:
@@ -3283,6 +4125,8 @@ def _build_strategy_item(
     matched_market: Dict[str, Any] | None,
     row_id: int | None = None,
     include_realtime_prices: bool = True,
+    allow_clob_book: bool | None = None,
+    leg_index: int = 0,
 ) -> Dict[str, Any]:
     yes_qty = _safe_float(item.get("Yes_now_qty")) or 0.0
     no_qty = _safe_float(item.get("No_now_qty")) or 0.0
@@ -3292,17 +4136,35 @@ def _build_strategy_item(
     no_token = str(item.get("no_token") or "").strip() or str((matched_market or {}).get("no_token") or "").strip()
     condition_id = str(item.get("condition_id") or "").strip() or (matched_market or {}).get("condition_id")
     ws_snapshot = _select_strategy_ws_snapshot(yes_token, no_token, condition_id) if include_realtime_prices else None
+    resolved_allow_clob_book = include_realtime_prices if allow_clob_book is None else bool(allow_clob_book)
     market_prices = _resolve_strategy_market_prices(
         matched_market,
         ws_snapshot=ws_snapshot,
         yes_token=yes_token,
         no_token=no_token,
-        allow_clob_book=include_realtime_prices,
+        allow_clob_book=resolved_allow_clob_book,
     )
+    tick_prices = (
+        _latest_virtual_tick_price_snapshot(row_id, leg_index=leg_index)
+        if include_realtime_prices and str(item.get("mode") or item.get("state") or "").strip().lower() == "virtual"
+        else {}
+    )
+    if tick_prices and (
+        market_prices.get("price_source") not in {"websocket", "clob_book"}
+        or not any(
+            market_prices.get(key)
+            for key in ("yes_bid_levels", "yes_ask_levels", "no_bid_levels", "no_ask_levels")
+        )
+    ):
+        market_prices = tick_prices
     yes_price = market_prices["yes_ask"] or _safe_float(item.get("Yes_ask") or item.get("ask"))
     yes_bid = market_prices["yes_bid"] or _safe_float(item.get("Yes_bid") or item.get("bid"))
     no_ask = market_prices["no_ask"] or _safe_float(item.get("No_ask"))
     no_bid = market_prices["no_bid"] or _safe_float(item.get("No_bid"))
+    yes_bid_levels = normalize_book_levels(market_prices.get("yes_bid_levels") or [], side="bid")
+    yes_ask_levels = normalize_book_levels(market_prices.get("yes_ask_levels") or [], side="ask")
+    no_bid_levels = normalize_book_levels(market_prices.get("no_bid_levels") or [], side="bid")
+    no_ask_levels = normalize_book_levels(market_prices.get("no_ask_levels") or [], side="ask")
     yes_last_price = market_prices.get("yes_last_price")
     no_last_price = market_prices.get("no_last_price")
     if yes_last_price is None:
@@ -3329,9 +4191,17 @@ def _build_strategy_item(
         "code_ok": item.get("IsCodeOk?"),
         "yes_bid": yes_bid,
         "yes_ask": yes_price,
+        "yes_bid_levels": yes_bid_levels,
+        "yes_ask_levels": yes_ask_levels,
+        "yes_bid_size": market_prices.get("yes_bid_size"),
+        "yes_ask_size": market_prices.get("yes_ask_size"),
         "yes_last_price": yes_last_price,
         "no_bid": no_bid,
         "no_ask": no_ask,
+        "no_bid_levels": no_bid_levels,
+        "no_ask_levels": no_ask_levels,
+        "no_bid_size": market_prices.get("no_bid_size"),
+        "no_ask_size": market_prices.get("no_ask_size"),
         "no_last_price": no_last_price,
         "yes_qty": yes_qty,
         "no_qty": no_qty,
@@ -3372,7 +4242,7 @@ def fetch_strategy_monitoring(limit: int = 100, sync_stats: bool = True, allow_r
         limit=max(1, limit),
         enrich_tokens=False,
         allow_remote_positions=allow_remote_positions,
-        include_realtime_prices=False,
+        include_realtime_prices=True,
     )
     t_load1 = time.perf_counter()
     print(f"[SV][strategies] _load_strategy_monitoring_rows {(t_load1 - t_load0) * 1000:.1f}ms")
@@ -3441,9 +4311,17 @@ def fetch_strategy_monitoring(limit: int = 100, sync_stats: bool = True, allow_r
     }
 
 
-def fetch_strategy_detail(row_id: int, allow_remote_positions: bool = True) -> Dict[str, Any]:
+def fetch_strategy_detail(
+    row_id: int,
+    allow_remote_positions: bool = True,
+    allow_clob_book: bool | None = None,
+) -> Dict[str, Any]:
     t0 = time.perf_counter()
     print(f"[SV][strategy_detail] start row_id={row_id} allow_remote_positions={allow_remote_positions}")
+    if allow_clob_book is None:
+        # CLOB prices are public market data and are independent from remote
+        # wallet-position access. Virtual PnL must still use the executable book.
+        allow_clob_book = True
 
     # --- NEW PATH: try unified data source first ---
     try:
@@ -3467,8 +4345,21 @@ def fetch_strategy_detail(row_id: int, allow_remote_positions: bool = True) -> D
             _inject_virtual_positions(item, int(row_id))
         if is_virtual or is_backtest_snapshot or not allow_remote_positions:
             _matched = _match_strategy_market(item, _load_strategy_market_index())
-            result = _build_strategy_item(item, _matched, row_id=item_row_id, include_realtime_prices=True)
+            result = _build_strategy_item(
+                item,
+                _matched,
+                row_id=item_row_id,
+                include_realtime_prices=True,
+                allow_clob_book=allow_clob_book,
+            )
             _recompute_strategy_metrics(result)
+            snapshots = get_strategy_leg_snapshots(
+                int(row_id),
+                _strat,
+                include_realtime_prices=True,
+                allow_clob_book=allow_clob_book,
+            )
+            _apply_multi_leg_snapshot_pnl(result, snapshots)
             result["position_source"] = result.get("position_source") or ("virtual" if is_virtual else None)
             result["display_name"] = _build_strategy_display_name(result, row_id=item_row_id)
             result["table"] = "backtest_history_snapshot" if is_backtest_snapshot else "strategy_registry"
@@ -3492,7 +4383,13 @@ def fetch_strategy_detail(row_id: int, allow_remote_positions: bool = True) -> D
         live_ctx = _get_live_position_cache(allow_remote=allow_remote_positions)
         matched_market = _match_strategy_market(item, _load_strategy_market_index())
         item, matched_market = _enrich_monitoring_row_tokens(item, matched_market, {})
-        result = _build_strategy_item(item, matched_market, row_id=item_row_id, include_realtime_prices=True)
+        result = _build_strategy_item(
+            item,
+            matched_market,
+            row_id=item_row_id,
+            include_realtime_prices=True,
+            allow_clob_book=allow_clob_book,
+        )
         _apply_wallet_live_positions(result, live_ctx)
         _recompute_strategy_metrics(result)
         result["display_name"] = _build_strategy_display_name(result, row_id=item_row_id)
@@ -3526,7 +4423,13 @@ def fetch_strategy_detail(row_id: int, allow_remote_positions: bool = True) -> D
         t_build0 = time.perf_counter()
         matched_market = _match_strategy_market(item, _load_strategy_market_index())
         item, matched_market = _enrich_monitoring_row_tokens(item, matched_market, {})
-        result = _build_strategy_item(item, matched_market, row_id=row_id, include_realtime_prices=True)
+        result = _build_strategy_item(
+            item,
+            matched_market,
+            row_id=row_id,
+            include_realtime_prices=True,
+            allow_clob_book=allow_clob_book,
+        )
         _apply_wallet_live_positions(result, live_ctx)
         _recompute_strategy_metrics(result)
         result["display_name"] = _build_strategy_display_name(result, row_id=row_id)

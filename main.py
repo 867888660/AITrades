@@ -254,9 +254,30 @@ WS_OPEN_TIMEOUT = int(config["websocket"].get("open_timeout_sec", 20))
 WS_CONNECT_STAGGER_SEC = float(config["websocket"].get("connect_stagger_sec", 1.2))
 WS_MAX_CONCURRENT_HANDSHAKES = max(1, int(config["websocket"].get("max_concurrent_handshakes", 2)))
 
-session = requests.Session()
+def _resolve_ws_proxy(url: str) -> str:
+    """返回该 URL 应使用的代理，Windows 注册表设置与环境变量一并考虑。
+
+    只读 http_proxy/HTTP_PROXY 是不够的：Windows 上代理通常只写在注册表里
+    (Clash 等客户端的“系统代理”开关)，此时环境变量为空，WS 会直连并超时。
+    """
+    try:
+        from services.http_client import resolve_proxy_url
+
+        return resolve_proxy_url(url)
+    except Exception:
+        # 允许 main.py 脱离 services/ 独立运行。
+        return str(os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY") or "")
+
+
+try:
+    from services.http_client import build_session as _build_proxy_aware_session
+
+    session = _build_proxy_aware_session()
+except Exception:
+    # 同上：独立运行时退回普通 Session。
+    session = requests.Session()
+    session.trust_env = True
 session.headers.update({"User-Agent": "polymarket_datatube/1.0"})
-session.trust_env = True  # 允许读取环境变量中的代理配置 (解决 timeout 问题)
 
 # ============================================================
 # Phase 1: 全量拉取活跃市场 (不变)
@@ -1691,7 +1712,7 @@ class WebSocketMonitor:
                     if self.connect_semaphore is not None:
                         await self.connect_semaphore.acquire()
                     try:
-                        proxy_url = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
+                        proxy_url = _resolve_ws_proxy(WS_URL)
                         connect_kwargs = {
                             "ping_interval": WS_PING_INTERVAL,
                             "ping_timeout": 10,

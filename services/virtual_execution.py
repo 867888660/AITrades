@@ -38,6 +38,20 @@ MIN_SET_TARGET_BUY_QTY = 0.01
 CASH_EPSILON = 1e-9
 OPEN_ORDER_ACTIVE_STATUSES = ("open", "partially_filled")
 STOP_LOSS_LOCKED_STATE = "stop_loss_locked"
+_VIRTUAL_MARKET_ACTION_TYPES = {
+    "BUY",
+    "SELL",
+    "SETPOS",
+    "SET_BINARY_TARGET",
+    "SET_TARGET",
+    "ORDER",
+    "PLACE_ORDER",
+    "REPLACE_ORDER",
+    "BUY_NOTIONAL",
+    "SELL_NOTIONAL",
+    "CLOSE",
+    "CLOSE_ALL",
+}
 
 _GENERIC_FEE_RATE: Dict[str, float] = {
     "crypto_spot": 0.001,
@@ -81,6 +95,54 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _parse_utc_datetime(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _leg_market_expiry_reason(
+    use_data: Dict[str, Any],
+    leg: int,
+    *,
+    now_utc: Optional[datetime] = None,
+) -> Optional[str]:
+    asset_class = str(
+        use_data.get(f"L{leg}_AssetClass")
+        or (use_data.get("AssetClass") if leg == 0 else "")
+        or ""
+    ).strip().lower()
+    if asset_class and asset_class != "polymarket_binary":
+        return None
+
+    status = str(
+        use_data.get(f"L{leg}_MarketStatus")
+        or (use_data.get("MarketStatus") if leg == 0 else "")
+        or ""
+    ).strip().lower()
+    if status in {"resolved", "settled", "finalized"}:
+        return "market_resolved"
+    if status in {"closed", "expired"}:
+        return "market_expired" if status == "expired" else "market_closed"
+
+    end_at = _parse_utc_datetime(
+        use_data.get(f"L{leg}_EndTime")
+        or use_data.get(f"Enddate_L{leg}")
+        or (use_data.get("Enddate") if leg == 0 else None)
+    )
+    current = now_utc or datetime.now(timezone.utc)
+    if end_at is not None and current.astimezone(timezone.utc) >= end_at:
+        return "market_expired"
+    return None
 
 
 def _side_label(side: str) -> str:
@@ -526,6 +588,12 @@ def _mark_account_equity(
             continue
         side = str(pos.get("side") or "YES")
         leg = int(pos.get("leg_index") or 0)
+        if _leg_market_expiry_reason(use_data, leg):
+            # Expired markets have no executable live book. Preserve the open
+            # position at cost until a separate resolution payout is known.
+            liquidation_value += qty * avg_price
+            open_cost += qty * avg_price
+            continue
         fill = _simulate_taker_fill(side, leg, "SELL", use_data, None, fee_rate, qty_limit=qty)
         mark = _safe_float(fill.get("price"), 0.0)
         if mark > 0 and _safe_float(fill.get("qty"), 0.0) > 0:
@@ -1369,6 +1437,23 @@ def execute_actions(
             side = str(action.get("side") or "Yes").strip()
             leg = int(action.get("leg", action.get("instrument", 0)))
 
+            expiry_reason = _leg_market_expiry_reason(use_data, leg)
+            if expiry_reason and atype in _VIRTUAL_MARKET_ACTION_TYPES:
+                write_action_event_conn(
+                    conn,
+                    strategy_id,
+                    MODE_VIRTUAL,
+                    atype,
+                    tick_id=audit_tick_id,
+                    leg_index=leg,
+                    side=side,
+                    status="skipped",
+                    reason=expiry_reason,
+                    raw_action=action,
+                    raw_function_json_hash=function_json_hash,
+                )
+                continue
+
             if atype == "BUY":
                 qty = _safe_float(action.get("qty"), 0.0)
                 price = action.get("price")
@@ -1563,6 +1648,31 @@ def sync_virtual_open_orders(
             price = _safe_float(order.get("price"), 0.0)
             remaining = _safe_float(order.get("remaining_qty"), 0.0)
             raw_action_json = str(order.get("raw_action_json") or "")
+            expiry_reason = _leg_market_expiry_reason(use_data, leg)
+            if expiry_reason:
+                conn.execute(
+                    """UPDATE strategy_virtual_open_orders
+                       SET status = 'canceled', reason = ?,
+                           remaining_qty = 0, updated_at_utc = ?
+                       WHERE id = ?""",
+                    (expiry_reason, _now(), order["id"]),
+                )
+                write_action_event_conn(
+                    conn,
+                    strategy_id,
+                    MODE_VIRTUAL,
+                    "OPEN_ORDER_FILL",
+                    tick_id=audit_tick_id,
+                    leg_index=leg,
+                    side=side,
+                    qty=remaining,
+                    price=price,
+                    status="canceled",
+                    reason=expiry_reason,
+                    order_ref=f"open:{order['id']}",
+                    raw_action=_parse_raw_action(raw_action_json),
+                )
+                continue
             if stop_loss_locked and action == "BUY":
                 conn.execute(
                     """UPDATE strategy_virtual_open_orders

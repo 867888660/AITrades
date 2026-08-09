@@ -1,14 +1,34 @@
-# Polymarket DataTube 文档入口（补充）
+# Polymarket DataTube 文档入口
+
+## 2026-08-04 Factor Run、Alpha Run 与 Research Backtest
+
+- 新增专题文档：[Factor Run、Alpha Run 与 Research Backtest MVP](03-features/factor-alpha-run-mvp.md)。
+- 正式边界拆为三段：Factor Evaluation 负责因子预测能力与分组表现；Alpha Evaluation 负责 Signal 的 IC/Rank IC、Decay、Turnover 与 Regime；Research Backtest 负责 Target、Position、Trade、Cost、Equity、Performance 与 Drawdown。
+- 没有合格 Signal 时生成显式 `FLAT` Target，并在下一根可执行 Bar 退出已有持仓；结果页同时展示 invested/flat rebalances。
+- 历史 Alpha Hybrid Run 保持不可变并只读兼容；新 Alpha Evaluation 不再生成组合和回测 Artifact。
+
+## 2026-08-04 Requirement 自动维护与实时进度
+
+- 新增专题文档：[Requirement 数据自动维护与实时进度](04-operations/requirement-data-maintenance.md)。
+- Requirement Library 与活跃 Research 由后端每 30 秒扫描；普通数据缺口自动排队、下载、校验和提交，不再要求用户点击 `Complete Missing Data`、`Prepare` 或 `Retry`。
+- Research Data 与 Library 共用实时状态，展示阶段、分区、行数、当前范围、ETA 和运行时间；只有终态错误或不支持的合同显示 `FAILED / UNAVAILABLE`。
+- 系统维护任务使用隐藏项目、内部授权标记、Provider 白名单、幂等键与固定预算，不借用或扩大用户 Research Session 权限。
+
+## 2026-08-01 Research Agent Skill
+
+- 新增专题文档：[Research Agent Skill：START、RESUME 与迭代研究](03-features/research-agent-skill.md)。
+- 用户只需要描述研究目标或提供恢复锚点；系统创建持久化 Research Session，并在 AgentMonitor 展示状态、原始基线、当前分支头、迭代记录与研究额度。
+- 新流程不要求用户创建 Grant；服务端继续使用内部授权兼容层保护正式 Preview、Frozen Bundle 和 Run，Agent 只使用 `session_id`。
+- `NEED_HUMAN` 仅用于语义/上下文歧义、重大范围变化、额度扩展或跨越研究边界。
 
 ## 2026-06-29 历史数据工作台与回测报告
 
 - 新增专题文档：[历史数据工作台与回测报告](03-features/history-workspace-backtest.md)。
 - 记录 Binance K 线按用户选择时间窗口分页补齐、`coverage.segments` 合并语义、补齐后前端回写搜索结果覆盖区间、Backtest Report 缺数据时由用户确认下载并纳入进度条。
+- 这是用户主动选择任意历史窗口的工具链，不是 Research Requirement 的自动维护链；Research / Library 不沿用这里的确认下载按钮。
 - 维护相关功能时，优先阅读该文档，再查看 `services/history_data_service.py`、`static/history_workspace.js` 和 `static/backtest_report.js`。
 
 ---
-
-# Polymarket DataTube 文档入口
 
 这个目录按阅读目的组织文档：先看全局，再看使用方式，需要改功能时看功能设计，需要查字段或历史决策时看参考与决策记录。
 
@@ -85,7 +105,19 @@
 - [workspace-guide.md](02-usage/workspace-guide.md)
   - 原 `WORKSPACE_GUIDE.md`。工作台功能和交互说明。
 
+- [agent-access-guide.md](02-usage/agent-access-guide.md)
+  - Agent 受控接口、Research Session、EventGraph、策略草案、审批和审计操作手册。
+
 ### 03-features
+
+- [research-agent-skill.md](03-features/research-agent-skill.md)
+  - Research Agent 的 START/RESUME、Context Resolver、Session/Iteration、Invalidation Plan、低频 NEED_HUMAN、内部研究额度与 AgentMonitor 设计。
+
+- [research-run-semantics.md](03-features/research-run-semantics.md)
+  - 正式 Preview、Frozen Bundle、Run、Readiness、不可变身份与当前授权复核语义。
+
+- [factor-alpha-run-mvp.md](03-features/factor-alpha-run-mvp.md)
+  - Factor Evaluation、Alpha Evaluation、Research Backtest 的产品边界、结果栏目、显式 FLAT、Artifact 复用、历史兼容和多资产验收记录。
 
 - [strategy-code-spec.md](03-features/strategy-code-spec.md)
   - 策略代码规范，定义 `Inputs`、`UseData` 标准命名、`FunctionJson` 多动作协议、`LegCount` 和第一阶段落地范围。
@@ -105,6 +137,13 @@
 
 - [strategy-monitor-home-ui.md](03-features/strategy-monitor-home-ui.md)
   - 原 `策略监控首页UI补充.md`。策略监控首页 UI 字段和交互补充说明。
+
+### 04-operations
+
+- [requirement-data-maintenance.md](04-operations/requirement-data-maintenance.md)
+  - Requirement Library 与 Research 的后端自动扫描、Provider 任务、状态语义、实时下载进度、资源边界和故障排查。
+- [research-workspace-operation-guide.md](04-operations/research-workspace-operation-guide.md)
+  - Research / Library 的用户操作、对象身份、发布与引用规则。
 
 ### 04-reference
 

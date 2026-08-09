@@ -1,51 +1,79 @@
 # Backtest Workflow
 
-Use this reference when an agent needs to create, run, inspect, compare, or report
-DataTube backtests. Backtests are local historical replays only; they do not
-approve or place live orders.
+Use this reference to create, run, inspect, compare, or report DataTube history
+backtests. They are local historical replays and never authorize live orders.
 
-## Hard Boundary
+This workflow requires a registered Strategy and a History Case. For a formal,
+Manifest-pinned `RESEARCH_BACKTEST` built directly from a Project Alpha, use
+[research-agent-workflow.md](research-agent-workflow.md) instead. Do not merge
+the two result contracts or reproducibility claims.
 
-Do not approve, reject, request changes, place live orders, switch a strategy to
-real trading, or modify private keys. A successful backtest is analysis evidence,
-not execution approval.
+## Contents
 
-## Preflight
+- Preflight and Strategy selection
+- Library Alpha contract
+- Case and run creation
+- Data identity, batches, workspace, and reporting
 
-1. Check runtime health and capabilities:
+## Preflight And Strategy Selection
+
+Check runtime and capabilities, then select the registered Strategy before the
+case. Prefer `strategy_id` because it preserves the Strategy signal source.
 
 ```bash
 python scripts/datatube_client.py health
 python scripts/datatube_client.py capabilities
+python scripts/datatube_client.py strategies --limit 100
+python scripts/datatube_client.py strategy <strategy_id>
 ```
 
-2. Confirm these capabilities when creating backtests:
+Require `backtest.read` and the relevant create capability. Read
+`signal_source.type` and route exactly as follows:
+
+| Signal source | Engine | Run input |
+| --- | --- | --- |
+| `LEGACY_STRATEGY_CODE` | `legacy_strategy_code_history.v1` | Prefer `strategy_id`; a raw `strategy_code` remains supported for compatibility. |
+| `LIBRARY_ALPHA` | `library_alpha_history.v1` | Require `strategy_id`; do not invent or require `strategy_code`. |
+
+Old Strategy rows without `signal_source` are legacy StrategyCode rows. A
+Library Alpha Strategy must remain in `Stop`: its backtest path is ready, but
+live execution is `NOT_CONNECTED`.
+
+## Library Alpha Contract
+
+A Library Alpha Strategy pins a published, `VALIDATED` Alpha plus every
+published, `VALIDATED` Factor dependency by definition ID, version, and hash.
+At run creation the compiler re-resolves that closure. Stop if it changed; do
+not silently run a newer Alpha or Factor.
+
+The history adapter executes:
 
 ```text
-backtest.read
-backtest.case.create
-backtest.run.create
-backtest.batch.create
+pinned Factors -> pinned Alpha -> target weights -> next-bar-open replay
 ```
 
-3. Prefer controlled agent APIs under `/api/agent/backtests/...`.
-4. Use direct history APIs only for UI-only actions such as rerun, rename,
-   delete, or importing a run into the workspace.
+Library Alpha cases currently require:
+
+- only Binance `crypto_spot` legs;
+- one shared bar interval;
+- a unique `instrument_id` or symbol for every leg;
+- instruments compatible with the pinned Universe Snapshot when one exists.
+
+Mixed Binance/Polymarket replay is not an implemented Library Alpha path.
 
 ## Select Or Create A Case
 
-List existing cases first:
+List cases first:
 
 ```bash
 python scripts/datatube_client.py backtest-cases --limit 100
 ```
 
-Create a case when no suitable one exists. A case needs at least one leg. For a
-Binance crypto spot leg, use fields like:
+Create a case only when no suitable history window and leg set exists:
 
 ```json
 {
-  "case_name": "BTCUSDT trend follow 2025-06",
+  "case_name": "BTCUSDT trend 1h",
   "collection_name": "Default",
   "strategy_id": 82,
   "legs": [
@@ -56,147 +84,138 @@ Binance crypto spot leg, use fields like:
       "symbol": "BTCUSDT",
       "instrument_id": "crypto_spot:binance:BTCUSDT",
       "display_name": "BTC / USDT",
-      "interval": "1m"
+      "interval": "1h"
     }
   ],
   "data_window": {
-    "start": "2025-06-04T16:04",
-    "end": "2025-07-01T16:04",
-    "interval": "1m"
+    "start": "2021-01-01T00:00:00Z",
+    "end": "2025-12-31T23:00:00Z",
+    "interval": "1h"
   },
-  "params": {
-    "initial_cash": "10000",
-    "fast_window": "20",
-    "slow_window": "60"
-  }
+  "params": {"initial_cash": 10000}
 }
 ```
 
-Create with:
+```bash
+python scripts/datatube_client.py backtest-case-create --data case.json
+```
+
+The non-mutating UI evaluator is available when an explicit compatibility
+check is needed:
 
 ```bash
-python scripts/datatube_client.py backtest-case-create --data '<json>'
+python scripts/datatube_client.py post /api/history/backtest-cases/evaluate --data compatibility.json
 ```
+
+Treat evaluator `severity=error` as blocked. Review warnings for missing local
+coverage or leg/schema differences before running.
 
 ## Create And Wait For A Run
 
-Create a run from an existing case:
+Legacy registered Strategy:
 
 ```bash
-python scripts/datatube_client.py backtest-run-create <case_id> --data '{"strategy_id":82,"strategy_code":"Stragy_Crypto_Trend_Follow","params":{"entry_z":"0.002","exit_z":"0.0005","stop_loss_pct":"0.04","trailing_stop_pct":"0.08"},"run_mode":"async"}'
+python scripts/datatube_client.py backtest-run-create <case_id> --data '{"strategy_id":82,"params":{"initial_cash":10000},"run_mode":"async"}'
 ```
 
-Wait for completion:
+Raw code compatibility path:
+
+```bash
+python scripts/datatube_client.py backtest-run-create <case_id> --data '{"strategy_code":"Stragy_Crypto_Trend_Follow","params":{"initial_cash":10000},"run_mode":"async"}'
+```
+
+Library Alpha Strategy with explicit comparable execution and portfolio inputs:
+
+```json
+{
+  "strategy_id": 96,
+  "params": {"initial_cash": 10000},
+  "execution_spec": {
+    "fee_bps": 2,
+    "slippage_bps": 10,
+    "allow_short": false,
+    "allow_leverage": false
+  },
+  "portfolio_spec": {
+    "top_n": 2,
+    "rebalance_frequency": "DAILY",
+    "max_position_weight": 0.5,
+    "cash_buffer": 0.0
+  },
+  "run_mode": "async"
+}
+```
+
+Pass that file with `backtest-run-create`. Stored Strategy inputs are merged
+first and run inputs override them. The compiled runtime freezes the selected
+source, parameters, execution spec, portfolio spec, and `runtime_hash` in
+`case_snapshot.run_strategy_runtime`.
 
 ```bash
 python scripts/datatube_client.py backtest-wait <run_id> --timeout 600 --interval 2
-```
-
-`backtest-wait` returns a compact summary by default so agents do not dump a
-full equity/order/event payload. Use `--full` only when the raw payload is truly
-needed. Do not use limit `0` as "return none"; the DataTube history service
-treats `0` as unbounded/full detail.
-
-Read a compact detail summary:
-
-```bash
 python scripts/datatube_client.py backtest-run <run_id> --equity-limit 50 --orders-limit 50 --events-limit 50 --summary
 ```
 
-Read raw details only when needed:
+Terminal statuses are `completed`, `failed`, `cancelled`, and `error`.
+`backtest-wait` is compact by default; use `--full` only when needed. Never use
+limit `0` to mean none because History treats it as unbounded detail.
 
-```bash
-python scripts/datatube_client.py backtest-run <run_id> --equity-limit 1000 --orders-limit 1000 --events-limit 300
-```
+## Data Identity And Reproducibility
 
-Statuses to treat as terminal:
+For every result, report `signal_source_type`, engine, and `runtime_hash`.
+Library Alpha History runs currently record:
 
 ```text
-completed
-failed
-cancelled
-error
+data_identity_mode = HISTORY_CASE_SNAPSHOT
+dataset_manifest_ids = []
 ```
 
-If a run is old and lacks strategy `metrics` in equity point metadata, rerun it
-with the current executor before claiming Strategy Metrics or State Lanes are
-available.
+This is reproducible against the frozen Strategy runtime and History Case
+snapshot, but it is not a Data Platform Manifest-pinned formal Research Run.
+State that distinction explicitly; do not claim Manifest-level reproducibility.
 
-## Batch Backtest
+## Batch And Iteration
 
-Use batch mode when comparing many cases or parameter sets.
-
-Create by explicit cases:
-
-```bash
-python scripts/datatube_client.py backtest-batch-create --data '{"case_ids":[47,52],"strategy_id":82,"strategy_code":"Stragy_Crypto_Trend_Follow","params":{"initial_cash":"10000"},"run_mode":"async","batch_name":"BTC trend sweep"}'
-```
-
-Create by collection or strategy:
+Create batches by explicit cases, collection, or Strategy. Omit
+`strategy_code` for Library Alpha:
 
 ```bash
-python scripts/datatube_client.py backtest-batch-create --data '{"collection_name":"Default","strategy_id":82,"max_cases":20,"params":{"initial_cash":"10000"},"run_mode":"async"}'
-```
-
-Inspect:
-
-```bash
+python scripts/datatube_client.py backtest-batch-create --data '{"case_ids":[47,52],"strategy_id":96,"params":{"initial_cash":10000},"run_mode":"async","batch_name":"Alpha comparison"}'
 python scripts/datatube_client.py backtest-batches --limit 50
 python scripts/datatube_client.py backtest-batch <batch_id> --include-runs 1
 ```
 
-Rank runs by return only after checking drawdown, order count, sample size, and
-whether all runs used comparable legs and windows.
+Compare only runs with compatible legs, windows, data identity, runtime inputs,
+and cost assumptions. Rank by return only after checking drawdown, Sharpe,
+orders, turnover, coverage, and sample size. For parameter sweeps, read
+[backtest-optimization.md](backtest-optimization.md).
 
-## Workspace And Chart Analysis
+## Workspace And Metrics
 
-Use the workspace after a completed run when visual or metric-state analysis is
-needed. The workspace URL usually follows:
+Completed runs may be opened at:
 
 ```text
 /strategies/<strategy_id>/workspace?source=backtest&run_id=<run_id>
 ```
 
-Import a history run into workspace when needed:
+Import when needed:
 
 ```bash
 python scripts/datatube_client.py post /api/history/backtest-runs/<run_id>/workspace --data '{}'
 ```
 
-Important chart groups:
+- `Strategy Metrics` and `State Lanes` come from strategy-emitted metrics.
+- `Backtest Metrics` and `Backtest State` are replay-derived.
+- Library Alpha lineage is under run metrics and runtime fields are in the case
+  snapshot.
 
-- `Strategy Metrics`: numeric fields emitted by strategy code in `metrics`.
-- `State Lanes`: state/text/bool fields emitted by strategy code in `metrics`.
-- `Backtest Metrics`: derived replay metrics such as return and drawdown.
-- `Backtest State`: derived replay state such as flat/long/short position.
+Do not relabel derived metrics as Strategy Metrics. Old runs may need a rerun
+before current runtime, Strategy Metrics, or State Lanes are available.
 
-Do not label derived Backtest Metrics as Strategy Metrics. If Strategy Metrics
-or State Lanes are missing, say whether the run is old, the strategy emitted no
-metrics, or the run did not save `strategy_metrics` / `strategy_metrics_meta`.
+## Report
 
-## Analysis Report
-
-Return a compact report with:
-
-```text
-run_id / batch_id
-case_id and strategy_code
-legs and data window
-status and errors
-initial/final equity
-total return
-max drawdown
-Sharpe if present
-order count and turnover clue
-Strategy Metrics observed
-State Lanes observed
-best/worst periods or state transitions
-risk notes
-next parameter or data checks
-```
-
-Use cautious wording. Backtest performance is historical and local to the chosen
-data, parameters, fees, and execution model.
-
-For AI parameter sweeps that create many runs, read
-[backtest-optimization.md](backtest-optimization.md).
+Report: run/batch and case IDs; Strategy ID/name; signal source, engine, runtime
+hash; legs/window; status/errors; execution/portfolio inputs; equity, return,
+drawdown, Sharpe, orders and turnover; Strategy Metrics/State Lanes; lineage and
+data identity; risk notes; and the next controlled hypothesis. End by saying
+the result is historical analysis and did not approve or execute live trades.

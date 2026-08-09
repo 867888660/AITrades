@@ -1,0 +1,11 @@
+<nav class="nav" aria-label="Primary navigation">
+  <a class="nav-link{% if request.path == '/' or request.path.startswith('/strategies') %} active{% endif %}" href="/">Strategy Monitor</a>
+  <a class="nav-link{% if request.path.startswith('/research') %} active{% endif %}" href="/research">Research</a>
+  <a class="nav-link{% if request.path.startswith('/library') %} active{% endif %}" href="/library">Library</a>
+  <a class="nav-link{% if request.path.startswith('/runs') %} active{% endif %}" href="/runs">Runs</a>
+  <a class="nav-link{% if request.path.startswith('/data-catalog') %} active{% endif %}" href="/data-catalog">Data Catalog</a>
+  <a class="nav-link{% if request.path.startswith('/history') or request.path.startswith('/backtests') %} active{% endif %}" href="/history">Backtests</a>
+  <a class="nav-link{% if request.path.startswith('/agent-monitor') %} active{% endif %}" href="/agent-monitor">Agent Monitor</a>
+  <a class="nav-link{% if request.path.startswith('/approvals') %} active{% endif %}" href="/approvals">Approvals</a>
+  <a class="nav-link{% if request.path.startswith('/settings') %} active{% endif %}" href="/settings">Settings</a>
+</nav>

@@ -1,5 +1,9 @@
 # 历史数据工作台与回测报告
 
+> 边界说明（2026-07-10）：本文描述的 `history_data_service` / StrategyCode 回放属于 Legacy Strategy Backtest。新的 `ResearchBacktestProvider v2` 消费冻结 Manifest 和 Target Weight，固定使用下一根 Bar Open、费用与滑点，不替代旧链路。两者的结果不能在未声明 Provider 和成交语义时直接比较。详见 [Quant Research V1](quant-research-platform-v1.md)。
+
+> OpenBB 边界（2026-07-12）：OpenBB 是可选的受控上游 Gateway；股票日线可经 `OpenBBEquityHistoryAdapter → CanonicalBarsCommitter` 写入独立 Research Catalog/Manifest，但不会直接混入 History Workspace，也不会在正式回测运行期间在线取数。启用、健康监控、来源身份和 canonical 约束见 [OpenBB 数据 Provider 接入](openbb-provider-integration.md)。
+
 本文记录 History Workspace 与 Backtest Report 的第一版数据和回测语义，重点说明历史数据覆盖、补齐、测试样例、回测任务和报告进度。
 
 ## 页面入口
@@ -208,4 +212,3 @@ python -m py_compile app.py services\history_data_service.py
 node --check static\history_workspace.js
 node --check static\backtest_report.js
 ```
-

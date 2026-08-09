@@ -229,6 +229,10 @@ def create_runs(spec: Dict[str, Any], base_url: str, param_sets: List[Dict[str, 
                 payload["strategy_id"] = strategy_id
             if strategy_code:
                 payload["strategy_code"] = strategy_code
+            if isinstance(spec.get("execution_spec"), dict):
+                payload["execution_spec"] = dict(spec["execution_spec"])
+            if isinstance(spec.get("portfolio_spec"), dict):
+                payload["portfolio_spec"] = dict(spec["portfolio_spec"])
             if spec.get("auto_download") is not None:
                 payload["auto_download"] = bool(spec.get("auto_download"))
             response = request(

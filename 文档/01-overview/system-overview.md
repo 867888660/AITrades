@@ -1,5 +1,9 @@
 # DataTube Python 系统完整说明文档
 
+> 量化研究状态（2026-08-04）：冻结的 Research Run 基线、Research UI 与 Research Agent START/RESUME 控制面已完成。系统现有全局 Universe/RequirementSet/Factor/Alpha Library、项目级 `PINNED / TRACK_DRAFT` 引用、不可变 Effective RequirementSet、五层 Readiness、确定性 Manifest Resolver、Run Inputs Preview 指纹，以及原子化 `Budget Reservation + Frozen Bundle + QUEUED Run + Outbox`。Formal Research Worker 的 Definitions 输入模式只消费 Bundle 固定输入，并产出 Artifact、Metrics 与 Lineage。Research Agent 可从自然语言目标开始，或从 Session/Project/Run/Preview/Bundle/Factor/Alpha 恢复；Session 持久化 Original Baseline、Current Branch Head、Hypothesis + Intervention Set、Invalidation Plan 和实验决策。用户不需要管理 Grant，服务端以固定 Research Session Policy 保护范围和额度；AgentMonitor 可查看、暂停、继续并处理少量 NEED_HUMAN。Requirement 自动维护器会每 30 秒扫描 Library 与活跃 Research，自动创建受限的 Binance、OpenBB Equity Daily 和 Polymarket 数据任务，并在 Research / Library 展示实时进度与终态错误。统一 Task DAG Orchestrator、FRED Point-in-time、精确股票交易日历，以及预计算 Artifact 输入模式的 Worker 执行仍未纳入本次基线。详见 [Requirement 数据自动维护](../04-operations/requirement-data-maintenance.md)、[Research Agent Skill](../03-features/research-agent-skill.md)、[Research Run 语义与实现基线](../03-features/research-run-semantics.md)、[Quant Research V1](../03-features/quant-research-platform-v1.md) 与 [交付状态](../04-operations/research-baseline-delivery-status.md)。
+>
+> Runs 当前分为 Factor Evaluation、Alpha Evaluation 与 Research Backtest：前两者负责因子/Signal 的预测性评估，后者独占 Portfolio、Execution、Trade、Cost、Equity 与 Drawdown；旧 Alpha Hybrid 结果保持不可变并只读兼容。详见 [Factor Run、Alpha Run 与 Research Backtest MVP](../03-features/factor-alpha-run-mvp.md)。
+
 ## 1. 文档目的
 
 本文档用于说明当前主应用链路中的 Python 文件、前端文件和关键存储的功能、上下游关系、数据流向与职责边界。

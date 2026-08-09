@@ -158,11 +158,50 @@ BACKTEST_CAPABILITIES: Dict[str, Any] = {
     "case_create_capability": "backtest.case.create",
     "run_create_capability": "backtest.run.create",
     "batch_create_capability": "backtest.batch.create",
+    "strategy_runtime_schema": "strategy_runtime_spec.v1",
+    "signal_source_types": ["LEGACY_STRATEGY_CODE", "LIBRARY_ALPHA"],
+    "library_alpha_engine": "library_alpha_history.v1",
     "notes": [
         "Backtest APIs create local historical replay runs only; they do not approve or execute live orders.",
         "Batch requests select existing history cases by case_ids, collection_name, or strategy_id.",
+        "Library Alpha Strategies compile Factor -> Alpha -> target weights and execute at next-bar open with explicit fees and slippage.",
+        "History-case Alpha runs record HISTORY_CASE_SNAPSHOT identity; they are not Data Platform Manifest-pinned Research Runs.",
         "Mixed Binance/Polymarket source replay is reported as planned rather than executed.",
     ],
+}
+
+RESEARCH_SESSION_CAPABILITIES: Dict[str, Any] = {
+    "sessions_endpoint": "/api/agent/research/sessions",
+    "session_detail_endpoint": "/api/agent/research/sessions/{session_id}",
+    "context_resolver_endpoint": "/api/agent/research/context",
+    "entry_modes": ["START", "RESUME"],
+    "resume_anchor_types": [
+        "SESSION", "PROJECT", "RUN", "PREVIEW", "BUNDLE",
+        "FACTOR_DEFINITION", "ALPHA_DEFINITION",
+    ],
+    "need_human_reason_codes": [
+        "AMBIGUOUS_INTENT", "AMBIGUOUS_CONTEXT", "MATERIAL_SCOPE_CHANGE",
+        "LIMIT_EXTENSION_REQUIRED", "CROSS_RESEARCH_BOUNDARY",
+    ],
+    "authorization_model": "USER_REQUEST_WITH_SERVER_MANAGED_RESEARCH_LIMITS",
+    "user_grant_required": False,
+    "monitor_path": "/agent-monitor",
+}
+
+INSPECTION_CAPABILITIES: Dict[str, Any] = {
+    "schema_version": "inspection.event.v1",
+    "traces_endpoint": "/api/agent/inspection/traces",
+    "trace_endpoint": "/api/agent/inspection/traces/{trace_id}",
+    "events_endpoint": "/api/agent/inspection/traces/{trace_id}/events",
+    "event_endpoint": "/api/agent/inspection/events/{event_id}",
+    "search_endpoint": "/api/agent/inspection/traces/{trace_id}/search",
+    "event_kinds": [
+        "agent_step", "skill_call", "tool_call", "state_change",
+        "artifact", "validation", "system",
+    ],
+    "access_pattern": ["summary", "index", "event", "dependency", "artifact"],
+    "read_capability": "audit.read",
+    "agent_delete_allowed": False,
 }
 
 EVENT_GRAPH_CAPABILITIES: Dict[str, Any] = {
@@ -266,11 +305,34 @@ DEFAULT_POLICY: Dict[str, Any] = {
         "event.news.search",
         "event.graph.patch.validate",
         "event.graph.change_request",
+        "research.read",
+        "research.project.create",
+        "research.universe.create",
+        "research.universe.snapshot.create",
+        "research.definition.create",
+        "research.definition.validate",
+        "research.project.pin",
+        "research.project.unpin",
+        "research.universe.unbind",
+        "research.requirement.compile",
+        "research.requirement.remove",
+        "research.coverage.check",
+        "research.backfill.create",
+        "research.preview.create",
+        "research.run.create",
+        "research.run.execute",
+        "research.library.archive",
     ],
     "deny": [
         "strategy.approve",
         "execution.apply",
         "admin.policy.set",
+        "research.grant.create",
+        "research.grant.update",
+        "research.budget.increase",
+        "research.library.publish",
+        "research.history.delete",
+        "research.live.enable",
     ],
     "limits": {
         "max_strategy_budget_usdc": 100.0,
@@ -321,6 +383,25 @@ PERMISSION_CAPABILITIES: Dict[str, List[str]] = {
     "event_news_refresh": ["event.news.refresh"],
     "event_news_search": ["event.news.search"],
     "event_graph_change_request": ["event.graph.change_request", "event.graph.patch.validate"],
+    "research_read": ["research.read"],
+    "research_project_create": ["research.project.create"],
+    "research_autonomous_write": [
+        "research.universe.create",
+        "research.universe.snapshot.create",
+        "research.universe.unbind",
+        "research.definition.create",
+        "research.definition.validate",
+        "research.project.pin",
+        "research.project.unpin",
+        "research.requirement.compile",
+        "research.requirement.remove",
+        "research.coverage.check",
+        "research.backfill.create",
+        "research.preview.create",
+        "research.run.create",
+        "research.library.archive",
+    ],
+    "research_run_execute": ["research.run.execute"],
 }
 
 CAPABILITY_PERMISSION = {
@@ -425,6 +506,10 @@ CREATE TABLE IF NOT EXISTS agent_audit_events (
     error_json      TEXT NOT NULL DEFAULT '{}',
     policy_decision TEXT NOT NULL DEFAULT 'allow',
     risk_decision   TEXT NOT NULL DEFAULT 'not_required',
+    visibility      TEXT NOT NULL DEFAULT 'visible',
+    hidden_at_utc   TEXT,
+    hidden_by       TEXT NOT NULL DEFAULT '',
+    hidden_reason   TEXT NOT NULL DEFAULT '',
     created_at_utc  TEXT NOT NULL
 );
 
@@ -534,6 +619,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     except Exception:
         pass
     conn.executescript(_DDL_AGENT)
+    # Inspection Trace is an additive semantic view over the existing
+    # agent_runs / agent_run_steps / agent_audit_events foundation.
+    from services.inspection_service import ensure_schema as ensure_inspection_schema
+    ensure_inspection_schema(conn)
     conn.commit()
 
 
@@ -550,6 +639,10 @@ def _ensure_agent_audit_columns(conn: sqlite3.Connection) -> None:
         "status_code": "INTEGER",
         "duration_ms": "REAL",
         "error_json": "TEXT NOT NULL DEFAULT '{}'",
+        "visibility": "TEXT NOT NULL DEFAULT 'visible'",
+        "hidden_at_utc": "TEXT",
+        "hidden_by": "TEXT NOT NULL DEFAULT ''",
+        "hidden_reason": "TEXT NOT NULL DEFAULT ''",
     }
     for name, definition in columns.items():
         if name not in existing:
@@ -638,6 +731,11 @@ def _require_agent_capability(capability: str, actor_type: str = "agent") -> Non
         raise ValueError("agent is disabled by settings")
     if capability not in set(policy.get("allow") or []):
         raise ValueError(f"agent capability disabled by settings: {capability}")
+
+
+def require_agent_capability(capability: str, actor_type: str = "agent") -> None:
+    """Public enforcement hook for controlled feature services."""
+    _require_agent_capability(capability, actor_type)
 
 
 def _agent_capability_enabled(capability: str, actor_type: str = "agent") -> bool:
@@ -823,6 +921,7 @@ def _audit(
             duration_ms,
         ),
     )
+    audit_event_id = _new_id("audit")
     conn.execute(
         """INSERT INTO agent_audit_events(
             event_id, run_id, step_id, actor_type, actor_id, agent_kind, workflow_id,
@@ -830,7 +929,7 @@ def _audit(
             input_json, output_json, error_json, policy_decision, risk_decision, created_at_utc
         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
-            _new_id("audit"),
+            audit_event_id,
             run_id,
             step_id,
             actor_type,
@@ -852,6 +951,29 @@ def _audit(
             now,
         ),
     )
+    # Keep the security/policy audit record and the Agent-native semantic trace
+    # distinct, while bridging them in the same transaction for consistency.
+    from services.inspection_service import bridge_audit_event
+    bridge_audit_event(
+        conn,
+        run_id=run_id,
+        step_id=step_id,
+        actor_type=actor_type,
+        actor_id=actor_id,
+        capability=capability,
+        target_type=target_type,
+        target_id=target_id,
+        input_data=input_compact,
+        output_data=output_compact,
+        error_data=error_compact,
+        policy_decision=policy_decision,
+        risk_decision=risk_decision,
+        endpoint=endpoint,
+        method=method,
+        status_code=status_code,
+        duration_ms=duration_ms,
+        created_at=now,
+    )
 
 
 def _compact_audit_value(value: Any, *, depth: int = 0) -> Any:
@@ -868,7 +990,18 @@ def _compact_audit_value(value: Any, *, depth: int = 0) -> Any:
             if idx >= 60:
                 result["_truncated_keys"] = len(value) - 60
                 break
-            result[str(key)] = _compact_audit_value(item, depth=depth + 1)
+            key_text = str(key)
+            normalized_key = key_text.lower().replace("-", "_")
+            sensitive_parts = (
+                "api_key", "apikey", "authorization", "cookie", "credential",
+                "mnemonic", "passphrase", "password", "private_key", "secret",
+                "seed_phrase", "signature", "token",
+            )
+            result[key_text] = (
+                "[REDACTED]"
+                if any(part in normalized_key for part in sensitive_parts)
+                else _compact_audit_value(item, depth=depth + 1)
+            )
         return result
     if isinstance(value, str):
         return _clip_text(value, 800)
@@ -907,6 +1040,30 @@ def _audit_request(
         conn.rollback()
     finally:
         conn.close()
+
+
+def audit_external_action(
+    *,
+    actor_type: str,
+    actor_id: str,
+    capability: str,
+    target_type: str = "",
+    target_id: str = "",
+    input_data: Any = None,
+    output_data: Any = None,
+    policy_decision: str = "allow",
+) -> None:
+    """Append an Agent audit event for writes implemented outside this module."""
+    _audit_request(
+        actor_type=actor_type,
+        actor_id=actor_id,
+        capability=capability,
+        target_type=target_type,
+        target_id=target_id,
+        input_data=input_data,
+        output_data=output_data,
+        policy_decision=policy_decision,
+    )
 
 
 def _add_activity(
@@ -1280,7 +1437,58 @@ def _normalize_draft_payload(payload: Dict[str, Any], *, existing: Optional[Dict
     return draft
 
 
-def get_capabilities() -> Dict[str, Any]:
+def _build_research_asset_matrix() -> dict:
+    """Return provider × asset_class × frequency × run_type capability matrix.
+
+    Generated from data_capability_service and research_backtest constants so
+    it stays current without manual doc updates.
+    """
+    from .data_platform.data_capability_service import (
+        BINANCE_INTERVALS,
+        POLYMARKET_INTERVALS,
+    )
+    from .data_platform.research_backtest import RESEARCH_BACKTEST_CAPABILITIES
+
+    rb_classes = list(getattr(RESEARCH_BACKTEST_CAPABILITIES, "asset_classes", ("crypto_spot",)))
+    matrix = [
+        {
+            "provider": "BINANCE",
+            "asset_class": "crypto_spot",
+            "supported_frequencies": BINANCE_INTERVALS,
+            "prepare_supported": True,
+            "supported_run_types": ["FACTOR_EVALUATION", "ALPHA_EVALUATION"]
+            + (["RESEARCH_BACKTEST"] if "crypto_spot" in rb_classes else []),
+        },
+        {
+            "provider": "POLYMARKET",
+            "asset_class": "polymarket_binary",
+            "supported_frequencies": POLYMARKET_INTERVALS,
+            "prepare_supported": True,
+            "supported_run_types": ["FACTOR_EVALUATION", "ALPHA_EVALUATION"],
+        },
+        {
+            "provider": "OPENBB",
+            "asset_class": "equity",
+            "supported_frequencies": ["1d"],
+            "prepare_supported": True,
+            "supported_run_types": ["FACTOR_EVALUATION", "ALPHA_EVALUATION"],
+            "notes": "RESEARCH_BACKTEST not supported for equity in v1. "
+            "instrument_scope must be comma-separated list or JSON array for multiple tickers. "
+            "frequency must be exactly '1d'; any other value is rejected at START.",
+        },
+    ]
+    return {"asset_matrix": matrix, "research_backtest_asset_classes": rb_classes}
+
+
+def get_capabilities(section: str = "") -> Dict[str, Any]:
+    """Return agent capabilities.
+
+    Pass ``section`` (comma-separated) to receive only the relevant slice and
+    avoid loading large irrelevant blocks.  Recognised section names:
+    ``research``, ``strategy``, ``backtest``, ``eventgraph``, ``market``,
+    ``inspection``.
+    Omit or pass ``all`` to receive the full payload.
+    """
     policy = _policy()
     policy["strategy_submission_template"] = {
         "fields": AGENT_REPORT_FIELDS,
@@ -1295,10 +1503,35 @@ def get_capabilities() -> Dict[str, Any]:
     policy["market_query_capabilities"] = query_capabilities
     policy["strategy_observation_capabilities"] = STRATEGY_OBSERVATION_CAPABILITIES
     policy["backtest_capabilities"] = BACKTEST_CAPABILITIES
+    policy["research_session_capabilities"] = RESEARCH_SESSION_CAPABILITIES
+    policy["research_asset_matrix"] = _build_research_asset_matrix()
+    policy["inspection_capabilities"] = INSPECTION_CAPABILITIES
     event_graph_capabilities = json.loads(json.dumps(EVENT_GRAPH_CAPABILITIES, ensure_ascii=False))
     event_graph_capabilities["approval_policy"] = _event_graph_approval_policy()
     policy["event_graph_capabilities"] = event_graph_capabilities
-    return policy
+
+    sections = {s.strip().lower() for s in section.split(",") if s.strip()} if section else set()
+    if not sections or "all" in sections:
+        return policy
+
+    SECTION_KEYS: Dict[str, list] = {
+        "research": [
+            "enabled", "allow", "deny", "limits",
+            "research_session_capabilities", "research_asset_matrix",
+        ],
+        "strategy": [
+            "enabled", "allow", "deny", "limits",
+            "strategy_submission_template", "strategy_observation_capabilities",
+        ],
+        "backtest": ["enabled", "allow", "deny", "limits", "backtest_capabilities"],
+        "eventgraph": ["enabled", "allow", "deny", "limits", "event_graph_capabilities"],
+        "market": ["enabled", "allow", "deny", "limits", "market_query_capabilities"],
+        "inspection": ["enabled", "allow", "deny", "limits", "inspection_capabilities"],
+    }
+    wanted: set = set()
+    for s in sections:
+        wanted.update(SECTION_KEYS.get(s, []))
+    return {k: v for k, v in policy.items() if k in wanted}
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -3903,11 +4136,16 @@ def list_audit(limit: int = 100, payload: Optional[Dict[str, Any]] = None) -> Li
     payload = payload or {}
     run_id = str(payload.get("run_id") or "").strip()
     agent_kind = str(payload.get("agent_kind") or "").strip()
+    include_hidden = str(payload.get("include_hidden") or "").strip().lower() in {"1", "true", "yes"}
+    if include_hidden and actor_type != "human":
+        raise ValueError("only a human may include hidden audit history")
     conn = _connect()
     try:
         _ensure_schema(conn)
         args: List[Any] = []
         where_parts: List[str] = []
+        if not include_hidden:
+            where_parts.append("visibility = 'visible'")
         if run_id:
             where_parts.append("run_id = ?")
             args.append(run_id)
@@ -4096,10 +4334,20 @@ def clear_audit(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             for start in range(0, len(ids), 200):
                 chunk = ids[start:start + 200]
                 placeholders = ",".join("?" for _ in chunk)
-                cur = conn.execute(f"DELETE FROM agent_audit_events WHERE event_id IN ({placeholders})", chunk)
+                cur = conn.execute(
+                    f"""UPDATE agent_audit_events
+                           SET visibility = 'hidden', hidden_at_utc = ?, hidden_by = ?, hidden_reason = ?
+                         WHERE event_id IN ({placeholders}) AND visibility <> 'hidden'""",
+                    [str(_now()), f"{actor_type}:{actor_id}", str(payload.get("reason") or "hidden from inspection view"), *chunk],
+                )
                 deleted += int(cur.rowcount or 0)
         elif confirm_all:
-            cur = conn.execute("DELETE FROM agent_audit_events")
+            cur = conn.execute(
+                """UPDATE agent_audit_events
+                      SET visibility = 'hidden', hidden_at_utc = ?, hidden_by = ?, hidden_reason = ?
+                    WHERE visibility <> 'hidden'""",
+                (_now(), f"{actor_type}:{actor_id}", str(payload.get("reason") or "hidden from inspection view")),
+            )
             deleted = int(cur.rowcount or 0)
         else:
             raise ValueError("event_ids or confirm_all is required")
@@ -4110,10 +4358,10 @@ def clear_audit(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             capability="audit.clear",
             target_type="audit",
             input_data=_compact_audit_value(payload),
-            output_data={"deleted": deleted},
+            output_data={"hidden": deleted, "deleted": 0},
         )
         conn.commit()
-        return {"deleted": deleted}
+        return {"hidden": deleted, "deleted": 0, "retained_for_audit": True}
     except Exception:
         conn.rollback()
         raise

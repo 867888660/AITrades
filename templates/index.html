@@ -16,15 +16,7 @@
             <div class="brand-subtitle">Realtime Market Hub</div>
           </div>
         </div>
-        <nav class="nav">
-          <a class="nav-link active" href="/" target="_blank" rel="noopener noreferrer">Dashboard</a>
-          <a class="nav-link" href="/event-graph" target="_blank" rel="noopener noreferrer">EventGraph</a>
-          <a class="nav-link" href="/ledger" target="_blank" rel="noopener noreferrer">Ledger</a>
-          <a class="nav-link" href="/history" target="_blank" rel="noopener noreferrer">History</a>
-          <a class="nav-link" href="/agent-monitor" target="_blank" rel="noopener noreferrer">AgentMonitor</a>
-          <a class="nav-link" href="/watchlist" target="_blank" rel="noopener noreferrer">Watchlist</a>
-          <a class="nav-link" href="/settings" target="_blank" rel="noopener noreferrer">Settings</a>
-        </nav>
+        {% include '_primary_navigation.html' %}
         <div class="sidebar-note">
           Crypto 与 Finance 数据由后台采集器持续写入本地 SQLite。
         </div>
@@ -139,11 +131,27 @@
             </div>
             <form id="strategyModalForm" class="form modal-form">
               <label>策略名称 <input name="strategy_name" required></label>
-              <label>策略代码文件
+              <label>信号来源
+                <select name="signal_source_type" id="strategySignalSourceType">
+                  <option value="LEGACY_STRATEGY_CODE" selected>StrategyCode（兼容）</option>
+                  <option value="LIBRARY_ALPHA">Library Alpha</option>
+                </select>
+              </label>
+              <label id="strategyCodeField">策略代码文件
                 <select name="strategy_code" id="strategyCodeSelect">
                   <option value="">-- 选择 --</option>
                 </select>
               </label>
+              <div id="strategyLibraryAlphaField" class="strategy-signal-source-panel" hidden>
+                <label>Library Alpha
+                  <select name="library_alpha_asset_id" id="strategyLibraryAlphaSelect">
+                    <option value="">-- 选择已发布 Alpha --</option>
+                  </select>
+                </label>
+                <div id="strategyLibraryAlphaSummary" class="muted">
+                  选择后会固定 Alpha 版本、spec hash 及其全部 Factor 依赖。执行接入尚未开放，因此只能保存为 Stop。
+                </div>
+              </div>
               <label>Mode
                 <select name="mode">
                   <option value="Stop" selected>Stop</option>
@@ -511,6 +519,6 @@
     </div>
     <script src="{{ url_for('static', filename='polymarket_links.js') }}"></script>
     <script src="{{ url_for('static', filename='strategy_params_bulk.js') }}?v=20260523_param_bulk"></script>
-    <script src="{{ url_for('static', filename='app.js') }}?v=20260623_human_override1"></script>
+    <script src="{{ url_for('static', filename='app.js') }}?v=20260715_openbb_status_card"></script>
   </body>
 </html>

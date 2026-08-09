@@ -12,6 +12,7 @@ from services.virtual_context_builder import build_use_data
 from services.history_data_service import get_backtest_metric_catalog, get_backtest_workspace_strategy
 from services.polymarket_service import (
     fetch_strategy_detail,
+    get_strategy_leg_snapshots,
     get_strategy_chart_capabilities,
     get_strategy_chart_defaults,
     resolve_market_selection,
@@ -20,15 +21,11 @@ from services import strategy_data_source
 from services.strategy_event_service import list_strategy_events
 from services.strategy_settings_service import build_strategy_settings_schema
 from services.strategy_stats_store import get_strategy_stats_db_path, strategy_metrics_db_directory
+from services.strategy_chart_service import default_strategy_metric_keys
+from services.strategy_display import preferred_leg_display_name
 from services.workspace_preset_service import list_workspace_presets
 
 
-_BACKTEST_STRATEGY_METRIC_DEFAULTS = (
-    "trend_ratio",
-    "pnl_pct",
-    "drawdown_pct",
-    "target_position",
-)
 _BACKTEST_STATE_LANE_DEFAULTS = (
     "decision",
     "position_state",
@@ -37,6 +34,34 @@ _BACKTEST_STATE_LANE_DEFAULTS = (
     "trend_state",
     "machine_state",
 )
+_DEFAULT_CHART_METRIC_LIMIT = 16
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _apply_multi_leg_summary_pnl(strategy: Dict[str, Any], legs_data: list[Dict[str, Any]]) -> None:
+    """Use the per-leg liquidation PnL already computed from each market's book."""
+    if len(legs_data) <= 1 or str(strategy.get("mode") or "").strip().lower() != "virtual":
+        return
+    total = 0.0
+    missing_active_leg = False
+    for leg in legs_data:
+        qty = (float(leg.get("yes_qty") or 0.0) + float(leg.get("no_qty") or 0.0))
+        pnl = leg.get("pnl")
+        if pnl is None:
+            missing_active_leg = missing_active_leg or qty > 0
+            continue
+        total += float(pnl)
+    strategy["strategy_pnl"] = total
+    strategy["virtual_total_pnl"] = total
+    strategy["pnl_source"] = (
+        "multi_leg_liquidation_sum_partial" if missing_active_leg else "multi_leg_liquidation_sum"
+    )
 
 
 def _path_status(path_text: str | None) -> Dict[str, Any]:
@@ -75,31 +100,17 @@ def _is_backtest_derived_catalog_item(item: Dict[str, Any]) -> bool:
     return meta.get("source") == "backtest_derived" or key.startswith("backtest_")
 
 
-def _default_strategy_metric_keys(catalog: Dict[str, Any]) -> list[str]:
-    numeric_items = {
-        str(item.get("key") or ""): item
-        for item in (catalog.get("numeric") if isinstance(catalog, dict) else []) or []
-        if item.get("key") and not _is_backtest_derived_catalog_item(item)
-    }
-    state_items = {
-        str(item.get("key") or ""): item
-        for item in (catalog.get("state") if isinstance(catalog, dict) else []) or []
-        if item.get("key") and not _is_backtest_derived_catalog_item(item)
-    }
-    defaults: list[str] = []
-    for key in _BACKTEST_STRATEGY_METRIC_DEFAULTS:
-        if key in numeric_items:
-            defaults.append(f"metric:{key}")
-    if not defaults:
-        for key in list(numeric_items)[:3]:
-            defaults.append(f"metric:{key}")
-    for key in _BACKTEST_STATE_LANE_DEFAULTS:
-        if key in state_items:
-            defaults.append(f"metric_state:{key}")
-    if not any(key.startswith("metric_state:") for key in defaults):
-        for key in list(state_items)[:4]:
-            defaults.append(f"metric_state:{key}")
-    return defaults
+def _merge_chart_default_metric_tokens(
+    chart_defaults: Dict[str, Any],
+    chart_capabilities: Dict[str, Any],
+    detail: Dict[str, Any],
+) -> list[str]:
+    merged = list(chart_defaults.get("sub_series") or [])
+    for key in default_strategy_metric_keys(chart_capabilities, detail)[:_DEFAULT_CHART_METRIC_LIMIT]:
+        token = f"metric:{key}"
+        if token not in merged:
+            merged.append(token)
+    return merged
 
 
 def get_strategy_workspace(row_id: int, include_events: bool = False, backtest_run_id: int | str | None = None) -> Dict[str, Any]:
@@ -107,7 +118,10 @@ def get_strategy_workspace(row_id: int, include_events: bool = False, backtest_r
     print(f"[SV][workspace] start row_id={row_id} include_events={include_events}")
 
     t_detail0 = time.perf_counter()
-    detail = fetch_strategy_detail(row_id, allow_remote_positions=False)
+    # The workspace must not block its first paint on one remote CLOB request per
+    # outcome. Cached realtime prices are enough for the compact header; the
+    # historical chart and live stream update independently.
+    detail = fetch_strategy_detail(row_id, allow_remote_positions=False, allow_clob_book=False)
     t_detail1 = time.perf_counter()
     print(f"[SV][workspace] fetch_strategy_detail {(t_detail1 - t_detail0) * 1000:.1f}ms")
 
@@ -122,7 +136,7 @@ def get_strategy_workspace(row_id: int, include_events: bool = False, backtest_r
     print(f"[SV][workspace] get_strategy_stats_db_path {(t_stats1 - t_stats0) * 1000:.1f}ms path={stats_db_path}")
 
     t_events0 = time.perf_counter()
-    recent_events = list_strategy_events(row_id, {"limit": 20}) if include_events else {"data": []}
+    recent_events = list_strategy_events(row_id, {"limit": 20}, detail=detail) if include_events else {"data": []}
     t_events1 = time.perf_counter()
     print(
         f"[SV][workspace] list_strategy_events {(t_events1 - t_events0) * 1000:.1f}ms "
@@ -148,11 +162,30 @@ def get_strategy_workspace(row_id: int, include_events: bool = False, backtest_r
         for snap in (detail.get("legs_snapshot") or [])
         if isinstance(snap, dict)
     }
+    if not live_leg_snapshots:
+        for snap in get_strategy_leg_snapshots(
+            row_id,
+            raw_strategy,
+            include_realtime_prices=True,
+            allow_clob_book=False,
+        ):
+            if isinstance(snap, dict):
+                live_leg_snapshots[int(snap.get("leg_index") or 0)] = snap
     market_legs = []
     legs_data = []
     for leg in sorted(raw_strategy.get("legs") or [], key=lambda item: int(item.get("leg_index") or 0)):
         leg_index = int(leg.get("leg_index") or 0)
         live_snap = live_leg_snapshots.get(leg_index) or {}
+        instrument_json = leg.get("instrument_json") if isinstance(leg.get("instrument_json"), dict) else {}
+        is_binary_leg = not (
+            str(leg.get("venue") or "").strip().lower() == "binance"
+            or str(leg.get("asset_class") or "").strip().lower() in {"crypto_spot", "crypto"}
+        )
+        leg_name = preferred_leg_display_name(
+            leg,
+            live_snap,
+            fallback=f"Leg {leg_index + 1}",
+        )
         if live_snap:
             fallback_yes_qty = live_snap.get("yes_qty")
             fallback_no_qty = live_snap.get("no_qty")
@@ -171,11 +204,22 @@ def get_strategy_workspace(row_id: int, include_events: bool = False, backtest_r
             fallback_yes_avg = leg.get("yes_avg_cost")
             fallback_no_avg = leg.get("no_avg_cost")
             fallback_pnl = leg.get("unrealized_pnl")
+        yes_bid = _first_present(live_snap.get("yes_bid"), detail.get("yes_bid") if leg_index == 0 else None)
+        yes_ask = _first_present(live_snap.get("yes_ask"), live_snap.get("yes_mark"), detail.get("yes_ask") if leg_index == 0 else None)
+        no_bid = _first_present(live_snap.get("no_bid"), detail.get("no_bid") if leg_index == 0 else None)
+        no_ask = _first_present(live_snap.get("no_ask"), live_snap.get("no_mark"), detail.get("no_ask") if leg_index == 0 else None)
+        yes_position = _first_present(live_snap.get("yes_position"), detail.get("yes_position") if leg_index == 0 else None)
+        no_position = _first_present(live_snap.get("no_position"), detail.get("no_position") if leg_index == 0 else None)
         market_legs.append(
             {
                 "type": "binance" if str(leg.get("venue") or "").strip().lower() == "binance" or str(leg.get("asset_class") or "").strip().lower() in {"crypto_spot", "crypto"} else "market",
                 "leg_index": leg_index,
                 "label": f"Leg {leg_index + 1}",
+                "name": leg_name,
+                "display_name": leg_name,
+                "question": leg_name,
+                "leg_type": "polymarket_binary" if is_binary_leg else "position",
+                "position_kind": "yes_no" if is_binary_leg else "position",
                 "condition_id": leg.get("condition_id") or "",
                 "yes_token": leg.get("yes_token") or "",
                 "no_token": leg.get("no_token") or "",
@@ -185,11 +229,23 @@ def get_strategy_workspace(row_id: int, include_events: bool = False, backtest_r
                 "symbol": leg.get("symbol") or "",
                 "interval": (leg.get("instrument_json") or {}).get("interval") if isinstance(leg.get("instrument_json"), dict) else "",
                 "instrument_id": leg.get("instrument_id") or "",
-                "instrument_json": leg.get("instrument_json") or {},
+                "instrument_json": instrument_json,
                 "budget_cap": leg.get("budget_cap"),
                 "params_json": leg.get("params_json"),
                 "direction": leg.get("direction") or "Observe",
                 "weight": leg.get("weight"),
+                "yes_bid": yes_bid,
+                "yes_ask": yes_ask,
+                "no_bid": no_bid,
+                "no_ask": no_ask,
+                "yes_qty": fallback_yes_qty,
+                "no_qty": fallback_no_qty,
+                "yes_avg": fallback_yes_avg,
+                "no_avg": fallback_no_avg,
+                "yes_position": yes_position,
+                "no_position": no_position,
+                "price_source": live_snap.get("price_source"),
+                "market_updated_at": live_snap.get("market_updated_at") or live_snap.get("updated_at"),
             }
         )
         # Per-leg price/position snapshot from the same live detail path used by the workspace summary.
@@ -198,22 +254,37 @@ def get_strategy_workspace(row_id: int, include_events: bool = False, backtest_r
                 "leg_index": leg_index,
                 "direction": leg.get("direction") or "Observe",
                 "leg_kind": leg.get("leg_kind") or "",
+                "leg_type": "polymarket_binary" if is_binary_leg else "position",
+                "position_kind": "yes_no" if is_binary_leg else "position",
+                "name": leg_name,
+                "display_name": leg_name,
+                "question": leg_name,
                 "asset_class": leg.get("asset_class") or "polymarket_binary",
                 "venue": leg.get("venue") or "",
                 "symbol": leg.get("symbol") or "",
                 "instrument_id": leg.get("instrument_id") or "",
-                "yes_bid": detail.get("yes_bid") if leg_index == 0 else None,
-                "yes_ask": live_snap.get("yes_mark") if live_snap else (detail.get("yes_ask") if leg_index == 0 else None),
-                "no_bid": detail.get("no_bid") if leg_index == 0 else None,
-                "no_ask": live_snap.get("no_mark") if live_snap else (detail.get("no_ask") if leg_index == 0 else None),
+                "yes_bid": yes_bid,
+                "yes_ask": yes_ask,
+                "no_bid": no_bid,
+                "no_ask": no_ask,
                 "yes_qty": fallback_yes_qty,
                 "no_qty": fallback_no_qty,
                 "yes_avg": fallback_yes_avg,
                 "no_avg": fallback_no_avg,
+                "yes_position": yes_position,
+                "no_position": no_position,
                 "unrealized_pnl": fallback_pnl,
+                "pnl": fallback_pnl,
+                "position": leg.get("position") or leg.get("position_qty") or leg.get("qty") or leg.get("yes_qty"),
+                "qty": leg.get("qty") or leg.get("position_qty") or leg.get("yes_qty"),
+                "avg": leg.get("avg") or leg.get("avg_price") or leg.get("yes_avg_cost"),
                 "budget_cap": leg.get("budget_cap"),
+                "price_source": live_snap.get("price_source"),
+                "market_updated_at": live_snap.get("market_updated_at") or live_snap.get("updated_at"),
             }
         )
+
+    _apply_multi_leg_summary_pnl(detail, legs_data)
 
     has_crypto_legs = any(
         str(leg.get("venue") or "").strip().lower() == "binance"
@@ -229,14 +300,21 @@ def get_strategy_workspace(row_id: int, include_events: bool = False, backtest_r
             "range": "1w",
             "main_side": "all",
             "main_series": [],
-            "sub_series": ["strategy_pnl"],
+            "sub_series": ["position", "strategy_pnl"],
             "template": "crypto_spot",
         }
         chart_capabilities = {
             **chart_capabilities,
             "main_allowed": [],
-            "sub_allowed": ["strategy_pnl", "strategy_bankroll", "initial_capital", "realized_profit"],
+            "sub_allowed": ["position", "qty", "avg", "strategy_pnl", "strategy_bankroll", "initial_capital", "realized_profit"],
         }
+    # Live first load intentionally contains only leg price, every leg's
+    # position, and strategy PnL. Strategy metrics remain available in the
+    # picker, but are not silently appended here.
+    chart_defaults = {
+        **chart_defaults,
+        "sub_series": list(dict.fromkeys(chart_defaults.get("sub_series") or [])),
+    }
     parsed_backtest_run_id = 0
     try:
         parsed_backtest_run_id = int(str(backtest_run_id or "").strip() or "0")
@@ -253,7 +331,7 @@ def get_strategy_workspace(row_id: int, include_events: bool = False, backtest_r
             "metric:backtest_drawdown",
             "metric_state:backtest_position_state",
         ]
-        strategy_metric_defaults = _default_strategy_metric_keys(chart_capabilities.get("metric_catalog") or {})
+        strategy_metric_defaults = _merge_chart_default_metric_tokens(chart_defaults, chart_capabilities, detail)
         available_catalog_keys = {
             f"metric:{item.get('key')}"
             for item in chart_capabilities.get("metric_catalog", {}).get("numeric", [])
@@ -263,19 +341,30 @@ def get_strategy_workspace(row_id: int, include_events: bool = False, backtest_r
             for item in chart_capabilities.get("metric_catalog", {}).get("state", [])
             if item.get("key")
         }
-        merged_sub = list(chart_defaults.get("sub_series") or [])
-        for key in [*strategy_metric_defaults, *backtest_defaults]:
+        merged_sub = list(strategy_metric_defaults)
+        for key in backtest_defaults:
             if key in available_catalog_keys and key not in merged_sub:
                 merged_sub.append(key)
+        if not any(key.startswith("metric_state:") for key in merged_sub):
+            state_items = {
+                str(item.get("key") or ""): item
+                for item in (chart_capabilities.get("metric_catalog", {}).get("state") or [])
+                if item.get("key") and not _is_backtest_derived_catalog_item(item)
+            }
+            for key in _BACKTEST_STATE_LANE_DEFAULTS:
+                if key in state_items and f"metric_state:{key}" not in merged_sub:
+                    merged_sub.append(f"metric_state:{key}")
+            if not any(key.startswith("metric_state:") for key in merged_sub):
+                for key in list(state_items)[:4]:
+                    merged_sub.append(f"metric_state:{key}")
         chart_defaults = {
             **chart_defaults,
             "sub_series": merged_sub,
             "template": "backtest_crypto" if has_crypto_legs else chart_defaults.get("template", "backtest"),
         }
 
-    total_ms = (time.perf_counter() - t0) * 1000
-    print(f"[SV][workspace] total {total_ms:.1f}ms row_id={row_id}")
-    return {
+    backtest_placeholder = get_backtest_placeholder(row_id)
+    payload = {
         "strategy": detail,
         "settings_schema": build_strategy_settings_schema(detail),
         "chart_defaults": chart_defaults,
@@ -293,7 +382,7 @@ def get_strategy_workspace(row_id: int, include_events: bool = False, backtest_r
         },
         "legs_data": legs_data,
         "workspace_presets": workspace_presets,
-        "backtest": get_backtest_placeholder(row_id),
+        "backtest": backtest_placeholder,
         "source_statuses": {
             "strategy_monitoring_db": _path_status(settings.get("strategy_monitoring_db_path")),
             "market_realtime_db": _path_status(
@@ -314,6 +403,9 @@ def get_strategy_workspace(row_id: int, include_events: bool = False, backtest_r
         },
         "recent_events": recent_events.get("data") or [],
     }
+    total_ms = (time.perf_counter() - t0) * 1000
+    print(f"[SV][workspace] total {total_ms:.1f}ms row_id={row_id}")
+    return payload
 
 
 def get_strategy_usedata_snapshot(row_id: int, *, include_live_orderbook: bool = True) -> Dict[str, Any]:

@@ -3,6 +3,11 @@
 Use this reference for news/event research, Polymarket market discovery, and
 Binance crypto context.
 
+If the request asks to evaluate a Factor or Alpha, create a formal Research
+Run, compare immutable experiments, or run a Manifest-pinned Research Backtest,
+route to [research-agent-workflow.md](research-agent-workflow.md). Do not use the
+History/Strategy Backtest workflow for those requests.
+
 ## Scope
 
 DataTube v1.0 uses:
@@ -76,6 +81,23 @@ it, for example:
 ```text
 Research this and then create a strategy draft.
 ```
+
+## US Pre-market Market-cap Ranking
+
+For a Polymarket largest-company-by-market-cap study, define Scheme A exactly as
+`04:00 <= America/New_York < 09:30` and use completed `1m` or `5m` bars only.
+Run the reusable controlled-API snapshot:
+
+```powershell
+python scripts/premarket_market_cap_research.py --interval 5m --lookback-days 7
+```
+
+Treat its market-cap history as an exploratory proxy because it derives shares
+from the current quote/profile. It can answer whether the latest pre-market
+session changed the estimated ordering, but it cannot establish predictive
+usefulness. Do not create a formal Factor Evaluation until historical
+point-in-time shares outstanding or market-cap snapshots are prepared and
+Manifest-pinned. Never label current shares backfilled over old prices as PIT.
 
 ## Output Shape
 

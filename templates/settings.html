@@ -16,14 +16,7 @@
             <div class="brand-subtitle">Realtime Market Hub</div>
           </div>
         </div>
-        <nav class="nav">
-          <a class="nav-link" href="/" target="_blank" rel="noopener noreferrer">Dashboard</a>
-          <a class="nav-link" href="/event-graph" target="_blank" rel="noopener noreferrer">EventGraph</a>
-          <a class="nav-link" href="/ledger" target="_blank" rel="noopener noreferrer">Ledger</a>
-          <a class="nav-link" href="/agent-monitor" target="_blank" rel="noopener noreferrer">AgentMonitor</a>
-          <a class="nav-link" href="/watchlist" target="_blank" rel="noopener noreferrer">Watchlist</a>
-          <a class="nav-link active" href="/settings" target="_blank" rel="noopener noreferrer">Settings</a>
-        </nav>
+        {% include '_primary_navigation.html' %}
         <div class="sidebar-note">
           这里统一管理 API Key、钱包、采集频率和 SQLite 路径。路径支持相对项目根目录，例如 `Data/PolyMarketDictionary.db`。
         </div>
@@ -51,6 +44,8 @@
               <label>
                 Finnhub API Keys
                 <textarea id="finnhubKeys" rows="6" placeholder="每行一个 API Key"></textarea>
+                <span id="finnhubKeyStatus" class="settings-note"></span>
+                <label class="checkbox"><input id="clearFinnhubKeys" type="checkbox"><span>清除已保存的 Finnhub Keys</span></label>
               </label>
               <label>
                 活动 Finnhub API Key
@@ -62,12 +57,55 @@
                 <label>
                   CoinGecko API Key
                   <input id="coingeckoApiKey" placeholder="可留空">
+                  <span id="coingeckoKeyStatus" class="settings-note"></span>
+                  <label class="checkbox"><input id="clearCoingeckoApiKey" type="checkbox"><span>清除已保存的 CoinGecko Key</span></label>
                 </label>
                 <label>
                   CoinGecko API Header
                   <input id="coingeckoApiHeader" placeholder="默认 x-cg-demo-api-key">
                 </label>
               </div>
+
+              <section class="settings-section">
+                <div class="settings-section-head">
+                  <h2>OpenBB Data Provider</h2>
+                  <p>复用现有数据管线：OpenBB 只负责上游取数，DataTube 继续负责标的身份、质量检查、Catalog 与 Manifest。</p>
+                </div>
+                <div class="grid three">
+                  <label class="switch">
+                    <input id="openbbEnabled" type="checkbox">
+                    <span>启用 OpenBB Provider</span>
+                  </label>
+                  <label>
+                    OpenBB Base URL
+                    <input id="openbbBaseUrl" placeholder="http://127.0.0.1:6901">
+                  </label>
+                  <label>
+                    默认上游 Provider
+                    <input id="openbbDefaultProvider" placeholder="yfinance">
+                  </label>
+                </div>
+                <div class="grid two">
+                  <label>
+                    允许的 Providers
+                    <textarea id="openbbAllowedProviders" rows="3" placeholder="每行一个，例如 yfinance"></textarea>
+                  </label>
+                  <label>
+                    请求超时（秒）
+                    <input id="openbbTimeoutSec" type="number" min="2" max="120" step="1">
+                  </label>
+                </div>
+                <div class="grid two">
+                  <label>
+                    FRED API Key
+                    <input id="openbbFredApiKey" type="password" autocomplete="off" placeholder="保存在本机加密 secrets">
+                    <span id="openbbFredKeyStatus" class="settings-note"></span>
+                    <label class="checkbox"><input id="clearOpenbbFredApiKey" type="checkbox"><span>清除已保存的 FRED Key</span></label>
+                  </label>
+                </div>
+                <p class="settings-note">当前受控接口只开放股票日线读取；不会替换 Binance 或 Polymarket 原生数据，也不会直接写入回测。</p>
+                <div id="openbbRuntimeStatus" class="status">正在检测 OpenBB 服务与数据任务...</div>
+              </section>
 
               <section class="settings-section">
                 <div class="settings-section-head">
@@ -98,6 +136,8 @@
                   <label>
                     API Key
                     <input id="llmApiKey" type="password" autocomplete="off" placeholder="sk-...">
+                    <span id="llmKeyStatus" class="settings-note"></span>
+                    <label class="checkbox"><input id="clearLlmApiKey" type="checkbox"><span>清除已保存的 LLM Key</span></label>
                   </label>
                 </div>
                 <div class="grid three">
@@ -328,6 +368,10 @@
                   <label class="checkbox"><input type="checkbox" data-agent-permission="event_news_refresh"><span>刷新全球新闻事件</span></label>
                   <label class="checkbox"><input type="checkbox" data-agent-permission="event_news_search"><span>检索指定新闻事件</span></label>
                   <label class="checkbox"><input type="checkbox" data-agent-permission="event_graph_change_request"><span>提交 EventGraph 变更请求</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="research_read"><span>读取 Research 工作台</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="research_project_create"><span>创建 Research</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="research_autonomous_write"><span>项目授权内自主研究</span></label>
+                  <label class="checkbox"><input type="checkbox" data-agent-permission="research_run_execute"><span>执行已授权 Research Run</span></label>
                 </div>
                 <p class="settings-note">硬性禁止：agent 不能批准自己的策略、不能直接执行实盘、不能修改自身权限。</p>
               </section>
@@ -375,6 +419,6 @@
         </section>
       </main>
     </div>
-    <script src="{{ url_for('static', filename='settings.js') }}?v=eventgraph-approval-20260630"></script>
+    <script src="{{ url_for('static', filename='settings.js') }}?v=openbb-worker-monitor-20260712"></script>
   </body>
 </html>

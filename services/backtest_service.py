@@ -17,6 +17,7 @@ from services.strategy_registry_service import get_strategy
 
 DEFAULT_BACKTEST_CASH = 10_000
 DEFAULT_BACKTEST_FEE_BPS = 2
+GENERIC_BACKTEST_COLLECTIONS = {"", "strategy picks"}
 
 
 def _now_iso() -> str:
@@ -124,6 +125,41 @@ def _is_executable_legs(legs: List[Dict[str, Any]]) -> bool:
     return sources in ({"binance"}, {"polymarket"})
 
 
+def _title_token(value: Any) -> str:
+    text = str(value or "").strip().replace("_", " ").replace("-", " ")
+    return " ".join(part.capitalize() for part in text.split()) or "Unknown"
+
+
+def _default_collection_name_for_legs(legs: List[Dict[str, Any]]) -> str:
+    if not legs:
+        return "Strategy Picks / Unknown / 0 legs"
+    sources = {str(leg.get("source") or "").strip().lower() or "unknown" for leg in legs}
+    asset_classes = {str(leg.get("asset_class") or "").strip().lower() or "unknown" for leg in legs}
+    if sources == {"binance"} and asset_classes <= {"crypto_spot", "crypto", "unknown"}:
+        family = "Binance Crypto"
+    elif sources == {"polymarket"} and asset_classes <= {"polymarket_binary", "binary", "unknown"}:
+        family = "Polymarket Binary"
+    elif len(sources) == 1 and len(asset_classes) == 1:
+        family = f"{_title_token(next(iter(sources)))} {_title_token(next(iter(asset_classes)))}"
+    else:
+        source_label = "+".join(_title_token(item) for item in sorted(sources))
+        asset_label = "+".join(_title_token(item) for item in sorted(asset_classes))
+        family = f"Mixed {source_label} {asset_label}"
+    leg_count = len(legs)
+    return f"Strategy Picks / {family} / {leg_count} leg{'s' if leg_count != 1 else ''}"
+
+
+def _should_retry_with_auto_collection(error: Exception, collection_name: str, auto_collection_name: str, payload: Dict[str, Any]) -> bool:
+    if bool(payload.get("strict_collection")):
+        return False
+    if collection_name == auto_collection_name:
+        return False
+    if "collection schema" not in str(error).lower():
+        return False
+    normalized = collection_name.strip().lower()
+    return normalized in GENERIC_BACKTEST_COLLECTIONS or normalized.startswith("strategy picks /")
+
+
 def _strategy_cases(row_id: int) -> List[Dict[str, Any]]:
     cases = []
     for item in list_history_backtest_cases():
@@ -160,6 +196,7 @@ def _latest_run_summary(run: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any
         return None
     metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
     snapshot = run.get("case_snapshot") if isinstance(run.get("case_snapshot"), dict) else {}
+    runtime = snapshot.get("run_strategy_runtime") if isinstance(snapshot.get("run_strategy_runtime"), dict) else {}
     window = snapshot.get("data_window") if isinstance(snapshot.get("data_window"), dict) else {}
     return {
         "run_id": run.get("run_id"),
@@ -169,6 +206,9 @@ def _latest_run_summary(run: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any
         "created_at_utc": run.get("created_at_utc"),
         "updated_at_utc": run.get("updated_at_utc"),
         "strategy_code": metrics.get("strategy_code") or snapshot.get("run_strategy_code"),
+        "signal_source_type": metrics.get("signal_source_type") or runtime.get("signal_source_type"),
+        "engine": metrics.get("engine") or metrics.get("backtest_engine") or runtime.get("engine"),
+        "strategy_runtime_hash": metrics.get("strategy_runtime_hash") or runtime.get("runtime_hash"),
         "period_start": metrics.get("period_start") or metrics.get("requested_start") or window.get("start"),
         "period_end": metrics.get("period_end") or metrics.get("requested_end") or window.get("end"),
         "total_return": metrics.get("total_return"),
@@ -181,6 +221,73 @@ def _latest_run_summary(run: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any
     }
 
 
+def _build_backtest_overview_payload(
+    row_id: int,
+    strategy: Dict[str, Any],
+    legs: List[Dict[str, Any]],
+    runs: List[Dict[str, Any]],
+    *,
+    cases: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    executable_now = _is_executable_legs(legs)
+    return {
+        "strategy_row_id": row_id,
+        "enabled": True,
+        "status": "ready" if executable_now else "metadata_ready",
+        "title": "Backtest",
+        "summary": (
+            "This strategy can be backtested directly when all legs come from the same supported venue."
+            if executable_now
+            else "This strategy can save backtest cases, but mixed-source replay is still limited."
+        ),
+        "defaults": {
+            "start_cash": DEFAULT_BACKTEST_CASH,
+            "slippage_bps": 10,
+            "fee_bps": DEFAULT_BACKTEST_FEE_BPS,
+            "benchmark": "NONE",
+        },
+        "engine_capabilities": {
+            "binance_single_leg": True,
+            "binance_multi_leg": True,
+            "polymarket_binary_replay": True,
+            "polymarket_metadata_cases": True,
+            "polymarket_tick_replay": False,
+            "mixed_source_replay": False,
+            "multi_leg_alignment": True,
+            "library_alpha_history": True,
+            "library_alpha_execution": "FACTOR_ALPHA_PORTFOLIO_NEXT_BAR_OPEN",
+            "library_alpha_data_identity": "HISTORY_CASE_SNAPSHOT",
+        },
+        "strategy": {
+            "strategy_id": strategy.get("strategy_id"),
+            "strategy_name": strategy.get("strategy_name"),
+            "strategy_code": _strategy_code_name(strategy.get("strategy_code")),
+            "signal_source": strategy.get("signal_source") or {
+                "type": "LEGACY_STRATEGY_CODE",
+                "strategy_code": _strategy_code_name(strategy.get("strategy_code")),
+            },
+            "mode": strategy.get("mode") or strategy.get("state"),
+        },
+        "legs": legs,
+        "cases": list(cases or [])[:10],
+        "recent_runs": [_latest_run_summary(run) for run in runs],
+        "latest_run": _latest_run_summary(runs[0] if runs else None),
+        "supported_inputs": [
+            "time_window",
+            "market_context",
+            "workspace_preset",
+            "indicator_config",
+            "execution_costs",
+        ],
+        "next_endpoints": {
+            "create": f"/api/polymarket/strategies/{row_id}/backtest",
+            "status": f"/api/polymarket/strategies/{row_id}/backtest",
+            "results": f"/api/polymarket/strategies/{row_id}/backtest/results",
+        },
+        "updated_at": _now_iso(),
+    }
+
+
 def get_strategy_backtest(row_id: int) -> Dict[str, Any]:
     strategy = get_strategy(int(row_id)) or get_history_backtest_workspace_strategy(int(row_id))
     if not strategy:
@@ -189,6 +296,7 @@ def get_strategy_backtest(row_id: int) -> Dict[str, Any]:
     legs = _history_legs_from_strategy(strategy)
     runs = _strategy_runs(row_id, limit=10)
     cases = _strategy_cases(row_id)
+    return _build_backtest_overview_payload(row_id, strategy, legs, runs, cases=cases)
     executable_now = _is_executable_legs(legs)
     return {
         "strategy_row_id": row_id,
@@ -273,25 +381,45 @@ def create_strategy_backtest(row_id: int, payload: Dict[str, Any] | None = None)
             data_window["end"] = data_window.get("to")
         if data_window.get("start") or data_window.get("end"):
             data_window["strict"] = bool(payload.get("strict_window", True))
-        collection_name = str(payload.get("collection_name") or f"Strategy {row_id}").strip()
+        auto_collection_name = _default_collection_name_for_legs(legs)
+        collection_name = str(payload.get("collection_name") or auto_collection_name).strip()
         case_name = str(payload.get("case_name") or "").strip()
         if not case_name:
             case_name = f"{strategy.get('strategy_name') or ('Strategy ' + str(row_id))} backtest {datetime.now(timezone.utc).strftime('%Y%m%d %H%M%S')}"
-        case = create_history_backtest_case(
-            {
-                "case_name": case_name,
-                "collection_name": collection_name,
-                "strategy_id": row_id,
-                "legs": legs,
-                "params": params,
-                "data_window": data_window,
-                "execution_config": {
-                    "origin": "strategy_workspace",
-                    "strategy_code": strategy_code,
-                },
-            }
-        )
+        case_payload = {
+            "case_name": case_name,
+            "collection_name": collection_name,
+            "strategy_id": row_id,
+            "legs": legs,
+            "params": params,
+            "data_window": data_window,
+            "execution_config": {
+                "origin": "strategy_workspace",
+                "strategy_code": strategy_code,
+                "execution_spec": payload.get("execution_spec") if isinstance(payload.get("execution_spec"), dict) else {},
+                "portfolio_spec": payload.get("portfolio_spec") if isinstance(payload.get("portfolio_spec"), dict) else {},
+            },
+        }
+        try:
+            case = create_history_backtest_case(case_payload)
+        except ValueError as exc:
+            if not _should_retry_with_auto_collection(exc, collection_name, auto_collection_name, payload):
+                raise
+            case_payload["collection_name"] = auto_collection_name
+            case = create_history_backtest_case(case_payload)
         case_id = case.get("case_id")
+
+    if payload.get("case_only") or payload.get("save_case_only"):
+        return {
+            "ok": True,
+            "strategy_row_id": row_id,
+            "case": case,
+            "run": None,
+            "message": "Backtest case saved. Run it from History when ready.",
+            "report_url": None,
+            "history_url": "/history",
+            "workspace_url": f"/strategies/{row_id}/workspace",
+        }
 
     if payload.get("metadata_only") and not executable_now:
         return {
@@ -310,6 +438,8 @@ def create_strategy_backtest(row_id: int, payload: Dict[str, Any] | None = None)
             "strategy_id": row_id,
             "strategy_code": strategy_code,
             "params": params,
+            "execution_spec": payload.get("execution_spec") if isinstance(payload.get("execution_spec"), dict) else {},
+            "portfolio_spec": payload.get("portfolio_spec") if isinstance(payload.get("portfolio_spec"), dict) else {},
             "auto_download": bool(payload.get("auto_download") or payload.get("auto_download_missing")),
             "run_mode": payload.get("run_mode") or "async",
         },
@@ -349,7 +479,12 @@ def get_strategy_backtest_results(row_id: int, run_id: int | None = None) -> Dic
 
 
 def get_backtest_placeholder(row_id: int) -> Dict[str, Any]:
-    return get_strategy_backtest(row_id)
+    strategy = get_strategy(int(row_id)) or get_history_backtest_workspace_strategy(int(row_id))
+    if not strategy:
+        raise ValueError(f"strategy {row_id} not found")
+    legs = _history_legs_from_strategy(strategy)
+    runs = _strategy_runs(row_id, limit=10)
+    return _build_backtest_overview_payload(row_id, strategy, legs, runs, cases=[])
 
 
 def create_backtest_placeholder(row_id: int, payload: Dict[str, Any] | None = None) -> Dict[str, Any]:

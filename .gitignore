@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.openbb-venv/
 .venv-offline/
 venv/
 env/
@@ -14,6 +15,8 @@ web_settings.json
 web_settings.secrets.json
 
 # Runtime data
+storage/
+tmp/
 wheelhouse/
 dist/
 *.db
@@ -27,10 +30,27 @@ Data/*.sqlite
 Data/*.sqlite3
 Data/*.backup_*.db
 project/instance/*.db
+storage/metadata/*.db
+storage/metadata/*.db-*
+storage/canonical/
+storage/factors/
+storage/alphas/
+storage/portfolio_targets/
+storage/backtests_orders/
+storage/backtests_results/
+storage/evaluations/
+storage/reports/
+storage/temp/
 strategy_metrics_dbs/*.db
 strategy_workspace_*.db
 polymarket_active_markets_cache.json
 *.log
+
+# Skill temp files and pycache
+.agents/skills/*/scripts/_tmp_*.json
+.agents/skills/*/scripts/__pycache__/
+skills/*/scripts/_tmp_*.json
+skills/*/scripts/__pycache__/
 
 # Local bundles and editor files
 project.zip

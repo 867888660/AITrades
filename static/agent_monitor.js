@@ -56,6 +56,19 @@ const graphChangeMeta = document.getElementById("graphChangeMeta");
 const graphChangeApproveApplyReadyBtn = document.getElementById("graphChangeApproveApplyReadyBtn");
 const graphChangeApplyApprovedBtn = document.getElementById("graphChangeApplyApprovedBtn");
 const graphChangeRejectBlockedBtn = document.getElementById("graphChangeRejectBlockedBtn");
+const agentResearchSessionList = document.getElementById("agentResearchSessionList");
+const agentResearchSessionCount = document.getElementById("agentResearchSessionCount");
+const agentResearchSessionDetail = document.getElementById("agentResearchSessionDetail");
+const agentInspectionTraceCount = document.getElementById("agentInspectionTraceCount");
+const agentInspectionTraceSearch = document.getElementById("agentInspectionTraceSearch");
+const agentInspectionTraceStatus = document.getElementById("agentInspectionTraceStatus");
+const agentInspectionTraceSearchBtn = document.getElementById("agentInspectionTraceSearchBtn");
+const agentInspectionTraceList = document.getElementById("agentInspectionTraceList");
+const agentInspectionSummary = document.getElementById("agentInspectionSummary");
+const agentInspectionEventSearch = document.getElementById("agentInspectionEventSearch");
+const agentInspectionEventKind = document.getElementById("agentInspectionEventKind");
+const agentInspectionSeverity = document.getElementById("agentInspectionSeverity");
+const agentInspectionEventList = document.getElementById("agentInspectionEventList");
 
 let hasLoadedAgentDashboard = false;
 let activeAgentApproval = null;
@@ -63,6 +76,10 @@ let agentRefreshTimer = null;
 let agentAuditRows = [];
 let filteredAgentAuditRows = [];
 let agentGraphChangeRows = [];
+let agentResearchSessions = [];
+let agentInspectionTraces = [];
+let agentInspectionEvents = [];
+let activeInspectionTrace = null;
 
 const AGENT_ACTIVITY_PIN_KEY = "agent_monitor_activity_pinned_category";
 
@@ -1832,20 +1849,249 @@ function renderAgentDrafts(rows = []) {
   }).join("");
 }
 
-function renderAgentDashboard(data = {}, auditRows = [], changePayload = {}) {
+function researchScopeText(scope) {
+  if (Array.isArray(scope)) return scope.join(", ");
+  if (scope && typeof scope === "object") return JSON.stringify(scope);
+  return String(scope || "未指定");
+}
+
+function renderResearchSessionDetail(session = {}) {
+  if (!agentResearchSessionDetail) return;
+  const brief = session.brief || {};
+  const policy = session.session_policy || {};
+  const usage = session.usage || {};
+  const iterations = session.iterations || [];
+  const question = session.pending_question || {};
+  const iterationHtml = iterations.length
+    ? iterations.map((item) => `
+      <div class="agent-item">
+        <div class="agent-item-main">
+          <div class="agent-item-title">第 ${escapeHtml(item.sequence)} 轮 · ${escapeHtml(item.decision || item.status)}</div>
+          <div class="agent-item-note">${escapeHtml((item.hypothesis || {}).statement || JSON.stringify(item.hypothesis || {}))}</div>
+          <div class="agent-item-meta">
+            <span>Control ${escapeHtml(item.control_run_id || "尚无")}</span>
+            <span>Candidate ${escapeHtml(item.candidate_run_id || "尚无")}</span>
+          </div>
+        </div>
+      </div>
+    `).join("")
+    : `<div class="empty-state">尚未开始迭代。</div>`;
+  agentResearchSessionDetail.innerHTML = `
+    <div class="agent-item">
+      <div class="agent-item-main">
+        <div class="agent-item-title">${escapeHtml(session.objective || "Research Session")}</div>
+        <div class="agent-item-meta">
+          ${agentStateChip(session.status)}
+          <span>${escapeHtml(session.entry_mode)}</span>
+          <span>${escapeHtml(brief.frequency || "-")}</span>
+          <span>${escapeHtml(researchScopeText(brief.instrument_scope))}</span>
+        </div>
+        <div class="agent-item-note">原始基线：${escapeHtml(session.original_baseline_run_id || "尚无")} · 当前分支头：${escapeHtml(session.current_branch_head_run_id || "尚无")}</div>
+        <div class="agent-item-note">运行额度：${escapeHtml(usage.runs || 0)} / ${escapeHtml(policy.max_runs || 0)}；运行时间：${escapeHtml(Math.ceil((usage.runtime_seconds || 0) / 60))} / ${escapeHtml(Math.ceil((policy.max_runtime_seconds || 0) / 60))} 分钟</div>
+        ${question.question ? `<div class="agent-item-note warning">需要你判断：${escapeHtml(question.question)}</div>` : ""}
+      </div>
+    </div>
+    ${iterationHtml}
+  `;
+}
+
+function renderResearchSessions(rows = []) {
+  agentResearchSessions = rows;
+  if (agentResearchSessionCount) agentResearchSessionCount.textContent = String(rows.length);
+  if (!agentResearchSessionList) return;
+  if (!rows.length) {
+    agentResearchSessionList.innerHTML = `<div class="empty-state">还没有 Research Session。对 Agent 说“研究 BTC 趋势策略”即可开始。</div>`;
+    return;
+  }
+  agentResearchSessionList.innerHTML = rows.map((session) => {
+    const usage = session.usage || {};
+    const policy = session.session_policy || {};
+    const paused = session.status === "PAUSED";
+    const needsHuman = session.status === "NEED_HUMAN";
+    const terminal = ["COMPLETED", "FAILED", "CANCELLED"].includes(session.status);
+    return `
+      <div class="agent-item">
+        <div class="agent-item-main">
+          <div class="agent-item-title">${escapeHtml(session.objective || session.session_id)}</div>
+          <div class="agent-item-meta">
+            ${agentStateChip(session.status)}
+            <span>${escapeHtml(session.entry_mode)}</span>
+            <span>Runs ${escapeHtml(usage.runs || 0)}/${escapeHtml(policy.max_runs || 0)}</span>
+            <span>更新 ${formatShortTime(session.updated_at)}</span>
+          </div>
+          <div class="agent-item-note">${escapeHtml(session.session_id)} · Project ${escapeHtml(session.project_id || "待选择")}</div>
+        </div>
+        <div class="agent-actions">
+          <button class="mini ghost" type="button" data-research-session-view="${escapeHtml(session.session_id)}">查看</button>
+          ${needsHuman ? `<button class="mini primary" type="button" data-research-session-answer="${escapeHtml(session.session_id)}">回答</button>` : ""}
+          ${paused ? `<button class="mini" type="button" data-research-session-continue="${escapeHtml(session.session_id)}">继续</button>` : ""}
+          ${!paused && !needsHuman && !terminal ? `<button class="mini ghost" type="button" data-research-session-pause="${escapeHtml(session.session_id)}">暂停</button>` : ""}
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+async function openResearchSession(sessionId) {
+  const payload = await fetchJson(`/api/agent/research/sessions/${encodeURIComponent(sessionId)}?actor_type=human&actor_id=local_user`);
+  renderResearchSessionDetail(payload.data || {});
+}
+
+function inspectionTone(status = "", severity = "") {
+  const level = String(severity || "").toLowerCase();
+  const state = String(status || "").toLowerCase();
+  if (level === "critical" || level === "error" || state === "failed") return "danger";
+  if (level === "warning" || state === "partial") return "warning";
+  if (state === "succeeded") return "success";
+  return "neutral";
+}
+
+function renderInspectionTraces(payload = {}) {
+  const rows = Array.isArray(payload.items) ? payload.items : [];
+  agentInspectionTraces = rows;
+  if (agentInspectionTraceCount) agentInspectionTraceCount.textContent = String(rows.length);
+  if (!agentInspectionTraceList) return;
+  if (!rows.length) {
+    setStatus(agentInspectionTraceList, "暂无可见 Trace");
+    return;
+  }
+  agentInspectionTraceList.innerHTML = rows.map((trace) => {
+    const active = activeInspectionTrace?.trace_id === trace.trace_id ? " active" : "";
+    const tone = inspectionTone(trace.status);
+    const subject = [trace.subject_type, trace.subject_id].filter(Boolean).join(":") || "unbound";
+    return `
+      <button class="inspection-trace-row${active}" type="button" data-inspection-trace-id="${escapeHtml(trace.trace_id)}">
+        <span class="inspection-trace-title">${escapeHtml(trace.title || trace.trace_id)}</span>
+        <span class="agent-activity-chip ${tone}">${escapeHtml(trace.status || "unknown")}</span>
+        <span class="inspection-trace-subject">${escapeHtml(subject)}</span>
+        <span class="inspection-trace-counts">${escapeHtml(trace.event_count || 0)} events · ${escapeHtml(trace.warning_count || 0)} warnings · ${escapeHtml(trace.error_count || 0)} errors</span>
+        <span class="muted">${formatShortTime(trace.started_at)}</span>
+      </button>
+    `;
+  }).join("");
+}
+
+function renderInspectionSummary(trace = {}) {
+  if (!agentInspectionSummary) return;
+  const subject = [trace.subject_type, trace.subject_id].filter(Boolean).join(":") || "未绑定业务对象";
+  agentInspectionSummary.innerHTML = `
+    <div class="agent-panel-head">
+      <div>
+        <span class="eyebrow">Trace Summary</span>
+        <h3>${escapeHtml(trace.title || trace.trace_id || "Inspection")}</h3>
+        <p class="muted">${escapeHtml(trace.summary || subject)}</p>
+      </div>
+      <span class="agent-activity-chip ${inspectionTone(trace.status)}">${escapeHtml(trace.status || "unknown")}</span>
+    </div>
+    <div class="inspection-summary-grid">
+      <span><b>${escapeHtml(trace.event_count || 0)}</b> Events</span>
+      <span><b>${escapeHtml(trace.warning_count || 0)}</b> Warnings</span>
+      <span><b>${escapeHtml(trace.error_count || 0)}</b> Errors</span>
+      <span><b>${escapeHtml(trace.completeness || "complete")}</b> Completeness</span>
+    </div>
+    <div class="agent-item-note">${escapeHtml(trace.trace_id || "")} · ${escapeHtml(subject)}</div>
+  `;
+}
+
+function filteredInspectionEvents() {
+  const query = String(agentInspectionEventSearch?.value || "").trim().toLowerCase();
+  const kind = String(agentInspectionEventKind?.value || "");
+  const severity = String(agentInspectionSeverity?.value || "");
+  return agentInspectionEvents.filter((item) => {
+    if (kind && item.event_kind !== kind) return false;
+    if (severity && item.severity !== severity) return false;
+    if (!query) return true;
+    return [item.title, item.operation, item.target_type, item.target_id, item.event_id]
+      .map((value) => String(value || "").toLowerCase())
+      .some((value) => value.includes(query));
+  });
+}
+
+function renderInspectionEvents() {
+  if (!agentInspectionEventList) return;
+  const rows = filteredInspectionEvents();
+  if (!rows.length) {
+    setStatus(agentInspectionEventList, activeInspectionTrace ? "当前筛选没有事件" : "选择一个 Trace 查看 Event Index");
+    return;
+  }
+  agentInspectionEventList.innerHTML = rows.map((item) => `
+    <button class="agent-activity-row inspection-event-row ${inspectionTone(item.status, item.severity)}" type="button" data-inspection-event-id="${escapeHtml(item.event_id)}">
+      <span>${String(item.sequence_no || 0).padStart(2, "0")}</span>
+      <span class="agent-activity-chip ${inspectionTone(item.status, item.severity)}">${escapeHtml(item.event_kind)}</span>
+      <strong>${escapeHtml(item.title || item.operation || item.event_id)}</strong>
+      <span class="truncate">${escapeHtml(item.actor_id || item.actor_type || "system")} · ${escapeHtml(item.duration_ms == null ? "-" : `${Number(item.duration_ms).toFixed(0)}ms`)}</span>
+    </button>
+  `).join("");
+}
+
+async function loadInspectionTraces() {
+  const params = new URLSearchParams({
+    actor_type: "human",
+    actor_id: "local_user",
+    limit: "100",
+  });
+  const query = String(agentInspectionTraceSearch?.value || "").trim();
+  const status = String(agentInspectionTraceStatus?.value || "");
+  if (query) params.set("q", query);
+  if (status) params.set("status", status);
+  const payload = await fetchJson(`/api/agent/inspection/traces?${params.toString()}`);
+  renderInspectionTraces(payload.data || {});
+}
+
+async function openInspectionTrace(traceId) {
+  const encoded = encodeURIComponent(traceId);
+  const [tracePayload, eventsPayload] = await Promise.all([
+    fetchJson(`/api/agent/inspection/traces/${encoded}?actor_type=human&actor_id=local_user`),
+    fetchJson(`/api/agent/inspection/traces/${encoded}/events?actor_type=human&actor_id=local_user&limit=500`),
+  ]);
+  activeInspectionTrace = tracePayload.data || null;
+  agentInspectionEvents = eventsPayload.data?.items || [];
+  renderInspectionTraces({ items: agentInspectionTraces });
+  renderInspectionSummary(activeInspectionTrace || {});
+  renderInspectionEvents();
+}
+
+async function openInspectionEvent(eventId) {
+  const payload = await fetchJson(`/api/agent/inspection/events/${encodeURIComponent(eventId)}?actor_type=human&actor_id=local_user`);
+  const item = payload.data || {};
+  if (!agentAuditModal || !agentAuditBody) return;
+  if (agentAuditTitle) agentAuditTitle.textContent = item.title || item.event_id || "Inspection Event";
+  if (agentAuditSubtitle) {
+    agentAuditSubtitle.textContent = `${item.event_kind || "event"} · ${item.status || "unknown"} · ${item.event_id || ""}`;
+  }
+  agentAuditBody.innerHTML = `
+    <div class="agent-audit-hero">
+      <div><span class="agent-audit-label">Operation</span><strong>${escapeHtml(item.operation || "-")}</strong></div>
+      <div><span class="agent-audit-label">Actor</span><strong>${escapeHtml(item.actor_id || item.actor_type || "-")}</strong></div>
+      <div><span class="agent-audit-label">Duration</span><strong>${escapeHtml(item.duration_ms == null ? "-" : `${Number(item.duration_ms).toFixed(0)} ms`)}</strong></div>
+    </div>
+    ${agentAuditJsonBlock("Input", item.input || {})}
+    ${agentAuditJsonBlock("Output", item.output || {})}
+    ${agentAuditJsonBlock("Error", item.error || {})}
+    ${agentAuditJsonBlock("Relations", item.relations || {})}
+    ${agentAuditJsonBlock("References", item.references || [])}
+    ${agentAuditJsonBlock("Metadata", item.metadata || {})}
+    ${agentAuditJsonBlock("Redaction", item.redaction || {})}
+  `;
+  agentAuditModal.hidden = false;
+}
+
+function renderAgentDashboard(data = {}, auditRows = [], changePayload = {}, researchRows = [], inspectionPayload = {}) {
   const pending = data.pending_approvals || [];
   const drafts = data.drafts || [];
   const changeRows = Array.isArray(changePayload.items) ? changePayload.items : [];
   const externalRows = auditRows.filter((row) => agentActorGroup(row) === "external");
   if (agentMeta) {
     const limits = data.policy?.limits || {};
-    agentMeta.innerHTML = `图谱变更: ${escapeHtml(changeRows.length)} | 外接: ${escapeHtml(externalRows.length)} | 待确认: ${escapeHtml(pending.length)} | 草案: ${escapeHtml(drafts.length)} | 单策略上限: ${formatFixed(limits.max_strategy_budget_usdc, 2)} USDC`;
+    agentMeta.innerHTML = `研究任务: ${escapeHtml(researchRows.length)} | 图谱变更: ${escapeHtml(changeRows.length)} | 外接: ${escapeHtml(externalRows.length)} | 待确认: ${escapeHtml(pending.length)} | 草案: ${escapeHtml(drafts.length)} | 单策略上限: ${formatFixed(limits.max_strategy_budget_usdc, 2)} USDC`;
   }
   renderAgentOverview(data, auditRows, changePayload);
   renderAgentGraphChanges(changePayload, auditRows);
   renderAgentPendingApprovals(pending);
   renderAgentActivity(auditRows);
   renderAgentDrafts(drafts);
+  renderResearchSessions(researchRows);
+  renderInspectionTraces(inspectionPayload);
 }
 
 async function loadAgentDashboard(options = {}) {
@@ -1854,13 +2100,22 @@ async function loadAgentDashboard(options = {}) {
     setStatus(agentPendingApprovals, "加载中...");
     setStatus(agentActivityList, "加载中...");
     setStatus(agentDraftList, "加载中...");
+    setStatus(agentResearchSessionList, "加载中...");
   }
-  const [dashboardPayload, auditPayload, changePayload] = await Promise.all([
+  const [dashboardPayload, auditPayload, changePayload, researchPayload, inspectionPayload] = await Promise.all([
     fetchJson("/api/agent/dashboard?limit=50"),
     fetchJson("/api/agent/audit?limit=300&actor_type=human&actor_id=local_user"),
     fetchJson("/api/agent/event-graph/change-requests?limit=80&actor_type=agent&actor_id=agent_strategy_assistant"),
+    fetchJson("/api/agent/research/sessions?limit=100&actor_type=human&actor_id=local_user"),
+    fetchJson("/api/agent/inspection/traces?limit=100&actor_type=human&actor_id=local_user"),
   ]);
-  renderAgentDashboard(dashboardPayload.data || {}, auditPayload.data || [], changePayload.data || {});
+  renderAgentDashboard(
+    dashboardPayload.data || {},
+    auditPayload.data || [],
+    changePayload.data || {},
+    researchPayload.data || [],
+    inspectionPayload.data || {},
+  );
   hasLoadedAgentDashboard = true;
 }
 
@@ -1885,7 +2140,56 @@ document.querySelector(".agent-workbench")?.addEventListener("click", async (eve
   const graphToApply = button.dataset.agentGraphApply;
   const graphToApproveApply = button.dataset.agentGraphApproveApply;
   const activityCategory = button.dataset.agentActivityCategory;
+  const researchSessionView = button.dataset.researchSessionView;
+  const researchSessionPause = button.dataset.researchSessionPause;
+  const researchSessionContinue = button.dataset.researchSessionContinue;
+  const researchSessionAnswer = button.dataset.researchSessionAnswer;
+  const inspectionTraceId = button.dataset.inspectionTraceId;
+  const inspectionEventId = button.dataset.inspectionEventId;
   try {
+    if (inspectionTraceId) {
+      button.disabled = true;
+      await openInspectionTrace(inspectionTraceId);
+      return;
+    }
+    if (inspectionEventId) {
+      button.disabled = true;
+      await openInspectionEvent(inspectionEventId);
+      return;
+    }
+    if (researchSessionView) {
+      button.disabled = true;
+      await openResearchSession(researchSessionView);
+      button.disabled = false;
+      return;
+    }
+    if (researchSessionPause) {
+      button.disabled = true;
+      await postAgentAction(`/api/agent/research/sessions/${encodeURIComponent(researchSessionPause)}/status`, {
+        actor_type: "human", actor_id: "local_user", status: "PAUSED", message: "用户从 AgentMonitor 暂停研究",
+      });
+      await loadAgentDashboard({ silent: true });
+      return;
+    }
+    if (researchSessionContinue) {
+      button.disabled = true;
+      await postAgentAction(`/api/agent/research/sessions/${encodeURIComponent(researchSessionContinue)}/continue`, {
+        actor_type: "human", actor_id: "local_user",
+      });
+      await loadAgentDashboard({ silent: true });
+      return;
+    }
+    if (researchSessionAnswer) {
+      const answer = prompt("补充信息", "");
+      if (answer === null || !answer.trim()) return;
+      button.disabled = true;
+      await postAgentAction(`/api/agent/research/sessions/${encodeURIComponent(researchSessionAnswer)}/answer`, {
+        actor_type: "human", actor_id: "local_user", answer,
+      });
+      await loadAgentDashboard({ silent: true });
+      await openResearchSession(researchSessionAnswer);
+      return;
+    }
     if (button.id === "graphChangeApproveApplyReadyBtn") {
       await runGraphChangeBulkAction("approveApply", button);
       return;
@@ -2095,6 +2399,19 @@ agentAuditModal?.addEventListener("click", (event) => {
 
 agentActivitySearch?.addEventListener("input", () => renderAgentActivity(agentAuditRows));
 agentActivityCategory?.addEventListener("change", () => renderAgentActivity(agentAuditRows));
+agentInspectionTraceSearchBtn?.addEventListener("click", () => loadInspectionTraces().catch((error) => {
+  setStatus(agentInspectionTraceList, error.message || "Trace 搜索失败");
+}));
+agentInspectionTraceSearch?.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    agentInspectionTraceSearchBtn?.click();
+  }
+});
+agentInspectionTraceStatus?.addEventListener("change", () => agentInspectionTraceSearchBtn?.click());
+agentInspectionEventSearch?.addEventListener("input", renderInspectionEvents);
+agentInspectionEventKind?.addEventListener("change", renderInspectionEvents);
+agentInspectionSeverity?.addEventListener("change", renderInspectionEvents);
 agentActivityPinBtn?.addEventListener("click", () => {
   const selected = currentAgentActivityCategory();
   const pinned = localStorage.getItem(AGENT_ACTIVITY_PIN_KEY) || "all";
@@ -2109,7 +2426,7 @@ agentActivityClearBtn?.addEventListener("click", async () => {
   const ids = filteredAgentAuditRows.map((event) => event.event_id).filter(Boolean);
   if (!ids.length) return;
   const category = agentAuditCategoryMeta(currentAgentActivityCategory()).label;
-  if (!confirm(`确认清除当前筛选下的 ${ids.length} 条 Activity？类别：${category}`)) return;
+  if (!confirm(`确认从当前视图隐藏 ${ids.length} 条 Activity？底层审计证据仍会保留。类别：${category}`)) return;
   agentActivityClearBtn.disabled = true;
   try {
     await fetchJson("/api/agent/audit", {
@@ -2123,7 +2440,7 @@ agentActivityClearBtn?.addEventListener("click", async () => {
     });
     await loadAgentDashboard({ silent: true });
   } catch (error) {
-    alert("清除失败: " + (error.message || String(error)));
+    alert("隐藏失败: " + (error.message || String(error)));
   } finally {
     agentActivityClearBtn.disabled = false;
   }
@@ -2292,4 +2609,5 @@ loadAgentDashboard()
     setStatus(agentPendingApprovals, error.message);
     setStatus(agentActivityList, error.message);
     setStatus(agentDraftList, error.message);
+    setStatus(agentResearchSessionList, error.message);
   });

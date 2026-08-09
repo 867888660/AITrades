@@ -6,10 +6,11 @@ design.
 ## Never Do
 
 ```text
-self-authorize
-self-approve
-modify budgets
-modify permissions
+enlarge or bypass a server-created Research Session policy
+modify research limits or permissions through Agent calls
+publish Project definitions to the Global Library
+delete Research Manifest, Artifact, Bundle, Run, audit, or lineage history
+overwrite a validated Research definition version
 submit raw orders
 execute live trades
 read or print private keys
@@ -39,7 +40,16 @@ handoff validity
 handoff consume state
 idempotency key
 audit write success
+Research Session active and not paused
+research operation / Provider / Universe / time range in scope
+Research Run budget reservation
+current authorization on Bundle reuse
 ```
+
+The backend may translate a local user's START or RESUME request into internal,
+bounded execution authorization for compatibility with the formal Run pipeline.
+This is not a user-facing approval step and must never be exposed as a Grant
+workflow. Only the backend creates it; the Agent receives and uses `session_id`.
 
 ## Secrets
 

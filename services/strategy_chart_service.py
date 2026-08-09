@@ -12,10 +12,10 @@ from typing import Any, Dict, List, Tuple
 
 from services.config_loader import BASE_DIR, get_market_realtime_db_path, load_web_settings
 from services.polymarket_service import (
-    build_workspace_market_detail,
     fetch_strategy_detail,
     get_strategy_chart_capabilities,
     get_strategy_chart_defaults,
+    get_strategy_leg_snapshots,
     resolve_market_selection,
 )
 from services import strategy_data_source
@@ -27,8 +27,10 @@ from services.history_data_service import (
     get_backtest_workspace_strategy,
 )
 from services.strategy_event_service import list_strategy_events
+from services.strategy_display import preferred_leg_display_name
 from services.strategy_stats_store import get_strategy_stats_db_path
 from services.strategy_metric_store import load_metric_events
+from services.virtual_liquidation import liquidate_position, normalize_book_levels
 
 
 _SERIES_CONFIG: Dict[str, Dict[str, str]] = {
@@ -40,10 +42,13 @@ _SERIES_CONFIG: Dict[str, Dict[str, str]] = {
     "no_mid": {"label": "No Mid", "panel": "main", "render": "line", "unit": "price", "category": "price"},
     "yes_position": {"label": "Yes Position", "panel": "positions", "render": "step", "unit": "ratio", "category": "position"},
     "no_position": {"label": "No Position", "panel": "positions", "render": "step", "unit": "ratio", "category": "position"},
+    "position": {"label": "Position", "panel": "positions", "render": "step", "unit": "qty", "category": "position"},
     "yes_qty": {"label": "Yes Qty", "panel": "sizes", "render": "step", "unit": "qty", "category": "size"},
     "no_qty": {"label": "No Qty", "panel": "sizes", "render": "step", "unit": "qty", "category": "size"},
+    "qty": {"label": "Qty", "panel": "sizes", "render": "step", "unit": "qty", "category": "size"},
     "yes_avg": {"label": "Yes Avg", "panel": "averages", "render": "line", "unit": "price", "category": "average"},
     "no_avg": {"label": "No Avg", "panel": "averages", "render": "line", "unit": "price", "category": "average"},
+    "avg": {"label": "Avg", "panel": "averages", "render": "line", "unit": "price", "category": "average"},
     "strategy_pnl": {"label": "Strategy PnL", "panel": "capital", "render": "line", "unit": "currency", "category": "capital"},
     "strategy_bankroll": {"label": "Strategy Bankroll", "panel": "capital", "render": "line", "unit": "currency", "category": "capital"},
     "initial_capital": {"label": "Initial Capital", "panel": "capital", "render": "line", "unit": "currency", "category": "capital"},
@@ -62,6 +67,10 @@ _PANEL_TITLES = {
     "market_supply": "Market Supply",
     "indicator_macd": "MACD",
     "metric_values": "Strategy Metrics",
+    "leg_positions": "Leg Positions",
+    "leg_position_metrics": "Leg-Cap Position Metrics",
+    "leg_edges": "Leg Edge / Probability",
+    "leg_rank": "Leg Rank",
     "metric_states": "State Lanes",
     "backtest_metrics": "Backtest Metrics",
     "backtest_states": "Backtest State",
@@ -129,7 +138,31 @@ _BACKTEST_SERIES_CONFIG = [
         "removable": True,
     },
 ]
-_PRICE_DETAIL_KEYS = {"yes_bid", "yes_ask", "no_bid", "no_ask", "yes_last_price", "no_last_price", "yes_mid", "no_mid"}
+_PRICE_DETAIL_KEYS = {
+    "yes_bid",
+    "yes_ask",
+    "yes_bid_levels",
+    "yes_ask_levels",
+    "no_bid",
+    "no_ask",
+    "no_bid_levels",
+    "no_ask_levels",
+    "yes_last_price",
+    "no_last_price",
+    "yes_mid",
+    "no_mid",
+}
+_LEG_POSITION_DETAIL_KEYS = {
+    "yes_position",
+    "no_position",
+    "position",
+    "yes_qty",
+    "no_qty",
+    "qty",
+    "yes_avg",
+    "no_avg",
+    "avg",
+}
 _STATS_DETAIL_KEYS = {
     "yes_qty",
     "no_qty",
@@ -144,6 +177,7 @@ _STATS_DETAIL_KEYS = {
     "realized_profit",
 }
 _PRICE_FORWARD_FILL_MAX_SECONDS = 300
+_DEFAULT_CHART_METRIC_LIMIT = 16
 
 
 def _is_price_field(key: str) -> bool:
@@ -157,10 +191,14 @@ def _is_price_field(key: str) -> bool:
         or text.endswith("_ohlc")
         or text.endswith("_yes_bid")
         or text.endswith("_yes_ask")
+        or text.endswith("_yes_bid_levels")
+        or text.endswith("_yes_ask_levels")
         or text.endswith("_yes_mid")
         or text.endswith("_yes_last_price")
         or text.endswith("_no_bid")
         or text.endswith("_no_ask")
+        or text.endswith("_no_bid_levels")
+        or text.endswith("_no_ask_levels")
         or text.endswith("_no_mid")
         or text.endswith("_no_last_price")
     )
@@ -215,6 +253,18 @@ def _parse_iso(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _strategy_end_at(detail: Dict[str, Any]) -> datetime | None:
+    raw = detail.get("raw") if isinstance(detail.get("raw"), dict) else {}
+    editable = detail.get("editable") if isinstance(detail.get("editable"), dict) else {}
+    return _parse_iso(
+        detail.get("end_date")
+        or raw.get("Enddate")
+        or raw.get("end_date")
+        or editable.get("Enddate")
+        or editable.get("end_date")
+    )
 
 
 def _iso_utc(value: datetime) -> str:
@@ -464,7 +514,13 @@ def _resolve_time_bounds(args: Dict[str, Any], defaults: Dict[str, Any]) -> tupl
     from_dt = _parse_iso(args.get("from"))
     if from_dt is None:
         range_text = str(args.get("range") or defaults.get("range") or "1d").strip().lower()
-        if range_text.endswith("w"):
+        if range_text == "ytd":
+            from_dt = datetime(to_dt.year, 1, 1, tzinfo=timezone.utc)
+        elif range_text == "all":
+            from_dt = datetime(2015, 1, 1, tzinfo=timezone.utc)
+        elif range_text.endswith("mo"):
+            from_dt = to_dt - timedelta(days=30 * max(1, int(range_text[:-2] or 1)))
+        elif range_text.endswith("w"):
             from_dt = to_dt - timedelta(days=7 * max(1, int(range_text[:-1] or 1)))
         elif range_text.endswith("d"):
             from_dt = to_dt - timedelta(days=max(1, int(range_text[:-1] or 1)))
@@ -1392,9 +1448,13 @@ def _detail_sample(detail: Dict[str, Any], interval_seconds: int, from_ts: str, 
     sample = {
         "yes_bid": _safe_binary_quote(detail.get("yes_bid")),
         "yes_ask": _safe_binary_quote(detail.get("yes_ask")),
+        "yes_bid_levels": normalize_book_levels(detail.get("yes_bid_levels") or [], side="bid"),
+        "yes_ask_levels": normalize_book_levels(detail.get("yes_ask_levels") or [], side="ask"),
         "yes_last_price": _safe_binary_quote(detail.get("yes_last_price")),
         "no_bid": _safe_binary_quote(detail.get("no_bid")),
         "no_ask": _safe_binary_quote(detail.get("no_ask")),
+        "no_bid_levels": normalize_book_levels(detail.get("no_bid_levels") or [], side="bid"),
+        "no_ask_levels": normalize_book_levels(detail.get("no_ask_levels") or [], side="ask"),
         "no_last_price": _safe_binary_quote(detail.get("no_last_price")),
         "yes_qty": _safe_float(detail.get("yes_qty")),
         "no_qty": _safe_float(detail.get("no_qty")),
@@ -1402,6 +1462,9 @@ def _detail_sample(detail: Dict[str, Any], interval_seconds: int, from_ts: str, 
         "no_avg": _safe_float(detail.get("no_avg")),
         "yes_position": _safe_float(detail.get("yes_position")),
         "no_position": _safe_float(detail.get("no_position")),
+        "position": _safe_float(detail.get("position") or detail.get("position_qty") or detail.get("qty")),
+        "qty": _safe_float(detail.get("qty") or detail.get("position_qty") or detail.get("yes_qty")),
+        "avg": _safe_float(detail.get("avg") or detail.get("avg_price") or detail.get("yes_avg")),
         "strategy_pnl": _safe_float(detail.get("strategy_pnl")),
         "strategy_bankroll": _safe_float(detail.get("strategy_bankroll")),
         "initial_capital": _safe_float(editable.get("initial_capital")),
@@ -1420,6 +1483,33 @@ def _detail_sample(detail: Dict[str, Any], interval_seconds: int, from_ts: str, 
     sample["ts"] = ts
     _fill_binary_complements(sample, infer_bid_ask=False)
     return {ts: sample}
+
+
+def _leg_position_sample(
+    detail: Dict[str, Any],
+    interval_seconds: int,
+    from_ts: str,
+    to_ts: str,
+) -> Dict[str, Dict[str, Any]]:
+    """Return the latest leg position snapshot without requiring a remote quote."""
+    sample = {
+        key: _safe_float(detail.get(key))
+        for key in _LEG_POSITION_DETAIL_KEYS
+    }
+    if not any(value is not None for value in sample.values()):
+        return {}
+    updated_at = detail.get("position_updated_at") or detail.get("market_updated_at") or to_ts
+    updated_dt = _parse_iso(updated_at) or _parse_iso(to_ts)
+    from_dt = _parse_iso(from_ts)
+    to_dt = _parse_iso(to_ts)
+    if updated_dt is None:
+        return {}
+    # A current snapshot is still useful for a historical chart; place it at the
+    # right edge instead of dropping the leg entirely when its last update is old.
+    if from_dt is not None and to_dt is not None and not (from_dt <= updated_dt <= to_dt):
+        updated_dt = to_dt
+    bucket = _bucket_ts(updated_dt.isoformat(), interval_seconds)
+    return {bucket: {"ts": bucket, **{key: value for key, value in sample.items() if value is not None}}}
 
 
 def _merge_samples(*sample_maps: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1494,11 +1584,51 @@ def _sync_row_pnl_to_visible_prices(rows: List[Dict[str, Any]]) -> None:
             row.pop("strategy_pnl", None)
 
 
-def _position_mark(row: Dict[str, Any], side: str, avg_price: float) -> float:
+def _position_mark(row: Dict[str, Any], side: str, avg_price: float, leg_index: int = 0) -> float:
     prefix = "yes" if side.upper() == "YES" else "no"
-    bid = _safe_float(row.get(f"market_0_{prefix}_bid") or row.get(f"{prefix}_bid"))
-    ask = _safe_float(row.get(f"market_0_{prefix}_ask") or row.get(f"{prefix}_ask"))
+    bid = _safe_float(row.get(f"market_{leg_index}_{prefix}_bid"))
+    ask = _safe_float(row.get(f"market_{leg_index}_{prefix}_ask"))
+    if leg_index == 0:
+        bid = bid if bid is not None else _safe_float(row.get(f"{prefix}_bid"))
+        ask = ask if ask is not None else _safe_float(row.get(f"{prefix}_ask"))
     return bid if bid is not None and bid > 0 else (ask if ask is not None and ask > 0 else avg_price)
+
+
+def _can_overlay_detail_pnl(detail: Dict[str, Any]) -> bool:
+    """Return whether the current detail PnL is based on a live position mark."""
+    source = str(detail.get("pnl_source") or "").strip().lower()
+    return source != "virtual_account_partial_cost_fallback"
+
+
+def _position_liquidation(
+    row: Dict[str, Any],
+    side: str,
+    qty: float,
+    fee_rate: float,
+    detail: Dict[str, Any] | None = None,
+    leg_index: int = 0,
+) -> Dict[str, Any]:
+    prefix = "yes" if side.upper() == "YES" else "no"
+    bid = _safe_float(row.get(f"market_{leg_index}_{prefix}_bid"))
+    ask = _safe_float(row.get(f"market_{leg_index}_{prefix}_ask"))
+    levels = row.get(f"market_{leg_index}_{prefix}_bid_levels") or []
+    if leg_index == 0:
+        bid = bid if bid is not None else _safe_float(row.get(f"{prefix}_bid"))
+        ask = ask if ask is not None else _safe_float(row.get(f"{prefix}_ask"))
+        levels = levels or row.get(f"{prefix}_bid_levels") or []
+    if not levels and detail:
+        leg_detail = next(
+            (
+                item for item in (detail.get("legs_snapshot") or [])
+                if int(item.get("leg_index") or 0) == int(leg_index)
+            ),
+            detail if leg_index == 0 else {},
+        )
+        levels = leg_detail.get(f"{prefix}_bid_levels") or []
+        bid = bid if bid is not None else _safe_float(leg_detail.get(f"{prefix}_bid"))
+        ask = ask if ask is not None else _safe_float(leg_detail.get(f"{prefix}_ask") or leg_detail.get(f"{prefix}_mark"))
+    fallback = bid if bid is not None and bid > 0 else ask
+    return liquidate_position(qty, fallback, fee_rate, bid_levels=levels)
 
 
 def _position_budget(detail: Dict[str, Any], account: sqlite3.Row | Dict[str, Any] | None = None) -> float:
@@ -1511,6 +1641,44 @@ def _position_budget(detail: Dict[str, Any], account: sqlite3.Row | Dict[str, An
         except Exception:
             budget = None
     return budget if budget is not None and budget > 0 else 0.0
+
+
+def _append_current_multileg_snapshot(
+    rows: List[Dict[str, Any]],
+    detail: Dict[str, Any],
+    from_ts: str,
+    to_ts: str,
+) -> str | None:
+    snapshots = detail.get("legs_snapshot") or []
+    if len(snapshots) <= 1:
+        return None
+    timestamps = [
+        _parse_iso(item.get("updated_at") or item.get("market_updated_at"))
+        for item in snapshots
+    ]
+    timestamps = [item for item in timestamps if item is not None]
+    if not timestamps:
+        return None
+    snapshot_dt = max(timestamps)
+    from_dt = _parse_iso(from_ts)
+    to_dt = _parse_iso(to_ts)
+    if (from_dt and snapshot_dt < from_dt) or (to_dt and snapshot_dt > to_dt):
+        return None
+    ts = snapshot_dt.isoformat()
+    current = dict(rows[-1]) if rows else {}
+    current["ts"] = ts
+    for item in snapshots:
+        leg_index = int(item.get("leg_index") or 0)
+        for side in ("yes", "no"):
+            for field in ("bid", "ask", "bid_levels"):
+                value = item.get(f"{side}_{field}")
+                if value is not None:
+                    current[f"market_{leg_index}_{side}_{field}"] = value
+                    if leg_index == 0:
+                        current[f"{side}_{field}"] = value
+    rows.append(current)
+    rows.sort(key=lambda item: _parse_iso(item.get("ts")) or datetime.min.replace(tzinfo=timezone.utc))
+    return ts
 
 
 def _infer_row_interval_seconds(rows: List[Dict[str, Any]]) -> int:
@@ -1576,7 +1744,8 @@ def _apply_virtual_account_pnl_to_rows(detail: Dict[str, Any], rows: List[Dict[s
         ).fetchone()
         orders = conn.execute(
             """
-            SELECT action, side, qty, price, fee_rate, net_cash_change, created_at_utc
+            SELECT id, leg_index, action, side, qty, price, gross_notional, fee_rate, fee,
+                   net_cash_change, liquidity_role, status, reason, created_at_utc
             FROM strategy_virtual_orders
             WHERE strategy_id = ? AND status = 'filled'
             ORDER BY created_at_utc ASC, id ASC
@@ -1596,14 +1765,19 @@ def _apply_virtual_account_pnl_to_rows(detail: Dict[str, Any], rows: List[Dict[s
         "YES": {"qty": 0.0, "avg": 0.0, "fee_rate": 0.0},
         "NO": {"qty": 0.0, "avg": 0.0, "fee_rate": 0.0},
     }
+    leg_positions: Dict[int, Dict[str, Dict[str, float]]] = {}
     order_items = []
+    end_at = _strategy_end_at(detail)
     for order in orders:
         ts = _parse_iso(order["created_at_utc"])
         if ts is None:
             continue
+        if end_at is not None and ts > end_at:
+            continue
         order_items.append((ts, dict(order)))
 
     idx = 0
+    last_valid_pnl = None
     interval_seconds = chart_interval_seconds if chart_interval_seconds > 0 else _infer_row_interval_seconds(rows)
     order_points = {
         _iso_utc_exact(order_ts)
@@ -1614,7 +1788,7 @@ def _apply_virtual_account_pnl_to_rows(detail: Dict[str, Any], rows: List[Dict[s
     # Collect per-bucket aggregated trades for chart events
     bucket_trades: Dict[str, List[Dict[str, Any]]] = {}
 
-    for row in rows:
+    for row_index, row in enumerate(rows):
         row_dt = _parse_iso(row.get("ts"))
         if row_dt is None:
             continue
@@ -1628,23 +1802,53 @@ def _apply_virtual_account_pnl_to_rows(detail: Dict[str, Any], rows: List[Dict[s
             side = str(order.get("side") or "").upper()
             if side not in positions:
                 continue
+            leg_index = int(order.get("leg_index") or 0)
+            leg_state = leg_positions.setdefault(
+                leg_index,
+                {
+                    "YES": {"qty": 0.0, "avg": 0.0, "fee_rate": 0.0},
+                    "NO": {"qty": 0.0, "avg": 0.0, "fee_rate": 0.0},
+                },
+            )
             qty = _safe_float(order.get("qty")) or 0.0
             price = _safe_float(order.get("price")) or 0.0
             fee_rate = _safe_float(order.get("fee_rate")) or 0.0
             cash += _safe_float(order.get("net_cash_change")) or 0.0
             action = str(order.get("action") or "BUY").upper()
             pos = positions[side]
+            leg_pos = leg_state[side]
+            leg_qty_before = float(leg_pos["qty"] or 0.0)
             if action == "BUY":
                 new_qty = pos["qty"] + qty
                 pos["avg"] = ((pos["qty"] * pos["avg"]) + (qty * price)) / new_qty if new_qty > 0 else 0.0
                 pos["qty"] = new_qty
                 pos["fee_rate"] = fee_rate
+                leg_new_qty = leg_pos["qty"] + qty
+                leg_pos["avg"] = ((leg_pos["qty"] * leg_pos["avg"]) + (qty * price)) / leg_new_qty if leg_new_qty > 0 else 0.0
+                leg_pos["qty"] = leg_new_qty
+                leg_pos["fee_rate"] = fee_rate
             else:
                 pos["qty"] = max(0.0, pos["qty"] - qty)
                 pos["fee_rate"] = fee_rate or pos["fee_rate"]
+                leg_pos["qty"] = max(0.0, leg_pos["qty"] - qty)
+                leg_pos["fee_rate"] = fee_rate or leg_pos["fee_rate"]
+            leg_qty_after = float(leg_pos["qty"] or 0.0)
             if order_point_ts == row_ts_str:
                 bucket_trades.setdefault(row_ts_str, []).append({
-                    "action": action, "side": side, "qty": qty, "price": price,
+                    "order_ref": str(order.get("id") or ""),
+                    "leg_index": leg_index,
+                    "action": action,
+                    "side": side,
+                    "qty": qty,
+                    "price": price,
+                    "gross_notional": _safe_float(order.get("gross_notional")),
+                    "fee": _safe_float(order.get("fee")),
+                    "net_cash_change": _safe_float(order.get("net_cash_change")),
+                    "liquidity_role": str(order.get("liquidity_role") or ""),
+                    "status": str(order.get("status") or "filled").lower(),
+                    "reason": str(order.get("reason") or ""),
+                    "position_qty_before": leg_qty_before,
+                    "position_qty_after": leg_qty_after,
                 })
 
         row["yes_qty"] = float(positions["YES"]["qty"] or 0.0)
@@ -1656,32 +1860,119 @@ def _apply_virtual_account_pnl_to_rows(detail: Dict[str, Any], rows: List[Dict[s
         allocation_base = max(0.0, cash) + yes_cost + no_cost
         row["yes_position"] = (yes_cost / allocation_base) if allocation_base > 0 else 0.0
         row["no_position"] = (no_cost / allocation_base) if allocation_base > 0 else 0.0
+        for leg_index, leg_state in leg_positions.items():
+            yes_leg = leg_state["YES"]
+            no_leg = leg_state["NO"]
+            yes_leg_cost = float(yes_leg["qty"] or 0.0) * float(yes_leg["avg"] or 0.0)
+            no_leg_cost = float(no_leg["qty"] or 0.0) * float(no_leg["avg"] or 0.0)
+            row[f"market_{leg_index}_yes_position"] = yes_leg_cost / allocation_base if allocation_base > 0 else 0.0
+            row[f"market_{leg_index}_no_position"] = no_leg_cost / allocation_base if allocation_base > 0 else 0.0
+            row[f"market_{leg_index}_yes_qty"] = float(yes_leg["qty"] or 0.0)
+            row[f"market_{leg_index}_no_qty"] = float(no_leg["qty"] or 0.0)
+            row[f"market_{leg_index}_yes_avg"] = float(yes_leg["avg"] or 0.0) if yes_leg["qty"] > 0 else 0.0
+            row[f"market_{leg_index}_no_avg"] = float(no_leg["avg"] or 0.0) if no_leg["qty"] > 0 else 0.0
+
+        previous_row = rows[row_index - 1] if row_index > 0 else {}
+        for trade in bucket_trades.get(row_ts_str, []):
+            position_key = f"market_{int(trade.get('leg_index') or 0)}_{str(trade.get('side') or '').lower()}_position"
+            trade["position_before"] = _safe_float(previous_row.get(position_key)) or 0.0
+            trade["position_after"] = _safe_float(row.get(position_key)) or 0.0
+
+        if end_at is not None and row_dt > end_at:
+            if last_valid_pnl is not None:
+                row["strategy_pnl"] = last_valid_pnl
+                row["pnl_source"] = "virtual_order_replay_expired_frozen"
+            else:
+                open_cost = sum(
+                    float(pos.get("qty") or 0.0) * float(pos.get("avg") or 0.0)
+                    for leg_state in leg_positions.values()
+                    for pos in leg_state.values()
+                )
+                row["strategy_pnl"] = cash + open_cost - initial_cash
+                row["pnl_source"] = "virtual_order_replay_expired_cost_fallback"
+            continue
 
         liquidation_value = 0.0
         estimated_exit_fees = 0.0
-        for side, pos in positions.items():
-            qty = float(pos["qty"] or 0.0)
-            avg = float(pos["avg"] or 0.0)
-            if qty <= 0 or avg <= 0:
-                continue
-            mark = _position_mark(row, side, avg)
-            liquidation_value += qty * mark
-            estimated_exit_fees += qty * float(pos["fee_rate"] or 0.0) * mark * (1.0 - mark)
+        missing_open_mark = False
+        # Each leg is a distinct market. Never net or mark positions from
+        # different legs with the primary market's quote.
+        for leg_index, leg_state in leg_positions.items():
+            for side, pos in leg_state.items():
+                qty = float(pos["qty"] or 0.0)
+                avg = float(pos["avg"] or 0.0)
+                if qty <= 0 or avg <= 0:
+                    continue
+                liquidation = _position_liquidation(
+                    row,
+                    side,
+                    qty,
+                    float(pos["fee_rate"] or 0.0),
+                    detail if row_index == len(rows) - 1 else None,
+                    leg_index=leg_index,
+                )
+                if liquidation.get("filled_qty", 0.0) <= 0:
+                    mark = _position_mark(row, side, 0.0, leg_index=leg_index)
+                    if mark <= 0:
+                        missing_open_mark = True
+                        continue
+                    liquidation_value += qty * mark
+                    estimated_exit_fees += qty * float(pos["fee_rate"] or 0.0) * mark * (1.0 - mark)
+                else:
+                    liquidation_value += float(liquidation.get("gross") or 0.0)
+                    estimated_exit_fees += float(liquidation.get("fee") or 0.0)
+                    key = f"market_{leg_index}_{side.lower()}"
+                    row[f"{key}_liquidation_vwap"] = liquidation.get("vwap")
+                    row[f"{key}_liquidation_filled_qty"] = liquidation.get("filled_qty")
+                    row[f"{key}_liquidation_depth_limited"] = liquidation.get("depth_limited")
+        if missing_open_mark:
+            if last_valid_pnl is not None:
+                row["strategy_pnl"] = last_valid_pnl
+                row["pnl_source"] = "virtual_order_replay_last_valid_mark"
+            else:
+                row.pop("strategy_pnl", None)
+                row["pnl_source"] = "virtual_order_replay_missing_mark"
+            continue
         row["strategy_pnl"] = cash + liquidation_value - estimated_exit_fees - initial_cash
-        row["pnl_source"] = "virtual_order_replay"
+        row["pnl_source"] = "virtual_order_replay_depth"
+        last_valid_pnl = row["strategy_pnl"]
 
     # Build aggregated trade events aligned to bucket timestamps
     aggregated_events: List[Dict[str, Any]] = []
     for bucket_ts, trades in sorted(bucket_trades.items(), key=lambda x: x[0]):
-        # Group by (action, side, price) within the bucket
-        groups: Dict[tuple, float] = {}
+        # A price can be shared by multiple legs. Keep leg identity in the
+        # grouping key so the chart never makes a multi-leg fill look like one
+        # anonymous order.
+        groups: Dict[tuple, Dict[str, Any]] = {}
         net_by_side: Dict[str, float] = {}
         for t in trades:
-            key = (t["action"], t["side"], t["price"])
-            groups[key] = groups.get(key, 0.0) + t["qty"]
+            key = (t["leg_index"], t["action"], t["side"], t["price"])
+            grouped = groups.setdefault(
+                key,
+                {
+                    **t,
+                    "qty": 0.0,
+                    "gross_notional": 0.0,
+                    "fee": 0.0,
+                    "net_cash_change": 0.0,
+                    "order_refs": [],
+                },
+            )
+            grouped["qty"] += float(t.get("qty") or 0.0)
+            grouped["gross_notional"] += float(t.get("gross_notional") or 0.0)
+            grouped["fee"] += float(t.get("fee") or 0.0)
+            grouped["net_cash_change"] += float(t.get("net_cash_change") or 0.0)
+            if t.get("order_ref"):
+                grouped["order_refs"].append(str(t["order_ref"]))
+            grouped["position_qty_after"] = t.get("position_qty_after")
             sign = 1.0 if t["action"] == "BUY" else -1.0
             net_by_side[t["side"]] = net_by_side.get(t["side"], 0.0) + sign * t["qty"]
-        parts = [f"{a} {s} qty={q:.2f} @{p:.4f}" for (a, s, p), q in groups.items()]
+        fills = list(groups.values())
+        parts = [
+            f"Leg {int(fill['leg_index']) + 1} {fill['action']} {fill['side']} "
+            f"qty={float(fill['qty']):.2f} @{float(fill['price']):.4f}"
+            for fill in fills
+        ]
         net_parts = [
             f"net {side} {qty:+.2f}"
             for side, qty in sorted(net_by_side.items())
@@ -1692,20 +1983,132 @@ def _apply_virtual_account_pnl_to_rows(detail: Dict[str, Any], rows: List[Dict[s
             label = f"Bucket Trades ({len(trades)} fills): {label}"
         if net_parts:
             label = f"{label} ({', '.join(net_parts)})"
+        unique_actions = {str(fill.get("action") or "") for fill in fills}
+        unique_sides = {str(fill.get("side") or "") for fill in fills}
+        unique_legs = {int(fill.get("leg_index") or 0) for fill in fills}
+        unique_prices = {float(fill.get("price") or 0.0) for fill in fills}
+        total_qty = sum(float(fill.get("qty") or 0.0) for fill in fills)
+        payload = {
+            "status": "filled",
+            "fills": fills,
+            "fill_count": len(trades),
+            "action": next(iter(unique_actions)) if len(unique_actions) == 1 else "MULTI",
+            "side": next(iter(unique_sides)) if len(unique_sides) == 1 else "MULTI",
+            "leg": next(iter(unique_legs)) if len(unique_legs) == 1 else None,
+            "price": next(iter(unique_prices)) if len(unique_prices) == 1 else None,
+            "qty": total_qty,
+        }
         aggregated_events.append({
             "ts": bucket_ts,
             "type": "trade",
+            "subtype": "filled",
             "label": label,
             "severity": "info",
             "source": "virtual_order_replay",
+            "status": "filled",
+            "action": payload["action"],
+            "side": payload["side"],
+            "leg": payload["leg"],
+            "price": payload["price"],
+            "quantity": payload["qty"],
+            "payload": payload,
         })
     return aggregated_events
+
+
+_CHART_EVENT_PAYLOAD_KEYS = {
+    "action",
+    "action_type",
+    "fee",
+    "gross_notional",
+    "instrument_id",
+    "leg",
+    "leg_index",
+    "liquidity_role",
+    "net_cash_change",
+    "order_ref",
+    "price",
+    "qty",
+    "quantity",
+    "reason",
+    "side",
+    "status",
+}
+
+
+def _compact_chart_event_label(item: Dict[str, Any]) -> str:
+    raw = str(item.get("summary") or item.get("label") or item.get("event_type") or item.get("type") or "-")
+    text = re.split(r"===DB_JSON_BEGIN===", raw, maxsplit=1, flags=re.IGNORECASE)[0]
+    text = " ".join(text.split())
+    event_type = str(item.get("event_type") or item.get("type") or "").lower()
+    if "print" in event_type:
+        fields = []
+        for key in ("decision", "actions", "candidates", "selected", "machine_state"):
+            match = re.search(rf"(?:^|\s){re.escape(key)}=([^\s]+)", text, flags=re.IGNORECASE)
+            if match:
+                fields.append(f"{key}={match.group(1)}")
+        if fields:
+            return " · ".join(fields)
+    return f"{text[:277]}…" if len(text) > 280 else text
+
+
+def _chart_event_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Project an event into the small, explicit chart tooltip contract."""
+    raw_payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    payload = {
+        key: raw_payload.get(key)
+        for key in _CHART_EVENT_PAYLOAD_KEYS
+        if raw_payload.get(key) is not None
+    }
+    status = str(payload.get("status") or item.get("event_subtype") or "").strip().lower()
+    action = str(payload.get("action") or payload.get("action_type") or "").strip().upper()
+    side = str(payload.get("side") or "").strip().upper()
+    leg = payload.get("leg", payload.get("leg_index"))
+    quantity = payload.get("qty", payload.get("quantity"))
+    projected = {
+        "id": item.get("id"),
+        "ts": item.get("ts"),
+        "type": item.get("event_type") or item.get("type"),
+        "subtype": item.get("event_subtype") or item.get("subtype"),
+        "label": _compact_chart_event_label(item),
+        "severity": item.get("severity"),
+        "source": item.get("source"),
+        "status": status,
+        "action": action,
+        "side": side,
+        "leg": leg,
+        "price": payload.get("price"),
+        "quantity": quantity,
+        "order_ref": payload.get("order_ref"),
+        "reason": payload.get("reason"),
+        "payload": payload,
+    }
+    return {key: value for key, value in projected.items() if value not in (None, "")}
+
+
+_LEG_SUB_METRIC_PATTERN = re.compile(
+    r"^leg:(\d+):(yes_position|no_position|position|yes_qty|no_qty|qty|yes_avg|no_avg|avg)$"
+)
+
+
+def _leg_sub_metric_parts(token: str) -> tuple[int, str] | None:
+    match = _LEG_SUB_METRIC_PATTERN.fullmatch(str(token or "").strip())
+    if not match:
+        return None
+    return int(match.group(1)), match.group(2)
+
+
+def _is_allowed_sub_series_token(token: str, allowed: set[str]) -> bool:
+    if token in allowed:
+        return True
+    leg_parts = _leg_sub_metric_parts(token)
+    return bool(leg_parts and leg_parts[1] in allowed)
 
 
 def _requested_sub_series(args: Dict[str, Any], defaults: Dict[str, Any], capabilities: Dict[str, Any]) -> List[str]:
     items = _raw_requested_sub_series(args, defaults)
     allowed = _allowed_sub_series_keys(capabilities)
-    return [item for item in items if item in allowed]
+    return [item for item in items if _is_allowed_sub_series_token(item, allowed)]
 
 
 def _raw_requested_sub_series(args: Dict[str, Any], defaults: Dict[str, Any]) -> List[str]:
@@ -1726,8 +2129,8 @@ def _allowed_sub_series_keys(capabilities: Dict[str, Any]) -> set[str]:
 def _sub_series_debug(args: Dict[str, Any], defaults: Dict[str, Any], capabilities: Dict[str, Any]) -> Dict[str, Any]:
     requested = _raw_requested_sub_series(args, defaults)
     allowed = _allowed_sub_series_keys(capabilities)
-    selected = [item for item in requested if item in allowed]
-    rejected = [item for item in requested if item not in allowed]
+    selected = [item for item in requested if _is_allowed_sub_series_token(item, allowed)]
+    rejected = [item for item in requested if not _is_allowed_sub_series_token(item, allowed)]
     metric_catalog = capabilities.get("metric_catalog") or {}
     return {
         "requested_sub_metrics": requested,
@@ -1821,11 +2224,20 @@ def _metric_series_items(metric_keys: List[str], capabilities: Dict[str, Any]) -
         meta = catalog.get(key) or {"key": key, "label": key, "unit": ""}
         meta_payload = meta.get("meta") if isinstance(meta.get("meta"), dict) else {}
         is_backtest_derived = str(meta_payload.get("source") or "") == "backtest_derived" or str(key).startswith("backtest_")
+        is_leg_position_metric = bool(re.fullmatch(r"L\d+_(?:yes_|no_)?position", str(key), flags=re.IGNORECASE))
+        default_panel = "backtest_metrics" if is_backtest_derived else "metric_values"
+        panel = "leg_position_metrics" if is_leg_position_metric else (str(meta.get("panel") or "") or default_panel)
+        if key in {"gap_up", "gap_down", "hold_buffer_yes", "recover_buffer_no"} and str(meta.get("unit") or "") == "compact_currency":
+            panel = "market_mcap"
+        label = str(meta.get("label") or key)
+        if is_leg_position_metric:
+            label = f"Leg-cap metric · {label}"
         items.append(
             {
                 "key": f"metric:{key}",
-                "label": str(meta.get("label") or key),
-                "panel": str(meta.get("panel") or "") or ("backtest_metrics" if is_backtest_derived else "metric_values"),
+                "label": label,
+                "full_label": label,
+                "panel": panel,
                 "render": "line",
                 "unit": str(meta.get("unit") or ""),
                 "category": "backtest_metric" if is_backtest_derived else "strategy_metric",
@@ -1838,6 +2250,191 @@ def _metric_series_items(metric_keys: List[str], capabilities: Dict[str, Any]) -
     return items
 
 
+def _metric_type_for_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
+        return "number"
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        return "text"
+    return "json"
+
+
+def _catalog_item_from_metric_value(key: str, value: Any, meta: Dict[str, Any], ts: str, count: int) -> Dict[str, Any]:
+    metric_type = _metric_type_for_value(value)
+    kind = str(meta.get("kind") or "").strip().lower()
+    if not kind:
+        kind = "continuous" if metric_type == "number" else ("state" if metric_type in {"bool", "text"} else "event")
+    return {
+        "key": key,
+        "label": str(meta.get("label") or key),
+        "kind": kind,
+        "metric_type": metric_type,
+        "unit": str(meta.get("unit") or ""),
+        "panel": str(meta.get("panel") or ""),
+        "value_state": "null" if value is None else "value",
+        "latest_value": value,
+        "latest_ts": ts,
+        "count": count,
+        "meta": meta,
+    }
+
+
+def _virtual_tick_metric_catalog(detail: Dict[str, Any], limit: int = 50) -> Dict[str, Any]:
+    row_id = detail.get("row_id")
+    if not row_id:
+        return {"items": [], "numeric": [], "state": []}
+    try:
+        conn = strategy_data_source.connect(readonly=True)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT run_at_utc, function_json
+            FROM strategy_virtual_ticks
+            WHERE strategy_id = ? AND function_json IS NOT NULL AND function_json != ''
+            ORDER BY run_at_utc DESC
+            LIMIT ?
+            """,
+            (int(row_id), int(limit)),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return {"items": [], "numeric": [], "state": []}
+    latest: Dict[str, Dict[str, Any]] = {}
+    counts: Dict[str, int] = {}
+    for row in rows:
+        try:
+            payload = json.loads(row["function_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+        metrics_meta = payload.get("metrics_meta") if isinstance(payload.get("metrics_meta"), dict) else {}
+        for raw_key, value in metrics.items():
+            key = str(raw_key or "").strip()
+            if not key:
+                continue
+            counts[key] = counts.get(key, 0) + 1
+            if key in latest:
+                continue
+            item_meta = metrics_meta.get(key) if isinstance(metrics_meta.get(key), dict) else {}
+            latest[key] = _catalog_item_from_metric_value(key, value, item_meta, str(row["run_at_utc"] or ""), 1)
+    for key, count in counts.items():
+        if key in latest:
+            latest[key]["count"] = count
+    items = sorted(latest.values(), key=lambda item: str(item.get("key") or ""))
+    return {
+        "items": items,
+        "numeric": [item for item in items if item.get("metric_type") == "number" and item.get("value_state") == "value"],
+        "state": [item for item in items if item.get("kind") == "state" and item.get("value_state") == "value"],
+    }
+
+
+def _natural_metric_sort_key(key: str) -> List[Any]:
+    parts = re.split(r"(\d+)", str(key or ""))
+    return [int(part) if part.isdigit() else part.lower() for part in parts]
+
+
+def _normalize_strategy_key(text: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(text or "").strip().lower())
+
+
+def _is_backtest_derived_catalog_item(item: Dict[str, Any]) -> bool:
+    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    key = str(item.get("key") or "")
+    return meta.get("source") == "backtest_derived" or key.startswith("backtest_")
+
+
+def _strategy_param_keys(detail: Dict[str, Any] | None) -> set[str]:
+    if not isinstance(detail, dict):
+        return set()
+    raw = detail.get("raw") if isinstance(detail.get("raw"), dict) else {}
+    params: Dict[str, Any] = {}
+    for candidate in (detail.get("input_json"), raw.get("input_json"), raw.get("InputJson")):
+        if isinstance(candidate, dict):
+            params.update(candidate)
+            continue
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(parsed, dict):
+            params.update(parsed)
+    return {_normalize_strategy_key(key) for key in params.keys() if str(key or "").strip()}
+
+
+def default_strategy_metric_keys(capabilities: Dict[str, Any], detail: Dict[str, Any] | None = None) -> List[str]:
+    catalog = {
+        key: item
+        for key, item in _metric_catalog_by_key(capabilities).items()
+        if not _is_backtest_derived_catalog_item(item)
+    }
+    keys = set(catalog.keys())
+    selected: List[str] = []
+    param_keys = _strategy_param_keys(detail)
+
+    def add(key: str) -> None:
+        if key in keys and key not in selected:
+            selected.append(key)
+
+    normalized_key_map: Dict[str, List[str]] = {}
+    for key in sorted(keys, key=_natural_metric_sort_key):
+        normalized_key_map.setdefault(_normalize_strategy_key(key), []).append(key)
+    for param_key in sorted(param_keys):
+        for key in normalized_key_map.get(param_key, []):
+            add(key)
+
+    for key in (
+        "trend_ratio",
+        "pnl_pct",
+        "drawdown_pct",
+        "drawdown_from_peak",
+        "target_position",
+        "target",
+        "target_delta",
+        "position_cap_pct",
+        "fair_price",
+        "entry_edge",
+        "full_entry_edge",
+        "exit_edge",
+        "gap_up",
+        "gap_down",
+        "day_to_end",
+        "risk_scale",
+    ):
+        add(key)
+    for key in ("mcap_count", "candidate_count", "selected_count", "best_edge", "best_yes_edge", "best_no_edge"):
+        add(key)
+    for pattern in (
+        r"^L\d+_(yes|no)_position$",
+        r"^L\d+_position$",
+        r"^L\d+_(model_prob|yes_edge|no_edge)$",
+        r"^L\d+_(target_rank|current_rank)$",
+        r"^L\d+_mcap_usd$",
+        r"^mcap_rank_[A-Z0-9]+$",
+        r"^mcap_usd_[A-Z0-9]+$",
+    ):
+        matched = sorted((key for key in keys if re.match(pattern, key)), key=_natural_metric_sort_key)
+        for key in matched:
+            add(key)
+    if not selected:
+        fallback = sorted(
+            (
+                key
+                for key, item in catalog.items()
+                if str(item.get("metric_type") or "") == "number" and str(item.get("value_state") or "") == "value"
+            ),
+            key=_natural_metric_sort_key,
+        )
+        for key in fallback[:6]:
+            add(key)
+    return selected[:120]
+
+
 def _metric_value_from_event(event: Dict[str, Any]) -> Any:
     return None if event.get("value_state") == "null" else event.get("value")
 
@@ -1848,11 +2445,19 @@ def _load_metric_numeric_samples(
     from_ts: str,
     to_ts: str,
     interval_seconds: int,
+    *,
+    include_prior: bool = True,
 ) -> Dict[str, Dict[str, Any]]:
     row_id = detail.get("row_id")
     if not row_id or not metric_keys:
         return {}
-    events_by_key = load_metric_events(int(row_id), metric_keys, from_ts, to_ts)
+    events_by_key = load_metric_events(
+        int(row_id),
+        metric_keys,
+        from_ts,
+        to_ts,
+        include_prior=include_prior,
+    )
     output: Dict[str, Dict[str, Any]] = {}
     from_dt = _parse_iso(from_ts)
     for key, events in events_by_key.items():
@@ -1863,6 +2468,51 @@ def _load_metric_numeric_samples(
             bucket = _bucket_ts(bucket_source, interval_seconds)
             value = _metric_value_from_event(event)
             output.setdefault(bucket, {"ts": bucket})[f"metric:{key}"] = value if isinstance(value, (int, float)) else None
+    return output
+
+
+def _load_virtual_tick_metric_samples(
+    detail: Dict[str, Any],
+    metric_keys: List[str],
+    from_ts: str,
+    to_ts: str,
+    interval_seconds: int,
+) -> Dict[str, Dict[str, Any]]:
+    row_id = detail.get("row_id")
+    if not row_id or not metric_keys:
+        return {}
+    wanted = set(metric_keys)
+    try:
+        conn = strategy_data_source.connect(readonly=True)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT run_at_utc, function_json
+            FROM strategy_virtual_ticks
+            WHERE strategy_id = ? AND run_at_utc >= ? AND run_at_utc <= ?
+            ORDER BY run_at_utc ASC
+            """,
+            (int(row_id), from_ts, to_ts),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return {}
+    output: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        try:
+            payload = json.loads(row["function_json"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+        if not metrics:
+            continue
+        bucket = _bucket_ts(str(row["run_at_utc"] or ""), interval_seconds)
+        sample = output.setdefault(bucket, {"ts": bucket})
+        for key in wanted:
+            if key not in metrics:
+                continue
+            value = metrics.get(key)
+            sample[f"metric:{key}"] = value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
     return output
 
 
@@ -2152,6 +2802,10 @@ def _market_series_items(targets: List[Dict[str, Any]], main_side: str) -> List[
         detail = target["detail"]
         prefix = f"market_{index}_"
         label_prefix = _short_market_label(detail, f"Market {index + 1}")
+        full_market_label = str(
+            detail.get("question") or detail.get("display_name") or label_prefix
+        ).strip()
+        market_short_label = str(detail.get("group_item_title") or label_prefix).strip()
         if _is_binance_detail(detail):
             symbol = str(detail.get("symbol") or label_prefix).strip().upper()
             return_label = symbol or label_prefix
@@ -2217,6 +2871,9 @@ def _market_series_items(targets: List[Dict[str, Any]], main_side: str) -> List[
                     "category": "market_target",
                     "market_index": index,
                     "market_label": label_prefix,
+                    "market_short_label": market_short_label,
+                    "market_full_label": full_market_label,
+                    "full_label": f"{full_market_label} · {config['label']}",
                     "base_key": key,
                     "source_label": "市场价格线",
                     "source_detail": f"{detail.get('question') or detail.get('display_name') or label_prefix} · Condition {detail.get('condition_id') or '-'}",
@@ -2224,6 +2881,117 @@ def _market_series_items(targets: List[Dict[str, Any]], main_side: str) -> List[
                 }
             )
     return items
+
+
+def _is_binary_leg_detail(detail: Dict[str, Any]) -> bool:
+    if _is_binance_detail(detail):
+        return False
+    asset_class = str(detail.get("asset_class") or "").strip().lower()
+    venue = str(detail.get("venue") or "").strip().lower()
+    return bool(
+        detail.get("condition_id")
+        or detail.get("yes_token")
+        or detail.get("no_token")
+        or asset_class in {"polymarket_binary", "binary", "binary_market"}
+        or venue == "polymarket"
+    )
+
+
+def _leg_position_series_items(
+    targets: List[Dict[str, Any]],
+    selected_series: List[str],
+) -> List[Dict[str, Any]]:
+    """Build position/size/average series per leg instead of one aggregate pair."""
+    selected = set(selected_series or [])
+    position_keys = {"yes_position", "no_position", "position"}
+    qty_keys = {"yes_qty", "no_qty", "qty"}
+    avg_keys = {"yes_avg", "no_avg", "avg"}
+    items: List[Dict[str, Any]] = []
+    for index, target in enumerate(targets):
+        detail = target.get("detail") or {}
+        leg_index = int(target.get("leg_index", detail.get("leg_index", index)) or index)
+        leg_name = _short_market_label(detail, f"Leg {leg_index + 1}")
+        full_leg_name = str(detail.get("question") or detail.get("display_name") or leg_name).strip()
+        short_leg_name = str(detail.get("group_item_title") or leg_name).strip()
+        binary = _is_binary_leg_detail(detail)
+        selected_for_leg = {
+            base_key
+            for token in selected
+            for parsed_index, base_key in [_leg_sub_metric_parts(token) or (-1, "")]
+            if parsed_index == leg_index and base_key
+        }
+        selected_for_leg.update(selected & (position_keys | qty_keys | avg_keys))
+        if binary:
+            fields = (
+                [("yes_position", "Yes Position", "leg_positions", "ratio"), ("no_position", "No Position", "leg_positions", "ratio")]
+                if selected_for_leg & position_keys
+                else []
+            )
+            if "yes_position" not in selected_for_leg:
+                fields = [item for item in fields if item[0] != "yes_position"]
+            if "no_position" not in selected_for_leg:
+                fields = [item for item in fields if item[0] != "no_position"]
+            if selected_for_leg & qty_keys:
+                fields.extend(
+                    item for item in (
+                        ("yes_qty", "Yes Qty", "leg_sizes", "qty"),
+                        ("no_qty", "No Qty", "leg_sizes", "qty"),
+                    ) if item[0] in selected_for_leg
+                )
+            if selected_for_leg & avg_keys:
+                fields.extend(
+                    item for item in (
+                        ("yes_avg", "Yes Avg", "leg_averages", "price"),
+                        ("no_avg", "No Avg", "leg_averages", "price"),
+                    ) if item[0] in selected_for_leg
+                )
+        else:
+            fields = []
+            if "position" in selected_for_leg:
+                fields.append(("position", "Position", "leg_positions", "qty"))
+            if "qty" in selected_for_leg:
+                fields.append(("qty", "Qty", "leg_sizes", "qty"))
+            if "avg" in selected_for_leg:
+                fields.append(("avg", "Avg", "leg_averages", "price"))
+        for base_key, label, panel, unit in fields:
+            selector_token = f"leg:{leg_index}:{base_key}"
+            items.append(
+                {
+                    "key": f"market_{index}_{base_key}",
+                    "label": f"Leg {leg_index + 1} {leg_name} {label}",
+                    "panel": panel,
+                    "render": "step" if panel != "leg_averages" else "line",
+                    "unit": unit,
+                    "category": "position" if panel == "leg_positions" else ("size" if panel == "leg_sizes" else "average"),
+                    "market_index": index,
+                    "leg_index": leg_index,
+                    "market_label": leg_name,
+                    "market_short_label": short_leg_name,
+                    "market_full_label": full_leg_name,
+                    "full_label": f"Leg {leg_index + 1} · {full_leg_name} · {label}",
+                    "base_key": base_key,
+                    "sub_metric": selector_token,
+                    "sub_metric_base": base_key,
+                    "source_label": "Strategy Leg",
+                    "source_detail": str(detail.get("question") or detail.get("display_name") or leg_name),
+                    "removable": False,
+                }
+            )
+    return items
+
+
+def _all_leg_sub_metric_tokens(targets: List[Dict[str, Any]]) -> List[str]:
+    tokens: List[str] = []
+    for index, target in enumerate(targets):
+        detail = target.get("detail") or {}
+        leg_index = int(target.get("leg_index", detail.get("leg_index", index)) or index)
+        base_keys = (
+            ("yes_position", "no_position", "yes_qty", "no_qty", "yes_avg", "no_avg")
+            if _is_binary_leg_detail(detail)
+            else ("position", "qty", "avg")
+        )
+        tokens.extend(f"leg:{leg_index}:{base_key}" for base_key in base_keys)
+    return tokens
 
 
 def _panel_list(series_items: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -2298,6 +3066,106 @@ def _binance_target_detail_from_leg(leg: Dict[str, Any], leg_index: int) -> Dict
     }
 
 
+def _chart_market_detail_from_market(
+    market: Dict[str, Any] | None,
+    *,
+    condition_id: str = "",
+    token_id: str = "",
+) -> Dict[str, Any]:
+    matched_market = market or {}
+    raw = matched_market.get("raw") if isinstance(matched_market.get("raw"), dict) else {}
+    resolved_condition_id = str(matched_market.get("condition_id") or condition_id or raw.get("conditionId") or "").strip()
+    yes_token = str(matched_market.get("yes_token") or raw.get("yes_token") or raw.get("yesToken") or "").strip()
+    no_token = str(matched_market.get("no_token") or raw.get("no_token") or raw.get("noToken") or "").strip()
+    token_text = str(token_id or "").strip()
+    if token_text and token_text not in {yes_token, no_token}:
+        if not yes_token:
+            yes_token = token_text
+        elif not no_token:
+            no_token = token_text
+    question = str(
+        matched_market.get("question")
+        or matched_market.get("display_name")
+        or matched_market.get("slug")
+        or raw.get("question")
+        or raw.get("slug")
+        or resolved_condition_id
+        or token_text
+        or "Manual Market"
+    ).strip()
+    yes_bid = _safe_float(matched_market.get("best_bid"))
+    yes_ask = _safe_float(matched_market.get("best_ask"))
+    yes_last = _safe_float(matched_market.get("yes_price"))
+    no_last = _safe_float(matched_market.get("no_price"))
+    no_bid = _safe_float(matched_market.get("no_bid"))
+    no_ask = _safe_float(matched_market.get("no_ask"))
+    yes_qty = _safe_float(matched_market.get("yes_qty") or raw.get("yes_qty")) or 0.0
+    no_qty = _safe_float(matched_market.get("no_qty") or raw.get("no_qty")) or 0.0
+    yes_avg = _safe_float(matched_market.get("yes_avg") or matched_market.get("yes_avg_cost") or raw.get("yes_avg"))
+    no_avg = _safe_float(matched_market.get("no_avg") or matched_market.get("no_avg_cost") or raw.get("no_avg"))
+    yes_position = _safe_float(matched_market.get("yes_position") or raw.get("yes_position"))
+    no_position = _safe_float(matched_market.get("no_position") or raw.get("no_position"))
+    position = _safe_float(
+        matched_market.get("position")
+        or matched_market.get("position_qty")
+        or matched_market.get("qty")
+        or raw.get("position")
+        or raw.get("position_qty")
+        or raw.get("qty")
+    )
+    avg = _safe_float(matched_market.get("avg") or matched_market.get("avg_price") or raw.get("avg"))
+    return {
+        "row_id": None,
+        "leg_index": matched_market.get("leg_index"),
+        "strategy": "Manual Market",
+        "question": question,
+        "subject": None,
+        "display_name": question,
+        "condition_id": resolved_condition_id,
+        "yes_token": yes_token,
+        "no_token": no_token,
+        "yes_bid": yes_bid,
+        "yes_ask": yes_ask,
+        "yes_last_price": yes_last if yes_last is not None else yes_ask,
+        "no_bid": no_bid,
+        "no_ask": no_ask,
+        "no_last_price": no_last if no_last is not None else no_ask,
+        "yes_qty": yes_qty,
+        "no_qty": no_qty,
+        "yes_avg": yes_avg,
+        "no_avg": no_avg,
+        "yes_position": yes_position if yes_position is not None else 0.0,
+        "no_position": no_position if no_position is not None else 0.0,
+        "position": position,
+        "qty": _safe_float(matched_market.get("qty") or matched_market.get("position_qty") or raw.get("qty")) or position,
+        "avg": avg,
+        "yes_current_pct": 0.0,
+        "no_current_pct": 0.0,
+        "strategy_bankroll": 0.0,
+        "strategy_pnl": 0.0,
+        "price_source": "market_cache" if matched_market else "manual_selection",
+        "position_source": "manual_selection",
+        "market_updated_at": raw.get("updatedAt") or matched_market.get("updated_at"),
+        "realtime_snapshot_db_path": "",
+        "end_date": matched_market.get("end_date") or raw.get("endDate"),
+        "market_category": matched_market.get("category"),
+        "slug": matched_market.get("slug") or raw.get("slug"),
+        "event_slug": matched_market.get("event_slug") or raw.get("eventSlug") or raw.get("event_slug"),
+        "group_item_title": matched_market.get("group_item_title") or raw.get("groupItemTitle"),
+        "url": matched_market.get("url") or raw.get("url"),
+        "matched_market_raw": raw or matched_market,
+        "editable": {},
+        "binary_identity_status": "ok" if yes_token or no_token or resolved_condition_id else "missing",
+        "leg_kind": matched_market.get("leg_kind") or raw.get("leg_kind") or "binary_market",
+        "asset_class": matched_market.get("asset_class") or raw.get("asset_class") or "polymarket_binary",
+        "venue": matched_market.get("venue") or raw.get("venue") or "polymarket",
+        "symbol": matched_market.get("symbol") or raw.get("symbol") or "",
+        "instrument_id": matched_market.get("instrument_id") or raw.get("instrument_id") or "",
+        "market_selected_manually": True,
+        "raw": raw or matched_market,
+    }
+
+
 def _market_target_detail_from_payload(target: Dict[str, Any]) -> Dict[str, Any] | None:
     binance_detail = _binance_target_detail_from_leg(target, int(target.get("leg_index") or 0))
     if binance_detail is not None:
@@ -2318,12 +3186,40 @@ def _market_target_detail_from_payload(target: Dict[str, Any]) -> Dict[str, Any]
         "group_item_title": target.get("group_item_title") or target.get("groupItemTitle") or "",
         "url": target.get("url") or "",
         "category": target.get("category") or "Workspace",
+        "display_name": target.get("display_name") or target.get("name") or "",
+        "leg_kind": target.get("leg_kind") or target.get("kind") or "",
+        "asset_class": target.get("asset_class") or "",
+        "venue": target.get("venue") or target.get("source") or "",
+        "symbol": target.get("symbol") or "",
+        "instrument_id": target.get("instrument_id") or "",
+        "leg_index": target.get("leg_index"),
+        "updated_at": target.get("market_updated_at") or target.get("updated_at"),
+        "best_bid": target.get("yes_bid"),
+        "best_ask": target.get("yes_ask") or target.get("yes_mark"),
+        "yes_price": target.get("yes_ask") or target.get("yes_mark"),
+        "no_bid": target.get("no_bid"),
+        "no_ask": target.get("no_ask") or target.get("no_mark"),
+        "no_price": target.get("no_ask") or target.get("no_mark"),
+        "yes_qty": target.get("yes_qty"),
+        "no_qty": target.get("no_qty"),
+        "yes_avg": target.get("yes_avg") or target.get("yes_avg_cost"),
+        "no_avg": target.get("no_avg") or target.get("no_avg_cost"),
+        "yes_position": target.get("yes_position"),
+        "no_position": target.get("no_position"),
+        "position": target.get("position") or target.get("position_qty"),
+        "qty": target.get("qty") or target.get("position_qty"),
+        "avg": target.get("avg") or target.get("avg_price"),
         "raw": target.get("raw") or target,
     }
-    return build_workspace_market_detail(market, condition_id=condition_id, token_id=token_id)
+    return _chart_market_detail_from_market(market, condition_id=condition_id, token_id=token_id)
 
 
-def _strategy_leg_market_targets(row_id: int, base_detail: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
+def _strategy_leg_market_targets(
+    row_id: int,
+    base_detail: Dict[str, Any] | None = None,
+    *,
+    allow_clob_book: bool = False,
+) -> List[Dict[str, Any]]:
     """Expand a strategy into one chart target per leg/market."""
     try:
         strategy = strategy_data_source.get_strategy(row_id)
@@ -2334,7 +3230,11 @@ def _strategy_leg_market_targets(row_id: int, base_detail: Dict[str, Any] | None
             strategy = get_backtest_workspace_strategy(row_id)
         except Exception:
             strategy = None
-    primary_detail = base_detail or fetch_strategy_detail(row_id, allow_remote_positions=False)
+    primary_detail = base_detail or fetch_strategy_detail(
+        row_id,
+        allow_remote_positions=False,
+        allow_clob_book=allow_clob_book,
+    )
     if not strategy:
         return [{"detail": primary_detail, "origin": "strategy", "is_primary": True}]
 
@@ -2345,11 +3245,42 @@ def _strategy_leg_market_targets(row_id: int, base_detail: Dict[str, Any] | None
     output: List[Dict[str, Any]] = []
     seen: set[str] = set()
     primary_identity = _leg_identity(primary_detail)
+    snapshot_by_index = {
+        int(snapshot.get("leg_index") or 0): snapshot
+        for snapshot in (primary_detail.get("legs_snapshot") or [])
+        if isinstance(snapshot, dict)
+    }
+    if len(snapshot_by_index) < len(legs):
+        for snapshot in get_strategy_leg_snapshots(
+            row_id,
+            strategy,
+            include_realtime_prices=True,
+            allow_clob_book=allow_clob_book,
+        ):
+            if isinstance(snapshot, dict):
+                snapshot_by_index[int(snapshot.get("leg_index") or 0)] = snapshot
     for index, leg in enumerate(legs):
         leg_index = int(leg.get("leg_index") or index)
+        snapshot = snapshot_by_index.get(leg_index) or {}
+        instrument = leg.get("instrument_json") if isinstance(leg.get("instrument_json"), dict) else {}
+        leg_name = preferred_leg_display_name(
+            leg,
+            snapshot,
+            fallback=f"Leg {leg_index + 1}",
+        )
         binance_detail = _binance_target_detail_from_leg(leg, leg_index)
         if binance_detail is not None:
             detail = binance_detail
+            detail.update(
+                {
+                    "display_name": leg_name,
+                    "question": leg_name,
+                    "leg_kind": leg.get("leg_kind") or "position",
+                    "position": leg.get("position") or leg.get("position_qty") or leg.get("qty") or leg.get("yes_qty"),
+                    "qty": leg.get("qty") or leg.get("position_qty") or leg.get("yes_qty"),
+                    "avg": leg.get("avg") or leg.get("avg_price") or leg.get("yes_avg_cost"),
+                }
+            )
         else:
             condition_id = str(leg.get("condition_id") or "").strip()
             yes_token = str(leg.get("yes_token") or "").strip()
@@ -2357,6 +3288,27 @@ def _strategy_leg_market_targets(row_id: int, base_detail: Dict[str, Any] | None
             token_id = yes_token or no_token
             if index == 0 and primary_identity:
                 detail = dict(primary_detail)
+                detail.update(
+                    {
+                        "question": leg_name,
+                        "display_name": leg_name,
+                        "leg_index": leg_index,
+                        "yes_qty": snapshot.get("yes_qty", leg.get("yes_qty")),
+                        "no_qty": snapshot.get("no_qty", leg.get("no_qty")),
+                        "yes_avg": snapshot.get("yes_avg", leg.get("yes_avg_cost")),
+                        "no_avg": snapshot.get("no_avg", leg.get("no_avg_cost")),
+                        "yes_position": snapshot.get("yes_position"),
+                        "no_position": snapshot.get("no_position"),
+                        "yes_bid": snapshot.get("yes_bid"),
+                        "yes_ask": snapshot.get("yes_ask") or snapshot.get("yes_mark"),
+                        "no_bid": snapshot.get("no_bid"),
+                        "no_ask": snapshot.get("no_ask") or snapshot.get("no_mark"),
+                        "market_updated_at": snapshot.get("market_updated_at") or snapshot.get("updated_at"),
+                        "leg_kind": leg.get("leg_kind") or detail.get("leg_kind") or "binary_market",
+                        "asset_class": leg.get("asset_class") or detail.get("asset_class") or "polymarket_binary",
+                        "venue": leg.get("venue") or detail.get("venue") or "polymarket",
+                    }
+                )
             else:
                 detail = _market_target_detail_from_payload(
                     {
@@ -2364,13 +3316,52 @@ def _strategy_leg_market_targets(row_id: int, base_detail: Dict[str, Any] | None
                         "yes_token": yes_token,
                         "no_token": no_token,
                         "token_id": token_id,
-                        "label": leg.get("label") or f"Leg {leg_index}",
-                        "question": leg.get("question") or leg.get("label") or f"Leg {leg_index}",
+                        "label": leg_name,
+                        "question": leg_name,
+                        "display_name": leg_name,
+                        "leg_kind": leg.get("leg_kind") or "binary_market",
+                        "asset_class": leg.get("asset_class") or "polymarket_binary",
+                        "venue": leg.get("venue") or "polymarket",
+                        "yes_qty": snapshot.get("yes_qty", leg.get("yes_qty")),
+                        "no_qty": snapshot.get("no_qty", leg.get("no_qty")),
+                        "yes_avg": snapshot.get("yes_avg", leg.get("yes_avg_cost")),
+                        "no_avg": snapshot.get("no_avg", leg.get("no_avg_cost")),
+                        "yes_position": snapshot.get("yes_position"),
+                        "no_position": snapshot.get("no_position"),
+                        "yes_bid": snapshot.get("yes_bid"),
+                        "yes_ask": snapshot.get("yes_ask") or snapshot.get("yes_mark"),
+                        "no_bid": snapshot.get("no_bid"),
+                        "no_ask": snapshot.get("no_ask") or snapshot.get("no_mark"),
+                        "market_updated_at": snapshot.get("market_updated_at") or snapshot.get("updated_at"),
                     }
                 )
                 if detail is None:
-                    resolved = resolve_market_selection(condition_id=condition_id, token_id=token_id, limit=20)
-                    detail = build_workspace_market_detail(resolved.get("selected"), condition_id=condition_id, token_id=token_id)
+                    detail = _chart_market_detail_from_market(
+                        {
+                            "condition_id": condition_id,
+                            "yes_token": yes_token,
+                            "no_token": no_token,
+                            "question": leg_name,
+                            "display_name": leg_name,
+                            "yes_qty": snapshot.get("yes_qty", leg.get("yes_qty")),
+                            "no_qty": snapshot.get("no_qty", leg.get("no_qty")),
+                            "yes_avg": snapshot.get("yes_avg", leg.get("yes_avg_cost")),
+                            "no_avg": snapshot.get("no_avg", leg.get("no_avg_cost")),
+                            "yes_position": snapshot.get("yes_position"),
+                            "no_position": snapshot.get("no_position"),
+                            "best_bid": snapshot.get("yes_bid"),
+                            "best_ask": snapshot.get("yes_ask") or snapshot.get("yes_mark"),
+                            "no_bid": snapshot.get("no_bid"),
+                            "no_ask": snapshot.get("no_ask") or snapshot.get("no_mark"),
+                            "leg_kind": leg.get("leg_kind") or "binary_market",
+                            "asset_class": leg.get("asset_class") or "polymarket_binary",
+                            "venue": leg.get("venue") or "polymarket",
+                            "category": "Workspace",
+                            "raw": leg,
+                        },
+                        condition_id=condition_id,
+                        token_id=token_id,
+                    )
         detail["leg_index"] = leg_index
         detail["budget_cap"] = leg.get("budget_cap")
         detail["params_json"] = leg.get("params_json")
@@ -2389,10 +3380,14 @@ def _strategy_leg_market_targets(row_id: int, base_detail: Dict[str, Any] | None
     return output or [{"detail": primary_detail, "origin": "strategy", "is_primary": True}]
 
 
-def _resolve_compare_details(row_id: int, args: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _resolve_compare_details(
+    row_id: int,
+    args: Dict[str, Any],
+    base_detail: Dict[str, Any] | None = None,
+) -> List[Dict[str, Any]]:
     raw_targets = _parse_json_list(args.get("market_targets_json"))
     if not raw_targets:
-        return _strategy_leg_market_targets(row_id)
+        return _strategy_leg_market_targets(row_id, base_detail=base_detail, allow_clob_book=False)
     output: List[Dict[str, Any]] = []
     seen: set[str] = set()
     for target in raw_targets:
@@ -2400,7 +3395,10 @@ def _resolve_compare_details(row_id: int, args: Dict[str, Any]) -> List[Dict[str
             continue
         target_type = str(target.get("type") or "market").strip().lower()
         if target_type == "strategy":
-            for expanded in _strategy_leg_market_targets(int(target.get("row_id") or row_id)):
+            for expanded in _strategy_leg_market_targets(
+                int(target.get("row_id") or row_id),
+                allow_clob_book=False,
+            ):
                 detail = expanded["detail"]
                 identity = _target_identity(detail)
                 if not identity.strip("|") or identity in seen:
@@ -2414,8 +3412,15 @@ def _resolve_compare_details(row_id: int, args: Dict[str, Any]) -> List[Dict[str
                 condition_id = str(target.get("condition_id") or "").strip()
                 token_id = str(target.get("yes_token") or target.get("no_token") or target.get("token_id") or "").strip()
                 query = str(target.get("question") or target.get("label") or "").strip()
-                resolved = resolve_market_selection(query=query, condition_id=condition_id, token_id=token_id, limit=20)
-                detail = build_workspace_market_detail(resolved.get("selected"), condition_id=condition_id, token_id=token_id)
+                if condition_id or token_id:
+                    detail = _chart_market_detail_from_market(target, condition_id=condition_id, token_id=token_id)
+                else:
+                    resolved = resolve_market_selection(query=query, condition_id=condition_id, token_id=token_id, limit=20)
+                    detail = _chart_market_detail_from_market(
+                        resolved.get("selected"),
+                        condition_id=condition_id,
+                        token_id=token_id,
+                    )
         identity = _target_identity(detail)
         if not identity.strip("|") or identity in seen:
             continue
@@ -2425,10 +3430,15 @@ def _resolve_compare_details(row_id: int, args: Dict[str, Any]) -> List[Dict[str
                 "detail": detail,
                 "origin": target_type,
                 "is_primary": bool(target.get("is_primary", not output)),
+                "leg_index": target.get("leg_index", detail.get("leg_index", len(output))),
             }
         )
     if not output:
-        base_detail = fetch_strategy_detail(row_id, allow_remote_positions=False)
+        base_detail = base_detail or fetch_strategy_detail(
+            row_id,
+            allow_remote_positions=False,
+            allow_clob_book=False,
+        )
         return [{"detail": base_detail, "origin": "strategy", "is_primary": True}]
     return output
 
@@ -2493,9 +3503,13 @@ def _series_style_overrides(args: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 
 
 def _resolve_chart_detail(row_id: int, args: Dict[str, Any]) -> tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
-    targets = _resolve_compare_details(row_id, args)
+    strategy_detail = fetch_strategy_detail(
+        row_id,
+        allow_remote_positions=False,
+        allow_clob_book=False,
+    )
+    targets = _resolve_compare_details(row_id, args, base_detail=strategy_detail)
     primary = next((item["detail"] for item in targets if item.get("is_primary")), targets[0]["detail"])
-    strategy_detail = fetch_strategy_detail(row_id, allow_remote_positions=False)
     return strategy_detail, targets, {
         "type": "market_collection",
         "label": primary.get("question") or primary.get("display_name") or f"Strategy {row_id}",
@@ -2503,6 +3517,7 @@ def _resolve_chart_detail(row_id: int, args: Dict[str, Any]) -> tuple[Dict[str, 
         "items": [
             {
                 "label": target["detail"].get("question") or target["detail"].get("display_name"),
+                "name": target["detail"].get("display_name") or target["detail"].get("question"),
                 "type": target["detail"].get("source") or target.get("origin"),
                 "source": target["detail"].get("source") or "",
                 "venue": target["detail"].get("venue") or "",
@@ -2513,6 +3528,8 @@ def _resolve_chart_detail(row_id: int, args: Dict[str, Any]) -> tuple[Dict[str, 
                 "condition_id": target["detail"].get("condition_id"),
                 "yes_token": target["detail"].get("yes_token"),
                 "no_token": target["detail"].get("no_token"),
+                "leg_kind": target["detail"].get("leg_kind") or "",
+                "leg_type": "polymarket_binary" if _is_binary_leg_detail(target["detail"]) else "position",
                 "origin": target.get("origin"),
                 "is_primary": bool(target.get("is_primary")),
                 "leg_index": target.get("leg_index", target["detail"].get("leg_index")),
@@ -2673,6 +3690,12 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
     )
     defaults = get_strategy_chart_defaults(detail)
     capabilities = get_strategy_chart_capabilities(detail)
+    virtual_metric_catalog = _virtual_tick_metric_catalog(detail)
+    if virtual_metric_catalog.get("items"):
+        capabilities = {
+            **capabilities,
+            "metric_catalog": _merge_metric_catalog(capabilities.get("metric_catalog") or {}, virtual_metric_catalog),
+        }
     backtest_run_id = _safe_int(args.get("backtest_run_id"))
     if backtest_run_id:
         capabilities = {
@@ -2688,6 +3711,7 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
     main_side = str(args.get("main_side") or defaults.get("main_side") or "all").strip().lower()
     indicator_cfg = _indicator_config(args, defaults)
     style_overrides = _series_style_overrides(args)
+    explicit_sub_metrics = bool(str(args.get("sub_metrics") or "").strip())
     selected_series = []
     selected_series.extend(_requested_sub_series(args, defaults, capabilities))
     has_binance_targets = any(_is_binance_detail(target.get("detail") or {}) for target in market_targets)
@@ -2696,6 +3720,9 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
             item for item in selected_series
             if item not in {"yes_position", "no_position", "yes_qty", "no_qty", "yes_avg", "no_avg"}
         ]
+    # `_requested_sub_series` already supplies the workspace defaults. Do not
+    # append strategy metrics behind the user's back: optional metrics are
+    # explicitly selected from the chart drawer.
     sub_metrics_debug = _sub_series_debug(args, defaults, capabilities)
     selected_metric_keys, selected_state_metric_keys = _selected_metric_keys(selected_series)
     static_selected_series = [item for item in selected_series if not item.startswith("metric:") and not item.startswith("metric_state:")]
@@ -2708,7 +3735,24 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
             item for item in static_selected_series
             if item not in {"strategy_pnl", "strategy_bankroll", "initial_capital", "realized_profit", "profit_roll_ratio"}
         ]
+    dynamic_position_tokens = {
+        "yes_position",
+        "no_position",
+        "position",
+        "yes_qty",
+        "no_qty",
+        "qty",
+        "yes_avg",
+        "no_avg",
+        "avg",
+    }
+    static_selected_series = [
+        item
+        for item in static_selected_series
+        if item not in dynamic_position_tokens and _leg_sub_metric_parts(item) is None
+    ]
     series_items = _market_series_items(market_targets, main_side)
+    series_items.extend(_leg_position_series_items(market_targets, selected_series))
     series_items.extend(_static_series_items(static_selected_series, detail))
     series_items.extend(_metric_series_items(selected_metric_keys, capabilities))
     series_items.extend(_overlay_series_items("crypto", overlay_crypto, overlay_crypto_fields))
@@ -2716,6 +3760,7 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
     t_samples0 = time.perf_counter()
     market_price_maps = []
     market_detail_samples = []
+    leg_position_samples = []
     for index, target in enumerate(market_targets):
         prefix = f"market_{index}_"
         is_binance_target = _is_binance_detail(target["detail"])
@@ -2728,6 +3773,12 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
             tick_price_sample_map = _load_strategy_tick_price_samples(detail, from_ts, to_ts, interval_seconds)
             price_sample_map = _overlay_sample_maps(tick_price_sample_map, price_sample_map)
         detail_sample_map = {} if is_binance_target else _detail_sample(target["detail"], interval_seconds, from_ts, to_ts)
+        leg_position_samples.append(
+            _prefix_sample_map(
+                _leg_position_sample(target["detail"], interval_seconds, from_ts, to_ts),
+                prefix,
+            )
+        )
         if index == 0 or is_binance_target:
             market_price_maps.append(_prefix_sample_map(price_sample_map, prefix))
             market_detail_samples.append(
@@ -2736,10 +3787,18 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
         else:
             market_price_maps.append(_watch_market_sample_map(price_sample_map, prefix, main_side))
             market_detail_samples.append(_watch_market_sample_map(detail_sample_map, prefix, main_side))
-    stats_detail_sample = _select_sample_keys(_detail_sample(detail, interval_seconds, from_ts, to_ts), _STATS_DETAIL_KEYS)
+    needs_stats = bool(set(static_selected_series) & _STATS_DETAIL_KEYS)
+    stats_detail_sample = (
+        _select_sample_keys(_detail_sample(detail, interval_seconds, from_ts, to_ts), _STATS_DETAIL_KEYS)
+        if needs_stats
+        else {}
+    )
     price_samples = market_price_maps[0] if market_price_maps else {}
-    stats_samples = _load_stats_samples(detail, from_ts, to_ts, interval_seconds)
-    metric_samples = _load_metric_numeric_samples(detail, selected_metric_keys, from_ts, to_ts, interval_seconds)
+    stats_samples = _load_stats_samples(detail, from_ts, to_ts, interval_seconds) if needs_stats else {}
+    metric_samples = _overlay_sample_maps(
+        _load_metric_numeric_samples(detail, selected_metric_keys, from_ts, to_ts, interval_seconds),
+        _load_virtual_tick_metric_samples(detail, selected_metric_keys, from_ts, to_ts, interval_seconds),
+    )
     metric_state_lanes = _metric_state_lanes(detail, selected_state_metric_keys, from_ts, to_ts, capabilities)
     crypto_overlay_samples = _load_crypto_overlay_samples(
         from_ts, to_ts, interval_seconds, overlay_crypto, overlay_crypto_fields
@@ -2778,24 +3837,38 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
     )
     stats_db_path = get_strategy_stats_db_path(detail)
     t_merge0 = time.perf_counter()
-    if not stats_samples:
+    if needs_stats and not stats_samples:
         stats_samples = _derive_stats_from_price_samples(detail, price_samples)
     rows = _merge_samples(
         *market_price_maps,
         stats_samples,
         metric_samples,
         stats_detail_sample,
+        *leg_position_samples,
         crypto_overlay_samples,
         finance_overlay_samples,
         backtest_samples,
         backtest_metric_samples,
         *market_detail_samples,
     )
+    current_snapshot_ts = _append_current_multileg_snapshot(rows, detail, from_ts, to_ts)
     _sync_row_pnl_to_visible_prices(rows)
     virtual_trade_events = _apply_virtual_account_pnl_to_rows(detail, rows, chart_interval_seconds=interval_seconds)
+    if current_snapshot_ts and detail.get("strategy_pnl") is not None and _can_overlay_detail_pnl(detail):
+        current_row = next((row for row in reversed(rows) if row.get("ts") == current_snapshot_ts), None)
+        if current_row is not None:
+            current_row["strategy_pnl"] = _safe_float(detail.get("strategy_pnl"))
+            current_row["pnl_source"] = detail.get("pnl_source") or "multi_leg_liquidation_sum"
     _apply_indicator_series(rows, series_items, detail, main_side, indicator_cfg, style_overrides)
     _apply_series_macd_overlays(rows, series_items, style_overrides)
     series_items = _attach_style_metadata(series_items, style_overrides)
+    sub_series_catalog = _leg_position_series_items(
+        market_targets,
+        _all_leg_sub_metric_tokens(market_targets),
+    )
+    if not backtest_run_id:
+        sub_series_catalog.extend(_static_series_items(["strategy_pnl"], detail))
+    sub_series_catalog = _attach_style_metadata(sub_series_catalog, style_overrides)
     t_merge1 = time.perf_counter()
     print(
         f"[SV][chart] merge_and_indicator {(t_merge1 - t_merge0) * 1000:.1f}ms rows={len(rows)} series={len(series_items)}"
@@ -2803,29 +3876,25 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
     if not rows:
         rows = [{"ts": to_ts}]
 
+    include_events = str(args.get("include_events") or "0").strip().lower() in {"1", "true", "yes", "on"}
     events = []
-    if detail.get("row_id"):
+    if include_events and detail.get("row_id"):
         t_event0 = time.perf_counter()
-        events_payload = list_strategy_events(row_id, {"limit": 80, "from": from_ts, "to": to_ts})
-        events = [
-            {
-                "ts": item.get("ts"),
-                "type": item.get("event_type"),
-                "label": item.get("summary"),
-                "severity": item.get("severity"),
-                "source": item.get("source"),
-            }
-            for item in events_payload.get("data") or []
-        ]
+        events_payload = list_strategy_events(
+            row_id,
+            {"limit": 80, "from": from_ts, "to": to_ts},
+            detail=detail,
+        )
+        events = [_chart_event_item(item) for item in events_payload.get("data") or []]
         t_event1 = time.perf_counter()
         print(f"[SV][chart] list_strategy_events {(t_event1 - t_event0) * 1000:.1f}ms events={len(events)}")
 
     # For virtual strategies, replace raw per-order trade events with bucket-aggregated ones
     # so that tooltip Trades align exactly with Position/PnL at the same bucket timestamp.
-    if virtual_trade_events:
+    if include_events and virtual_trade_events:
         events = [ev for ev in events if str(ev.get("type") or "").lower() not in ("trade", "fill", "order")]
         events.extend(virtual_trade_events)
-    if backtest_events:
+    if include_events and backtest_events:
         events.extend(backtest_events)
         events.sort(key=lambda item: str(item.get("ts") or ""))
 
@@ -2858,6 +3927,7 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
                 "strategy_detail_row_id": detail.get("row_id"),
                 "market_target_count": len(market_targets),
                 "series_count": len(series_items),
+                "sub_series_catalog_count": len(sub_series_catalog),
                 "metric_series_count": len([item for item in series_items if item.get("category") == "strategy_metric"]),
                 "state_lane_count": len(metric_state_lanes),
                 "backtest_state_lane_count": len(backtest_state_lanes),
@@ -2884,7 +3954,12 @@ def get_strategy_chart(row_id: int, args: Dict[str, Any]) -> Dict[str, Any]:
             *_panel_list(series_items),
             *([{"id": "metric_states", "title": state_lane_panel_title}] if metric_state_lanes else []),
         ],
+        "panel_catalog": [
+            *_panel_list([*series_items, *sub_series_catalog]),
+            *([{"id": "metric_states", "title": state_lane_panel_title}] if metric_state_lanes else []),
+        ],
         "series": series_items,
+        "sub_series_catalog": sub_series_catalog,
         "events": events,
         "metric_state_lanes": metric_state_lanes,
         "rows": rows,

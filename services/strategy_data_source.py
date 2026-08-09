@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from services.config_loader import BASE_DIR, load_web_settings
+from services.strategy_signal_source_service import effective_strategy_signal_source
 
 # ---------------------------------------------------------------------------
 # Strategy state namespaces
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS strategy_registry (
     profit_roll_ratio REAL    NOT NULL DEFAULT 0,
     realized_profit   REAL    NOT NULL DEFAULT 0,
     input_json        TEXT    NOT NULL DEFAULT '{}',
+    signal_source_json TEXT   NOT NULL DEFAULT '{}',
     created_at_utc    TEXT    NOT NULL,
     updated_at_utc    TEXT    NOT NULL
 );
@@ -388,6 +390,32 @@ CREATE TABLE IF NOT EXISTS unassigned_positions (
 _schema_ensured: bool = False
 _db_file_ensured: bool = False
 
+_READONLY_REQUIRED_TABLES = {
+    "strategy_registry",
+    "strategy_legs",
+    "strategy_state",
+    "strategy_virtual_account",
+    "strategy_virtual_positions",
+    "strategy_virtual_orders",
+    "strategy_virtual_events",
+}
+_READONLY_REQUIRED_REGISTRY_COLS = {
+    "strategy_id", "strategy_name", "strategy_code", "input_json", "signal_source_json", "mode"
+}
+_READONLY_REQUIRED_LEG_COLS = {
+    "strategy_id",
+    "leg_index",
+    "leg_uid",
+    "condition_id",
+    "yes_token",
+    "no_token",
+    "leg_kind",
+    "instrument_id",
+    "yes_qty",
+    "no_qty",
+}
+_READONLY_REQUIRED_EVENT_COLS = {"strategy_id", "event_type", "mode", "repeat_count", "last_seen_utc"}
+
 
 def _db_path() -> Path:
     settings = load_web_settings()
@@ -409,21 +437,36 @@ def _ensure_db_file(path: Path) -> None:
     _db_file_ensured = True
 
 
+def _readonly_schema_ready(conn: sqlite3.Connection) -> bool:
+    existing = {
+        str(row[0])
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    }
+    if not _READONLY_REQUIRED_TABLES.issubset(existing):
+        return False
+
+    registry_cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(strategy_registry)").fetchall()}
+    if not _READONLY_REQUIRED_REGISTRY_COLS.issubset(registry_cols):
+        return False
+
+    leg_cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(strategy_legs)").fetchall()}
+    if not _READONLY_REQUIRED_LEG_COLS.issubset(leg_cols):
+        return False
+
+    event_cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(strategy_virtual_events)").fetchall()}
+    if not _READONLY_REQUIRED_EVENT_COLS.issubset(event_cols):
+        return False
+
+    return True
+
+
 def connect(*, readonly: bool = False) -> sqlite3.Connection:
     """Return a connection to the strategy DB with tables ensured."""
     global _schema_ensured
     path = _db_path()
     _ensure_db_file(path)
-    if readonly and not _schema_ensured:
-        bootstrap = sqlite3.connect(str(path), timeout=5.0)
-        bootstrap.row_factory = sqlite3.Row
-        try:
-            bootstrap.execute("PRAGMA foreign_keys=ON;")
-            bootstrap.execute("PRAGMA busy_timeout=5000;")
-            _ensure_schema(bootstrap)
-            _schema_ensured = True
-        finally:
-            bootstrap.close()
     if readonly:
         uri = f"file:{path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=5.0)
@@ -433,6 +476,25 @@ def connect(*, readonly: bool = False) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA busy_timeout=5000;")
     conn.row_factory = sqlite3.Row
+    if readonly and not _schema_ensured:
+        if _readonly_schema_ready(conn):
+            _schema_ensured = True
+        else:
+            conn.close()
+            bootstrap = sqlite3.connect(str(path), timeout=5.0)
+            bootstrap.row_factory = sqlite3.Row
+            try:
+                bootstrap.execute("PRAGMA foreign_keys=ON;")
+                bootstrap.execute("PRAGMA busy_timeout=5000;")
+                _ensure_schema(bootstrap)
+                _schema_ensured = True
+            finally:
+                bootstrap.close()
+            conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            conn.execute("PRAGMA busy_timeout=5000;")
+            conn.row_factory = sqlite3.Row
     if not readonly and not _schema_ensured:
         _ensure_schema(conn)
         _schema_ensured = True
@@ -448,6 +510,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.executescript(_DDL_REGISTRY)
     else:
         _migrate_registry_mode_column(conn)
+        _migrate_registry_signal_source_column(conn)
     if "strategy_legs" not in existing:
         conn.executescript(_DDL_LEGS)
     else:
@@ -496,6 +559,15 @@ def _migrate_registry_mode_column(conn: sqlite3.Connection) -> None:
                    END
                    WHERE COALESCE(mode, '') = ''"""
             )
+
+
+def _migrate_registry_signal_source_column(conn: sqlite3.Connection) -> None:
+    """Add the additive v1 Strategy signal-source contract."""
+    cols = {str(r[1]) for r in conn.execute("PRAGMA table_info(strategy_registry)").fetchall()}
+    if "signal_source_json" not in cols:
+        conn.execute(
+            "ALTER TABLE strategy_registry ADD COLUMN signal_source_json TEXT NOT NULL DEFAULT '{}'"
+        )
 
 
 def _migrate_virtual_events_columns(conn: sqlite3.Connection) -> None:
@@ -650,6 +722,10 @@ def _normalize_strategy_mode(strategy: Dict[str, Any]) -> Dict[str, Any]:
     # Legacy alias for callers that have not yet been migrated. New UI/API code
     # should use `mode`; true strategy-machine state lives in strategy_state.
     strategy["state"] = mode
+    strategy["signal_source"] = effective_strategy_signal_source(
+        _safe_json_dict(strategy.get("signal_source_json")),
+        strategy_code=strategy.get("strategy_code"),
+    )
     return strategy
 
 
@@ -1176,6 +1252,7 @@ def strategy_to_flat_dict(strategy: Dict[str, Any], leg_index: int = 0) -> Dict[
     mode = str(strategy.get("mode") or strategy.get("state") or "Stop").strip() or "Stop"
     flat: Dict[str, Any] = {
         "row_id": strategy["strategy_id"],
+        "leg_index": leg_index,
         "Strategy": strategy.get("strategy_name", ""),
         "Code": strategy.get("strategy_code", ""),
         "mode": mode,

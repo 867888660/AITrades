@@ -14,6 +14,7 @@ SENSITIVE_SETTING_KEYS = (
     "active_finnhub_api_key",
     "coingecko_api_key",
     "llm_api_key",
+    "openbb_fred_api_key",
 )
 
 
@@ -81,14 +82,11 @@ def _ensure_key(key_path: Path) -> bytes:
 
 def _encrypt_payload(payload: Dict[str, Any], key_path: Path) -> str:
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    try:
-        Fernet, _ = _load_fernet()
-        key = _ensure_key(key_path)
-        return "fernet:" + Fernet(key).encrypt(encoded).decode("ascii")
-    except SecureSettingsError:
-        if not _dpapi_available():
-            raise
+    if _dpapi_available():
         return "dpapi:" + base64.b64encode(_dpapi_crypt(encoded, protect=True)).decode("ascii")
+    Fernet, _ = _load_fernet()
+    key = _ensure_key(key_path)
+    return "fernet:" + Fernet(key).encrypt(encoded).decode("ascii")
 
 
 def _decrypt_payload(token: str, key_path: Path) -> Dict[str, Any]:
@@ -131,8 +129,14 @@ def save_secrets(secrets_path: Path, key_path: Path, secrets: Dict[str, Any]) ->
         return
     token = _encrypt_payload(clean, key_path)
     secrets_path.parent.mkdir(parents=True, exist_ok=True)
-    with secrets_path.open("w", encoding="utf-8") as f:
-        json.dump({"version": 1, "encrypted": token}, f, ensure_ascii=False, indent=2)
+    temp_path = secrets_path.with_suffix(secrets_path.suffix + ".tmp")
+    with temp_path.open("w", encoding="utf-8") as f:
+        json.dump({"version": 2, "protection": "dpapi-user" if token.startswith("dpapi:") else "fernet", "encrypted": token}, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    temp_path.replace(secrets_path)
+    if token.startswith("dpapi:") and key_path.exists():
+        key_path.unlink()
     try:
         os.chmod(secrets_path, 0o600)
     except OSError:
@@ -151,4 +155,6 @@ def strip_sensitive(settings: Dict[str, Any]) -> Dict[str, Any]:
             public["has_coingecko_api_key"] = bool(value)
         elif key == "llm_api_key":
             public["has_llm_api_key"] = bool(value)
+        elif key == "openbb_fred_api_key":
+            public["has_openbb_fred_api_key"] = bool(value)
     return public

@@ -297,6 +297,8 @@ def load_metric_events(
     keys: Iterable[str],
     from_ts: str,
     to_ts: str,
+    *,
+    include_prior: bool = True,
 ) -> Dict[str, List[Dict[str, Any]]]:
     key_list = [_safe_key(key) for key in keys if _safe_key(key)]
     if not key_list:
@@ -307,24 +309,28 @@ def load_metric_events(
         _ensure_schema(conn)
         output: Dict[str, List[Dict[str, Any]]] = {key: [] for key in key_list}
         placeholders = ",".join("?" for _ in key_list)
-        prior_rows = conn.execute(
-            f"""
-            SELECT *
-            FROM strategy_metric_events
-            WHERE strategy_id = ?
-              AND metric_key IN ({placeholders})
-              AND run_at_utc < ?
-            ORDER BY metric_key ASC, run_at_utc DESC, id DESC
-            """,
-            (int(strategy_id), *key_list, str(from_ts)),
-        ).fetchall()
-        seen_prior = set()
-        for row in prior_rows:
-            key = str(row["metric_key"] or "")
-            if key in seen_prior:
-                continue
-            seen_prior.add(key)
-            output.setdefault(key, []).append(_event_row(row))
+        if include_prior:
+            prior_rows = conn.execute(
+                f"""
+                SELECT *
+                FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY metric_key
+                        ORDER BY run_at_utc DESC, id DESC
+                    ) AS metric_row_number
+                    FROM strategy_metric_events
+                    WHERE strategy_id = ?
+                      AND metric_key IN ({placeholders})
+                      AND run_at_utc < ?
+                )
+                WHERE metric_row_number = 1
+                ORDER BY metric_key ASC
+                """,
+                (int(strategy_id), *key_list, str(from_ts)),
+            ).fetchall()
+            for row in prior_rows:
+                key = str(row["metric_key"] or "")
+                output.setdefault(key, []).append(_event_row(row))
         rows = conn.execute(
             f"""
             SELECT *

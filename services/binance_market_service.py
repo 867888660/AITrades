@@ -795,3 +795,18 @@ def search_binance_markets(args: Dict[str, Any]) -> Dict[str, Any]:
     if category == "equity":
         return _search_equity(args)
     raise ValueError(f"Unsupported Binance market category: {category}")
+
+
+def get_binance_spot_symbol_status(symbol: str) -> Dict[str, Any] | None:
+    """Return exchange-listed identity/status without requesting ticker data."""
+    target = str(symbol or "").strip().upper()
+    if not target:
+        return None
+    exchange_info, meta = _fetch_spot_exchange_info(force_refresh=False)
+    for item in exchange_info.get("symbols", []) or []:
+        if str(item.get("symbol") or "").strip().upper() == target:
+            row = _spot_row(item)
+            row.pop("_source_item", None)
+            row["source_status"] = "degraded" if meta.get("errors") else "ok"
+            return row
+    return None

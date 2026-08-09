@@ -1,0 +1,4 @@
+# Optional isolated runtime for the Qlib Alpha158-compatible importer.
+pyqlib==0.9.7
+pyarrow
+

@@ -643,8 +643,22 @@ def _case_compatibility(
         }
         if expected_assets and asset_classes and not asset_classes.issubset(expected_assets):
             issues.append({"level": "warning", "message": f"Case asset classes {sorted(asset_classes)} differ from strategy legs {sorted(expected_assets)}."})
+        signal_source = strategy.get("signal_source") if isinstance(strategy.get("signal_source"), dict) else {}
+        signal_source_type = str(signal_source.get("type") or "LEGACY_STRATEGY_CODE").upper()
         strategy_code = str(strategy.get("strategy_code") or "").strip()
-        if not strategy_code:
+        if signal_source_type == "LIBRARY_ALPHA":
+            intervals = {str(leg.get("interval") or DEFAULT_BINANCE_INTERVAL).lower() for leg in legs}
+            instrument_ids = {
+                str(leg.get("instrument_id") or leg.get("symbol") or "").strip()
+                for leg in legs
+            }
+            if sources != {"binance"} or (asset_classes and asset_classes != {"crypto_spot"}):
+                issues.append({"level": "error", "message": "Library Alpha backtest currently requires all-Binance crypto_spot legs."})
+            if len(intervals) > 1:
+                issues.append({"level": "error", "message": "Library Alpha backtest requires one shared bar interval across all legs."})
+            if "" in instrument_ids or len(instrument_ids) != len(legs):
+                issues.append({"level": "error", "message": "Library Alpha backtest requires a unique instrument_id or symbol for every leg."})
+        elif not strategy_code:
             issues.append({"level": "warning", "message": "Selected strategy has no strategy_code."})
 
     code_schema = _strategy_code_schema(strategy_code)
@@ -1045,6 +1059,43 @@ def rerun_backtest_run(run_id: int, payload: Optional[Dict[str, Any]] = None) ->
         snapshot["auto_download_missing"] = bool(payload.get("auto_download") or payload.get("auto_download_missing"))
     if str(payload.get("strategy_code") or "").strip():
         snapshot["run_strategy_code"] = str(payload.get("strategy_code") or "").strip()
+    existing_runtime = snapshot.get("run_strategy_runtime") if isinstance(snapshot.get("run_strategy_runtime"), dict) else {}
+    runtime_strategy = snapshot.get("run_strategy_snapshot") if isinstance(snapshot.get("run_strategy_snapshot"), dict) else {}
+    if not runtime_strategy:
+        runtime_strategy = {
+            "strategy_id": snapshot.get("run_strategy_id"),
+            "strategy_name": snapshot.get("case_name") or "Rerun Strategy",
+            "strategy_code": snapshot.get("run_strategy_code") or existing_runtime.get("strategy_code") or "",
+            "signal_source": existing_runtime.get("signal_source") or {
+                "type": "LEGACY_STRATEGY_CODE",
+                "strategy_code": snapshot.get("run_strategy_code") or "",
+            },
+            "input_json": {},
+        }
+    else:
+        runtime_strategy = dict(runtime_strategy)
+    if str(payload.get("strategy_code") or "").strip():
+        runtime_strategy["strategy_code"] = snapshot["run_strategy_code"]
+        runtime_strategy["signal_source"] = {
+            "type": "LEGACY_STRATEGY_CODE",
+            "strategy_code": snapshot["run_strategy_code"],
+        }
+    from services.strategy_runtime_service import StrategyRuntimeCompiler
+
+    snapshot["run_strategy_runtime"] = StrategyRuntimeCompiler().compile(
+        runtime_strategy,
+        params=snapshot.get("run_params") if isinstance(snapshot.get("run_params"), dict) else {},
+        execution_spec=(
+            payload.get("execution_spec")
+            if isinstance(payload.get("execution_spec"), dict)
+            else existing_runtime.get("execution_spec")
+        ),
+        portfolio_spec=(
+            payload.get("portfolio_spec")
+            if isinstance(payload.get("portfolio_spec"), dict)
+            else existing_runtime.get("portfolio_spec")
+        ),
+    ).to_dict()
     ts = _now_iso()
     conn = _connect()
     try:
@@ -1066,6 +1117,9 @@ def rerun_backtest_run(run_id: int, payload: Optional[Dict[str, Any]] = None) ->
                     "legs_count": len(snapshot.get("legs") if isinstance(snapshot.get("legs"), list) else []),
                     "equity_points": 0,
                     "orders": 0,
+                    "strategy_runtime_hash": snapshot["run_strategy_runtime"].get("runtime_hash"),
+                    "signal_source_type": snapshot["run_strategy_runtime"].get("signal_source_type"),
+                    "backtest_engine": snapshot["run_strategy_runtime"].get("engine"),
                 }, ensure_ascii=False, sort_keys=True),
                 ts,
                 ts,
@@ -1108,12 +1162,37 @@ def create_backtest_run(case_id: int, payload: Optional[Dict[str, Any]] = None) 
         or strategy_snapshot.get("strategy_code")
         or ""
     ).strip()
+    from services.strategy_runtime_service import StrategyRuntimeCompiler
+
+    runtime_strategy = strategy or {
+        "strategy_id": strategy_id,
+        "strategy_name": str(strategy_snapshot.get("strategy_name") or "Transient StrategyCode"),
+        "strategy_code": strategy_code,
+        "signal_source": {"type": "LEGACY_STRATEGY_CODE", "strategy_code": strategy_code},
+        "input_json": {},
+    }
+    strategy_runtime = StrategyRuntimeCompiler().compile(
+        runtime_strategy,
+        params=params,
+        execution_spec=(
+            payload.get("execution_spec")
+            if isinstance(payload.get("execution_spec"), dict)
+            else execution_config.get("execution_spec")
+        ),
+        portfolio_spec=(
+            payload.get("portfolio_spec")
+            if isinstance(payload.get("portfolio_spec"), dict)
+            else execution_config.get("portfolio_spec")
+        ),
+    ).to_dict()
+    strategy_code = str(strategy_runtime.get("strategy_code") or strategy_code).strip()
     batch_id = str(payload.get("batch_id") or "").strip()
     case_snapshot = dict(case)
     case_snapshot["run_strategy_id"] = strategy_id
     case_snapshot["run_strategy_code"] = strategy_code
     case_snapshot["run_params"] = params
     case_snapshot["run_strategy_snapshot"] = strategy or {}
+    case_snapshot["run_strategy_runtime"] = strategy_runtime
     case_snapshot["run_compatibility"] = _case_compatibility(case.get("legs") or [], strategy, strategy_code=strategy_code)
     case_snapshot["auto_download_missing"] = bool(payload.get("auto_download") or payload.get("auto_download_missing"))
     if batch_id:
@@ -1129,6 +1208,9 @@ def create_backtest_run(case_id: int, payload: Optional[Dict[str, Any]] = None) 
         "legs_count": len(case.get("legs") or []),
         "equity_points": 0,
         "orders": 0,
+        "strategy_runtime_hash": strategy_runtime.get("runtime_hash"),
+        "signal_source_type": strategy_runtime.get("signal_source_type"),
+        "backtest_engine": strategy_runtime.get("engine"),
         "progress_percent": 0.0,
         "progress_stage": "created",
         "progress_message": "Backtest run created.",
@@ -2621,12 +2703,236 @@ def _execute_polymarket_backtest(
         conn.close()
 
 
+def _history_rows_to_research_bars(
+    rows: List[Dict[str, Any]],
+    interval: str,
+) -> List[Dict[str, Any]]:
+    duration_ms = _interval_ms(interval)
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        start_ms = _safe_int(row.get("open_time_ms"), 0)
+        if start_ms <= 0:
+            continue
+        start_time = _ms_to_iso(start_ms)
+        end_time = _ms_to_iso(start_ms + duration_ms)
+        result.append({
+            **dict(row),
+            "event_time": start_time,
+            "bar_start_time": start_time,
+            "bar_end_time": end_time,
+            "available_time": end_time,
+            "bar_status": "COMPLETE",
+        })
+    return result
+
+
+def _execute_library_alpha_backtest(
+    run_id: int,
+    snapshot: Dict[str, Any],
+    strategy_runtime: Dict[str, Any],
+    params: Dict[str, Any],
+    legs: List[Dict[str, Any]],
+    ts: str,
+    finish_failed: Any,
+) -> None:
+    from services.library_alpha_backtest_adapter import LibraryAlphaHistoryBacktestAdapter
+
+    if not legs or any(_leg_source(leg) != "binance" for leg in legs):
+        finish_failed("Library Alpha backtest currently requires all-Binance case legs.")
+        return
+    intervals = {str(leg.get("interval") or DEFAULT_BINANCE_INTERVAL).strip() for leg in legs}
+    if len(intervals) != 1:
+        finish_failed("Library Alpha backtest requires one shared interval across all legs.")
+        return
+    interval = next(iter(intervals))
+    start_ms, end_ms = _window_ms_from_snapshot(snapshot)
+    window = snapshot.get("data_window") if isinstance(snapshot.get("data_window"), dict) else {}
+    strict_window = bool(window.get("strict"))
+    events: List[Dict[str, Any]] = []
+    _mark_backtest_progress(run_id, 18, "loading_data", f"Loading local bars for Library Alpha across {len(legs)} instruments.")
+    conn = _connect()
+    try:
+        leg_rows = [
+            _read_binance_kline_rows(
+                conn,
+                str(leg.get("symbol") or "").upper().strip(),
+                interval,
+                start_ms,
+                end_ms,
+            )
+            for leg in legs
+        ]
+    finally:
+        conn.close()
+
+    min_points = max(20, _safe_int(params.get("min_points"), 20))
+    for index, (leg, rows) in enumerate(zip(legs, leg_rows)):
+        if len(rows) < min_points:
+            events.append({
+                "event_type": "data_window_missing_download_required",
+                "message": f"{leg.get('symbol') or leg.get('instrument_id')} has only {len(rows)} local bars.",
+                "meta": {"leg_index": index, "points": len(rows), "min_points": min_points, "download_required": True},
+            })
+            finish_failed(f"Missing Binance history for Library Alpha leg {index + 1}.", events)
+            return
+        if strict_window:
+            first_ms = _safe_int(rows[0].get("open_time_ms"), 0)
+            last_ms = _safe_int(rows[-1].get("open_time_ms"), 0)
+            if (start_ms and first_ms > start_ms + _interval_ms(interval)) or (end_ms and last_ms < end_ms - _interval_ms(interval)):
+                events.append({
+                    "event_type": "data_window_partial",
+                    "message": f"{leg.get('symbol') or leg.get('instrument_id')} has partial data in the strict window.",
+                    "meta": {"leg_index": index, "actual_start": _ms_to_iso(first_ms), "actual_end": _ms_to_iso(last_ms)},
+                })
+                finish_failed(f"Missing strict-window Binance history for Library Alpha leg {index + 1}.", events)
+                return
+
+    row_maps = [{_safe_int(row.get("open_time_ms"), 0): row for row in rows} for rows in leg_rows]
+    common_times = sorted(set.intersection(*(set(item) for item in row_maps)) if row_maps else set())
+    common_times = [item for item in common_times if item > 0]
+    if len(common_times) < min_points:
+        finish_failed(f"Library Alpha legs have only {len(common_times)} aligned bars.")
+        return
+
+    bars_by_instrument: Dict[str, List[Dict[str, Any]]] = {}
+    for index, (leg, row_map) in enumerate(zip(legs, row_maps)):
+        instrument_id = str(leg.get("instrument_id") or leg.get("symbol") or "").strip()
+        if not instrument_id or instrument_id in bars_by_instrument:
+            finish_failed("Library Alpha case requires one unique instrument identity per leg.")
+            return
+        bars_by_instrument[instrument_id] = _history_rows_to_research_bars(
+            [row_map[item] for item in common_times],
+            interval,
+        )
+
+    _mark_backtest_progress(run_id, 48, "data_ready", f"Prepared {len(common_times)} aligned bars for Library Alpha execution.")
+    initial_cash = max(1.0, _finite_float(params.get("initial_cash"), DEFAULT_BACKTEST_CASH))
+    try:
+        output = LibraryAlphaHistoryBacktestAdapter().execute(
+            strategy_runtime,
+            bars_by_instrument=bars_by_instrument,
+            frequency=interval,
+            case_id=_safe_int(snapshot.get("case_id"), 0) or None,
+            initial_cash=initial_cash,
+        )
+    except Exception as exc:
+        finish_failed(f"Library Alpha backtest failed: {exc}", events)
+        return
+
+    _mark_backtest_progress(run_id, 86, "calculating_metrics", f"Library Alpha produced {len(output.portfolio_targets)} targets and {len(output.result.orders)} orders.")
+    drawdowns = {str(item.get("event_time") or ""): dict(item) for item in output.result.drawdown_curve}
+    equity_points: List[Dict[str, Any]] = []
+    for point in output.result.equity_curve:
+        event_time = str(point.get("event_time") or "")
+        drawdown = drawdowns.get(event_time, {})
+        equity = _finite_float(point.get("equity"), initial_cash)
+        position_weights = dict(point.get("position_weights") or {})
+        equity_points.append({
+            "ts_utc": event_time,
+            "equity": equity,
+            "cash": _finite_float(point.get("cash"), 0.0),
+            "exposure": _finite_float(point.get("gross_exposure"), 0.0),
+            "pnl": equity - initial_cash,
+            "meta": {
+                "engine": "library_alpha_history",
+                "signal_source_type": "LIBRARY_ALPHA",
+                "strategy_runtime_hash": strategy_runtime.get("runtime_hash"),
+                "positions": dict(point.get("positions") or {}),
+                "position_values": dict(point.get("position_values") or {}),
+                "position_weights": position_weights,
+                "backtest_return": equity / initial_cash - 1.0,
+                "backtest_drawdown": _finite_float(drawdown.get("drawdown"), 0.0),
+                "backtest_position_state": "invested" if any(abs(float(value)) > 1e-12 for value in position_weights.values()) else "flat",
+            },
+        })
+
+    orders: List[Dict[str, Any]] = []
+    leg_by_instrument = {
+        str(leg.get("instrument_id") or leg.get("symbol") or "").strip(): (index, leg)
+        for index, leg in enumerate(legs)
+    }
+    for item in output.result.orders:
+        instrument_id = str(item.get("instrument_id") or "")
+        leg_index, leg = leg_by_instrument.get(instrument_id, (0, legs[0]))
+        orders.append({
+            "ts_utc": item.get("event_time"),
+            "leg_id": _backtest_leg_id(leg, leg_index),
+            "instrument_id": instrument_id,
+            "side": str(item.get("side") or ""),
+            "quantity": _finite_float(item.get("quantity"), 0.0),
+            "price": _finite_float(item.get("fill_price"), 0.0),
+            "fee": _finite_float(item.get("fee"), 0.0),
+            "status": "filled",
+            "reason": "library_alpha_target_weight",
+            "meta": dict(item),
+        })
+
+    metrics = {
+        **dict(output.result.metrics),
+        "implemented": True,
+        "engine": "library_alpha_history",
+        "strategy_code": "",
+        "signal_source_type": "LIBRARY_ALPHA",
+        "strategy_runtime_hash": strategy_runtime.get("runtime_hash"),
+        "lineage": output.lineage,
+        "alpha_signal_count": len(output.alpha_signals),
+        "portfolio_target_count": len(output.portfolio_targets),
+        "equity_points": len(equity_points),
+        "orders": len(orders),
+        "legs_count": len(legs),
+        "requested_start": _ms_to_iso(start_ms) if start_ms else None,
+        "requested_end": _ms_to_iso(end_ms) if end_ms else None,
+        "strict_window": strict_window,
+        "aligned_points": len(common_times),
+        "progress_percent": 95.0,
+        "progress_stage": "writing_report",
+        "progress_message": "Writing Library Alpha backtest report.",
+        "progress_updated_at": _now_iso(),
+    }
+    _mark_backtest_progress(run_id, 95, "writing_report", "Writing Library Alpha equity, orders, lineage, and events.")
+    conn = _connect()
+    try:
+        conn.execute("DELETE FROM backtest_equity_points WHERE run_id = ?", (run_id,))
+        conn.execute("DELETE FROM backtest_orders WHERE run_id = ?", (run_id,))
+        for point in equity_points:
+            conn.execute(
+                """INSERT OR REPLACE INTO backtest_equity_points(run_id, ts_utc, equity, cash, exposure, pnl, meta_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (run_id, point["ts_utc"], point["equity"], point["cash"], point["exposure"], point["pnl"], json.dumps(point["meta"], ensure_ascii=False)),
+            )
+        for order in orders:
+            conn.execute(
+                """INSERT INTO backtest_orders(run_id, ts_utc, leg_id, instrument_id, side, quantity, price, fee, status, reason, meta_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (run_id, order["ts_utc"], order["leg_id"], order["instrument_id"], order["side"], order["quantity"], order["price"], order["fee"], order["status"], order["reason"], json.dumps(order["meta"], ensure_ascii=False)),
+            )
+        for event in output.result.rebalance_events:
+            conn.execute(
+                "INSERT INTO backtest_events(run_id, ts_utc, event_type, message, meta_json) VALUES (?, ?, 'rebalance', ?, ?)",
+                (run_id, event.get("execution_time") or event.get("signal_time") or ts, "Library Alpha target-weight rebalance.", json.dumps(dict(event), ensure_ascii=False)),
+            )
+        conn.execute(
+            "INSERT INTO backtest_events(run_id, ts_utc, event_type, message, meta_json) VALUES (?, ?, 'complete', ?, ?)",
+            (run_id, _now_iso(), f"Library Alpha replay complete: {len(equity_points)} equity points, {len(orders)} orders.", json.dumps(output.lineage, ensure_ascii=False)),
+        )
+        conn.execute(
+            """UPDATE backtest_runs
+               SET status='completed', metrics_json=?, error=NULL, started_at_utc=COALESCE(started_at_utc, ?),
+                   finished_at_utc=?, updated_at_utc=? WHERE run_id=?""",
+            (json.dumps({**metrics, "progress_percent": 100.0, "progress_stage": "completed", "progress_message": "Backtest completed.", "progress_updated_at": _now_iso()}, ensure_ascii=False, sort_keys=True), ts, _now_iso(), _now_iso(), run_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _execute_backtest_run(run_id: int) -> None:
     _mark_backtest_progress(run_id, 8, "starting", "Backtest worker started.")
     run = get_backtest_run(run_id)
     if not run:
         return
     snapshot = run.get("case_snapshot") or {}
+    strategy_runtime = snapshot.get("run_strategy_runtime") if isinstance(snapshot.get("run_strategy_runtime"), dict) else {}
     strategy_code = str(snapshot.get("run_strategy_code") or "").strip()
     params = snapshot.get("run_params") if isinstance(snapshot.get("run_params"), dict) else {}
     legs = snapshot.get("legs") if isinstance(snapshot.get("legs"), list) else []
@@ -2665,6 +2971,10 @@ def _execute_backtest_run(run_id: int) -> None:
                     json.dumps({
                         "implemented": True,
                         "note": message,
+                        "engine": strategy_runtime.get("engine"),
+                        "backtest_engine": strategy_runtime.get("engine"),
+                        "signal_source_type": strategy_runtime.get("signal_source_type"),
+                        "strategy_runtime_hash": strategy_runtime.get("runtime_hash"),
                         "legs_count": len(legs),
                         "equity_points": 0,
                         "orders": 0,
@@ -2702,6 +3012,18 @@ def _execute_backtest_run(run_id: int) -> None:
             conn_fail.commit()
         finally:
             conn_fail.close()
+
+    if str(strategy_runtime.get("signal_source_type") or "").upper() == "LIBRARY_ALPHA":
+        _execute_library_alpha_backtest(
+            run_id,
+            snapshot,
+            strategy_runtime,
+            params,
+            legs,
+            ts,
+            finish_failed,
+        )
+        return
 
     if compatibility.get("severity") == "error":
         issues = compatibility.get("issues") if isinstance(compatibility.get("issues"), list) else []
@@ -3309,6 +3631,61 @@ def find_backtest_run_for_workspace_strategy(strategy_id: int) -> Dict[str, Any]
     return {}
 
 
+def _backtest_workspace_only_strategy_id(run: Dict[str, Any]) -> int:
+    """Return the synthetic workspace strategy id owned by a backtest run.
+
+    A backtest can also reference a normal monitoring strategy through
+    ``backtest_runs.strategy_id``.  That relationship must not hide the normal
+    strategy from Strategy Monitor, so only explicit workspace-import metadata
+    is considered here.
+    """
+    snapshot = run.get("case_snapshot") if isinstance(run.get("case_snapshot"), dict) else {}
+    metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+    strategy_id = _safe_int(
+        metrics.get("workspace_strategy_id") or snapshot.get("run_strategy_id"),
+        0,
+    )
+    if strategy_id <= 0:
+        return 0
+
+    created_marker = metrics.get("workspace_strategy_created")
+    if created_marker is None:
+        created_marker = snapshot.get("workspace_strategy_created")
+    if created_marker is not None:
+        return strategy_id if bool(created_marker) else 0
+
+    # Compatibility for imports created before workspace provenance was stored.
+    # The legacy importer used this exact generated name for synthetic rows.
+    imported_at = metrics.get("workspace_imported_at") or snapshot.get("workspace_imported_at")
+    strategy = snapshot.get("run_strategy_snapshot") if isinstance(snapshot.get("run_strategy_snapshot"), dict) else {}
+    strategy_name = str(strategy.get("strategy_name") or "").strip()
+    run_id = _safe_int(run.get("run_id"), 0)
+    case_name = str(snapshot.get("case_name") or f"Backtest run {run_id}").strip()
+    expected_name = f"{case_name} / run {run_id}"
+    if imported_at and run_id > 0 and strategy_name == expected_name:
+        return strategy_id
+    return 0
+
+
+def list_backtest_workspace_only_strategy_ids() -> set[int]:
+    """List strategies created only to host imported backtest workspaces."""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """SELECT * FROM backtest_runs
+               WHERE COALESCE(NULLIF(metrics_json, ''), '{}') <> '{}'
+               ORDER BY run_id DESC"""
+        ).fetchall()
+    finally:
+        conn.close()
+    strategy_ids: set[int] = set()
+    for row in rows:
+        strategy_id = _backtest_workspace_only_strategy_id(_decode_run_row(row))
+        if strategy_id > 0:
+            strategy_ids.add(strategy_id)
+    return strategy_ids
+
+
 def get_backtest_workspace_strategy(strategy_id: int) -> Dict[str, Any]:
     """Rehydrate an imported workspace strategy from its saved backtest run snapshot."""
     target_id = _safe_int(strategy_id, 0)
@@ -3439,11 +3816,16 @@ def import_backtest_run_to_workspace(run_id: int, payload: Optional[Dict[str, An
     if strategy_id <= 0:
         raise ValueError("workspace strategy was not created")
     now = _now_iso()
+    workspace_strategy_created = bool(created) or (
+        _backtest_workspace_only_strategy_id(run) == strategy_id
+    )
     snapshot["run_strategy_id"] = strategy_id
     snapshot["run_strategy_snapshot"] = strategy
     snapshot["workspace_imported_at"] = now
+    snapshot["workspace_strategy_created"] = workspace_strategy_created
     metrics["workspace_strategy_id"] = strategy_id
     metrics["workspace_imported_at"] = now
+    metrics["workspace_strategy_created"] = workspace_strategy_created
     conn = _connect()
     try:
         conn.execute(
@@ -3570,6 +3952,7 @@ def get_backtest_run(
 def _batch_run_summary(run: Dict[str, Any]) -> Dict[str, Any]:
     metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
     snapshot = run.get("case_snapshot") if isinstance(run.get("case_snapshot"), dict) else {}
+    runtime = snapshot.get("run_strategy_runtime") if isinstance(snapshot.get("run_strategy_runtime"), dict) else {}
     return {
         "run_id": run.get("run_id"),
         "case_id": run.get("case_id"),
@@ -3582,7 +3965,9 @@ def _batch_run_summary(run: Dict[str, Any]) -> Dict[str, Any]:
         "created_at_utc": run.get("created_at_utc"),
         "updated_at_utc": run.get("updated_at_utc"),
         "finished_at_utc": run.get("finished_at_utc"),
-        "engine": metrics.get("engine"),
+        "engine": metrics.get("engine") or metrics.get("backtest_engine") or runtime.get("engine"),
+        "signal_source_type": metrics.get("signal_source_type") or runtime.get("signal_source_type"),
+        "strategy_runtime_hash": metrics.get("strategy_runtime_hash") or runtime.get("runtime_hash"),
         "total_return": metrics.get("total_return"),
         "max_drawdown": metrics.get("max_drawdown"),
         "sharpe": metrics.get("sharpe"),
@@ -3706,6 +4091,8 @@ def create_backtest_batch(payload: Optional[Dict[str, Any]] = None) -> Dict[str,
             "strategy_id": payload.get("strategy_id") or case.get("strategy_id"),
             "strategy_code": payload.get("strategy_code"),
             "params": {**common_params, **case_params},
+            "execution_spec": payload.get("execution_spec") if isinstance(payload.get("execution_spec"), dict) else {},
+            "portfolio_spec": payload.get("portfolio_spec") if isinstance(payload.get("portfolio_spec"), dict) else {},
             "auto_download": bool(payload.get("auto_download") or payload.get("auto_download_missing")),
             "run_mode": run_mode,
             "batch_id": batch_id,
@@ -3940,20 +4327,50 @@ def download_binance_klines(payload: Dict[str, Any]) -> Dict[str, Any]:
     errors: List[str] = []
     rows: List[List[Any]] = []
     source_url = ""
+    successful_response = False
     for base in BINANCE_BASE_URLS:
         try:
             response = SESSION.get(f"{base}/api/v3/klines", params=params, timeout=get_timeout())
             if response.status_code >= 400:
                 raise RuntimeError(f"HTTP {response.status_code}: {response.text[:160]}")
             payload_json = response.json()
-            if isinstance(payload_json, list):
-                rows = payload_json
+            if not isinstance(payload_json, list):
+                raise RuntimeError("Binance klines response was not a list")
+            rows = payload_json
             source_url = base
+            successful_response = True
             break
         except Exception as exc:
             errors.append(f"{base}: {exc}")
-    if not rows and errors:
+    if not successful_response:
         raise RuntimeError("; ".join(errors))
+
+    # An empty, successful response is materially different from an endpoint
+    # failure. Probe for the first later bar so controlled backfills can
+    # distinguish a pre-listing window from a provider/network outage.
+    available_from = None
+    if not rows and start_ms is not None and source_url:
+        probe_params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": start_ms,
+            "limit": 1,
+        }
+        try:
+            probe = SESSION.get(
+                f"{source_url}/api/v3/klines",
+                params=probe_params,
+                timeout=get_timeout(),
+            )
+            if probe.status_code >= 400:
+                raise RuntimeError(f"HTTP {probe.status_code}: {probe.text[:160]}")
+            probe_json = probe.json()
+            if isinstance(probe_json, list) and probe_json and isinstance(probe_json[0], list):
+                first_open = _safe_int(probe_json[0][0])
+                if first_open > 0:
+                    available_from = _ms_to_iso(first_open)
+        except Exception as exc:
+            errors.append(f"{source_url} availability probe: {exc}")
 
     fetched_at = _now_iso()
     inserted = 0
@@ -4008,6 +4425,7 @@ def download_binance_klines(payload: Dict[str, Any]) -> Dict[str, Any]:
         "stored": inserted,
         "batch_from": _ms_to_iso(min(batch_times)) if batch_times else None,
         "batch_to": _ms_to_iso(max(batch_times)) if batch_times else None,
+        "available_from": available_from,
         "source_url": source_url,
         "errors": errors,
         "coverage": get_binance_coverage(symbol, interval),
@@ -4090,19 +4508,45 @@ def download_polymarket_price_history(payload: Dict[str, Any]) -> Dict[str, Any]
     end_ms = _parse_time_ms(payload.get("end") or payload.get("end_time"))
     interval = str(payload.get("interval") or "max").strip()
     fidelity = str(payload.get("fidelity") or "60").strip()
-    params: Dict[str, Any] = {"market": token_id, "interval": interval, "fidelity": fidelity}
-    if start_ms is not None:
-        params["startTs"] = int(start_ms / 1000)
-    if end_ms is not None:
-        params["endTs"] = int(end_ms / 1000)
+    latest_available = bool(payload.get("latest_available"))
+    base_params: Dict[str, Any] = {"market": token_id, "fidelity": fidelity}
+    requests: list[Dict[str, Any]] = []
+    if latest_available or (start_ms is None and end_ms is None):
+        # Polymarket treats relative interval and absolute timestamps as
+        # mutually exclusive filters.
+        requests.append({**base_params, "interval": interval})
+    else:
+        if start_ms is None or end_ms is None:
+            raise ValueError("Polymarket absolute history requires both start and end")
+        if end_ms < start_ms:
+            raise ValueError("Polymarket history end must not precede start")
+        start_seconds = int(start_ms / 1000)
+        end_seconds = int(end_ms / 1000)
+        max_window_seconds = 14 * 24 * 60 * 60
+        cursor = start_seconds
+        while cursor <= end_seconds:
+            chunk_end = min(end_seconds, cursor + max_window_seconds)
+            requests.append({**base_params, "startTs": cursor, "endTs": chunk_end})
+            if chunk_end >= end_seconds:
+                break
+            cursor = chunk_end + 1
 
-    response = SESSION.get(f"{CLOB_BASE_URL}/prices-history", params=params, timeout=get_timeout())
-    if response.status_code >= 400:
-        raise RuntimeError(f"Polymarket prices-history HTTP {response.status_code}: {response.text[:180]}")
-    data = response.json()
-    points = data.get("history") if isinstance(data, dict) else data
-    if not isinstance(points, list):
-        points = []
+    points_by_timestamp: Dict[int, Dict[str, Any]] = {}
+    for params in requests:
+        response = SESSION.get(f"{CLOB_BASE_URL}/prices-history", params=params, timeout=get_timeout())
+        if response.status_code >= 400:
+            raise RuntimeError(f"Polymarket prices-history HTTP {response.status_code}: {response.text[:180]}")
+        data = response.json()
+        chunk_points = data.get("history") if isinstance(data, dict) else data
+        if not isinstance(chunk_points, list):
+            chunk_points = []
+        for point in chunk_points:
+            if not isinstance(point, dict):
+                continue
+            ts = _safe_int(point.get("t") or point.get("timestamp"))
+            if ts > 0:
+                points_by_timestamp[ts] = point
+    points = [points_by_timestamp[key] for key in sorted(points_by_timestamp)]
 
     fetched_at = _now_iso()
     stored = 0
@@ -4133,7 +4577,7 @@ def download_polymarket_price_history(payload: Dict[str, Any]) -> Dict[str, Any]
         "source": "polymarket",
         "token_id": token_id,
         "condition_id": condition_id,
-        "requested": params,
+        "requested": requests,
         "fetched": len(points),
         "stored": stored,
         "coverage": get_polymarket_coverage(condition_id=condition_id, token_id=token_id),

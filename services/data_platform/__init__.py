@@ -1,0 +1,330 @@
+"""Foundational metadata services for DataTube's quantitative research layer.
+
+The package is intentionally additive.  It owns research metadata and frozen
+dataset manifests, while the existing realtime, VirtualRunner, and strategy
+tables remain unchanged until a later adapter is ready.
+"""
+
+from .catalog_service import DatasetCatalogService
+from .data_client import FrozenManifestData
+from .data_capability_service import ResearchDataCapabilityService
+from .input_candidate_resolver import (
+    INPUT_CANDIDATE_SCHEMA_VERSION,
+    FactorInputCandidateResolver,
+)
+from .backtest_contract import (
+    BacktestCapabilities,
+    BacktestExecutionSpec,
+    ExecutionSpec,
+    ExistingBacktestAdapter,
+    CURRENT_HISTORY_BACKTEST_CAPABILITIES,
+    audit_execution_spec,
+)
+from .binance_history_adapter import BinanceHistoryAdapter
+from .canonical_bars import CanonicalBarsCommitter
+from .polymarket_history import PolymarketHistoryPreparer
+from .polymarket_task_executor import (
+    POLYMARKET_EXPORT_TASK_TYPE,
+    PolymarketResearchTaskExecutor,
+    PolymarketResearchWorker,
+)
+from .openbb_history_adapter import OpenBBEquityHistoryAdapter
+from .openbb_task_executor import OPENBB_EXPORT_TASK_TYPE, OpenBBResearchTaskExecutor, OpenBBResearchWorker
+from .factor_alpha import AlphaComponent, AlphaEngine, AlphaSpec, FactorEngine, FactorSpec
+from .factor_formula import FactorFormulaCompilation, FactorFormulaCompiler, FormulaDiagnostic
+from .factor_engine_v4 import (
+    FACTOR_ENGINE_V4_CODE_HASH,
+    FACTOR_ENGINE_V4_VERSION,
+    FACTOR_GRAPH_CONTRACT_VERSION,
+    FactorEngineV4,
+    FactorGraphCompiler,
+    FactorGraphSpec,
+)
+from .artifact_service import ArtifactService, ResearchArtifactMaterializer, content_hash_for_rows
+from .instrument_registry import InstrumentRegistry, make_instrument_id
+from .models import (
+    DataRequirement,
+    RequirementDependencyLink,
+    RequirementSet,
+    DatasetCatalogEntry,
+    DatasetManifest,
+    DatasetPartition,
+    Instrument,
+    UniverseDefinition,
+    UniverseSnapshot,
+)
+from .requirement_service import DataRequirementService
+from .requirement_compiler import REQUIREMENT_COMPILER_VERSION, RequirementCompiler
+from .requirement_workspace_service import RequirementWorkspaceService, default_requirement_spec, normalize_requirement_spec
+from .requirement_maintenance_service import RequirementMaintenanceService
+from .input_bundle import ResearchInputBundleService
+from .resolved_plan import ResolvedDataPlanService
+from .research_backtest import RESEARCH_BACKTEST_CAPABILITIES, ResearchBacktestProvider, ResearchBacktestResult
+from .portfolio import PortfolioEngine, PortfolioSpec
+from .evaluation import AlphaEvaluator, EvaluationResult, EvaluationSpec, FactorEvaluator, FutureReturnBuilder
+from .binance_backfill import (
+    BINANCE_BACKFILL_TASK_TYPE,
+    BinanceBackfillJobService,
+    BinanceBackfillTaskExecutor,
+    BinanceBackfillWorker,
+    BinanceGapDetector,
+)
+from .provenance_service import ManifestProvenanceService, request_hash, sanitized_request
+from .research_control_plane import ResearchControlPlane
+from .run_contracts import (
+    PREVIEW_FINGERPRINT_SCHEMA_VERSION,
+    READINESS_RULE_VERSION,
+    REASON_CODE_CATALOG_VERSION,
+    BundleInputClosure,
+    BundleInputMode,
+    BundleIntegrityStatus,
+    BundleLifecycleStatus,
+    BundleReuseStatus,
+    FrozenBundleStatus,
+    HistoricalAuthorizationEvidence,
+    IdempotencyConflictError,
+    PreviewFingerprint,
+    ReadinessCheck,
+    ReadinessDimension,
+    ReadinessDimensionResult,
+    ReadinessReport,
+    ReadinessStatus,
+    RemediationCode,
+    ResearchReasonCode,
+    aggregate_readiness_status,
+    build_preview_fingerprint,
+    enforce_idempotent_run_request,
+    is_preview_stale,
+)
+from .source_policy import SourcePolicy, SourcePolicyService
+from .store import DataPlatformStore, get_default_store
+from .universe_service import UniverseService
+from .shared_universe_service import (
+    SharedUniverseService,
+    UniverseConflictError,
+    UniverseResolutionError,
+    UniverseSharedImpactError,
+)
+from .definition_registry import DefinitionRegistry, ResearchDefinition
+from .factor_draft import (
+    FACTOR_DRAFT_SCHEMA_VERSION,
+    FACTOR_EDITOR_DOCUMENT_VERSION,
+    FactorDraft,
+    FactorDraftService,
+    FactorDraftValidationError,
+)
+from .factor_preview import (
+    FACTOR_PREVIEW_SCHEMA_VERSION,
+    FactorPreviewError,
+    FactorPreviewService,
+)
+from .factor_definition_executor import FactorDefinitionExecutor
+from .alpha_factor_candidates import (
+    ALPHA_FACTOR_CANDIDATE_SCHEMA_VERSION,
+    AlphaFactorCandidateResolver,
+)
+from .alpha_draft import (
+    ALPHA_DRAFT_SCHEMA_VERSION,
+    ALPHA_EDITOR_DOCUMENT_VERSION,
+    AlphaDraft,
+    AlphaDraftService,
+    AlphaDraftValidationError,
+)
+from .alpha_preview import (
+    ALPHA_PREVIEW_SCHEMA_VERSION,
+    AlphaPreviewError,
+    AlphaPreviewService,
+)
+from .research_authoring_audit import ResearchAuthoringAudit
+from .library_service import ResearchLibraryService
+from .library_group_service import LibraryGroupService
+from .manifest_resolver import (
+    MANIFEST_RESOLVER_VERSION,
+    SOURCE_SELECTION_POLICY_VERSION,
+    DeterministicManifestResolver,
+    ManifestResolution,
+)
+from .run_preview_service import ResearchRunPreviewService, SUPPORTED_RESEARCH_RUN_TYPES
+from .research_run_service import (
+    FormalResearchRunExecutor,
+    PreviewStaleError,
+    ReadinessBlockedError,
+    ResearchRunService,
+    ResearchRunWorker,
+)
+from .research_agent_authorization import (
+    DEFAULT_RESEARCH_OPERATIONS,
+    AuthorizationDecision,
+    ResearchAgentAuthorization,
+    ResearchAuthorizationError,
+)
+from .research_context_resolver import ResearchContextResolver, SUPPORTED_ANCHORS
+from .research_agent_session import (
+    DEFAULT_SESSION_POLICY,
+    ITERATION_DECISIONS,
+    ITERATION_STATES,
+    NEED_HUMAN_REASONS,
+    SESSION_STATES,
+    ResearchAgentSessionService,
+    normalize_research_brief,
+)
+
+__all__ = [
+    "DataPlatformStore",
+    "BacktestCapabilities",
+    "BacktestExecutionSpec",
+    "ExecutionSpec",
+    "BinanceHistoryAdapter",
+    "CanonicalBarsCommitter",
+    "PolymarketHistoryPreparer",
+    "POLYMARKET_EXPORT_TASK_TYPE",
+    "PolymarketResearchTaskExecutor",
+    "PolymarketResearchWorker",
+    "OpenBBEquityHistoryAdapter",
+    "OPENBB_EXPORT_TASK_TYPE",
+    "OpenBBResearchTaskExecutor",
+    "OpenBBResearchWorker",
+    "AlphaComponent",
+    "AlphaEngine",
+    "AlphaSpec",
+    "ArtifactService",
+    "CURRENT_HISTORY_BACKTEST_CAPABILITIES",
+    "DataRequirement",
+    "RequirementDependencyLink",
+    "RequirementSet",
+    "RequirementCompiler",
+    "RequirementWorkspaceService",
+    "RequirementMaintenanceService",
+    "default_requirement_spec",
+    "normalize_requirement_spec",
+    "REQUIREMENT_COMPILER_VERSION",
+    "ResearchInputBundleService",
+    "ResolvedDataPlanService",
+    "DatasetCatalogService",
+    "DatasetCatalogEntry",
+    "DatasetManifest",
+    "DatasetPartition",
+    "DataRequirementService",
+    "FrozenManifestData",
+    "ResearchDataCapabilityService",
+    "INPUT_CANDIDATE_SCHEMA_VERSION",
+    "FactorInputCandidateResolver",
+    "FactorEngine",
+    "FactorSpec",
+    "FactorFormulaCompilation",
+    "FactorFormulaCompiler",
+    "FormulaDiagnostic",
+    "FACTOR_ENGINE_V4_CODE_HASH",
+    "FACTOR_ENGINE_V4_VERSION",
+    "FACTOR_GRAPH_CONTRACT_VERSION",
+    "FactorEngineV4",
+    "FactorGraphCompiler",
+    "FactorGraphSpec",
+    "ExistingBacktestAdapter",
+    "RESEARCH_BACKTEST_CAPABILITIES",
+    "ResearchBacktestProvider",
+    "ResearchBacktestResult",
+    "ResearchArtifactMaterializer",
+    "PortfolioEngine",
+    "PortfolioSpec",
+    "AlphaEvaluator",
+    "EvaluationResult",
+    "EvaluationSpec",
+    "FactorEvaluator",
+    "FutureReturnBuilder",
+    "BINANCE_BACKFILL_TASK_TYPE",
+    "BinanceBackfillJobService",
+    "BinanceBackfillTaskExecutor",
+    "BinanceBackfillWorker",
+    "BinanceGapDetector",
+    "ManifestProvenanceService",
+    "request_hash",
+    "sanitized_request",
+    "ResearchControlPlane",
+    "PREVIEW_FINGERPRINT_SCHEMA_VERSION",
+    "READINESS_RULE_VERSION",
+    "REASON_CODE_CATALOG_VERSION",
+    "BundleInputClosure",
+    "BundleInputMode",
+    "BundleIntegrityStatus",
+    "BundleLifecycleStatus",
+    "BundleReuseStatus",
+    "FrozenBundleStatus",
+    "HistoricalAuthorizationEvidence",
+    "IdempotencyConflictError",
+    "PreviewFingerprint",
+    "ReadinessCheck",
+    "ReadinessDimension",
+    "ReadinessDimensionResult",
+    "ReadinessReport",
+    "ReadinessStatus",
+    "RemediationCode",
+    "ResearchReasonCode",
+    "aggregate_readiness_status",
+    "build_preview_fingerprint",
+    "enforce_idempotent_run_request",
+    "is_preview_stale",
+    "SourcePolicy",
+    "SourcePolicyService",
+    "content_hash_for_rows",
+    "Instrument",
+    "InstrumentRegistry",
+    "UniverseDefinition",
+    "UniverseService",
+    "SharedUniverseService",
+    "UniverseConflictError",
+    "UniverseResolutionError",
+    "UniverseSharedImpactError",
+    "UniverseSnapshot",
+    "get_default_store",
+    "make_instrument_id",
+    "audit_execution_spec",
+    "DefinitionRegistry",
+    "ResearchDefinition",
+    "FACTOR_DRAFT_SCHEMA_VERSION",
+    "FACTOR_EDITOR_DOCUMENT_VERSION",
+    "FactorDraft",
+    "FactorDraftService",
+    "FactorDraftValidationError",
+    "FACTOR_PREVIEW_SCHEMA_VERSION",
+    "FactorPreviewError",
+    "FactorPreviewService",
+    "FactorDefinitionExecutor",
+    "ALPHA_FACTOR_CANDIDATE_SCHEMA_VERSION",
+    "AlphaFactorCandidateResolver",
+    "ALPHA_DRAFT_SCHEMA_VERSION",
+    "ALPHA_EDITOR_DOCUMENT_VERSION",
+    "AlphaDraft",
+    "AlphaDraftService",
+    "AlphaDraftValidationError",
+    "ALPHA_PREVIEW_SCHEMA_VERSION",
+    "AlphaPreviewError",
+    "AlphaPreviewService",
+    "ResearchAuthoringAudit",
+    "ResearchLibraryService",
+    "LibraryGroupService",
+    "MANIFEST_RESOLVER_VERSION",
+    "SOURCE_SELECTION_POLICY_VERSION",
+    "DeterministicManifestResolver",
+    "ManifestResolution",
+    "ResearchRunPreviewService",
+    "SUPPORTED_RESEARCH_RUN_TYPES",
+    "PreviewStaleError",
+    "ReadinessBlockedError",
+    "ResearchRunService",
+    "ResearchRunWorker",
+    "FormalResearchRunExecutor",
+    "DEFAULT_RESEARCH_OPERATIONS",
+    "AuthorizationDecision",
+    "ResearchAgentAuthorization",
+    "ResearchAuthorizationError",
+    "ResearchContextResolver",
+    "SUPPORTED_ANCHORS",
+    "DEFAULT_SESSION_POLICY",
+    "ITERATION_DECISIONS",
+    "ITERATION_STATES",
+    "NEED_HUMAN_REASONS",
+    "SESSION_STATES",
+    "ResearchAgentSessionService",
+    "normalize_research_brief",
+]

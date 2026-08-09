@@ -1069,6 +1069,16 @@ function renderSystemStatus(overview, latency = latestSystemLatency) {
   const state = overview.collector || {};
   const settings = overview.settings || {};
   const sources = overview.sources || {};
+  const openbbSettings = settings.openbb_settings || {};
+  const openbbLatency = (latency?.external || []).find((entry) => entry.key === "openbb");
+  const openbbEnabled = openbbLatency?.enabled ?? Boolean(openbbSettings.enabled);
+  const openbbValue = !openbbEnabled
+    ? `已禁用 | ${openbbLatency?.url || openbbSettings.base_url || "-"}`
+    : !openbbLatency
+      ? `正在检测服务状态 | ${openbbSettings.base_url || "http://127.0.0.1:6901"}`
+      : openbbLatency.ok
+        ? `加载成功 | ${openbbLatency.url || openbbSettings.base_url || "-"} | Latency: ${formatLatencyMs(openbbLatency.latency_ms)}`
+        : `连接失败 | ${openbbLatency.url || openbbSettings.base_url || "-"} | Latency: ${formatLatencyMs(openbbLatency.latency_ms)}`;
   const items = [
     { label: "Collector", value: state.running ? "运行中" : "未运行", status: state.running ? "good" : "pending", ready: state.running },
     { label: "行情 SQLite", value: state.db_path || settings.sqlite_db_path || "-", status: "good" },
@@ -1110,6 +1120,12 @@ function renderSystemStatus(overview, latency = latestSystemLatency) {
       value: `Interval: ${settings.finance_refresh_sec || "-"}s | ${feedMetaText(state.finance)}`,
       status: state.finance?.status || "pending",
       ready: Boolean((state.finance?.count || state.finance?.data?.length || 0) > 0 && !state.finance?.stale && !(state.finance?.errors || []).length),
+    },
+    {
+      label: "OpenBB",
+      value: openbbValue,
+      status: !openbbEnabled ? "disabled" : openbbLatency ? (openbbLatency.ok ? "good" : "error") : "pending",
+      ready: Boolean(openbbLatency?.ok),
     },
     { label: "前端刷新", value: `${settings.ui_refresh_sec || "-"} 秒`, status: "pending" },
   ];
@@ -1948,6 +1964,7 @@ function renderStrategyRowsLegacy(rows) {
           return `
           <div class="stg-action-group">
             <a class="stg-btn stg-btn-default" href="/strategies/${rid}/workspace" target="_blank" rel="noopener noreferrer">工作台</a>
+            <button class="stg-btn stg-btn-default" data-add-backtest-sid="${rid}" title="将当前策略加入回测数据">添加回测</button>
             <button class="stg-btn stg-btn-edit" data-edit-sid="${rid}">设置参数</button>
             <button class="stg-btn stg-btn-state" data-state-sid="${rid}">State</button>
             <button class="stg-btn stg-btn-warning" data-flat-sid="${rid}" data-flat-name="${escapeHtml(row.strategy || row.display_name || String(rid))}" data-flat-mode="${escapeHtml(strategyMode(row))}">平仓</button>
@@ -2007,6 +2024,10 @@ function strategyName(row) {
 }
 
 function strategyCode(row) {
+  const source = row.signal_source || row.raw?.signal_source;
+  if (source?.type === "LIBRARY_ALPHA") {
+    return `Alpha · ${source.alpha_name || source.alpha_definition_id || "-"}@${source.alpha_version || "-"}`;
+  }
   return row.strategy_code || row.raw?.Code || row.editable?.StrategyCode || "-";
 }
 
@@ -2165,6 +2186,7 @@ function renderStrategyRows(rows) {
         <td>
           <div class="strategy-actions">
             <a class="stg-btn stg-btn-default" href="/strategies/${escapeHtml(rid)}/workspace" target="_blank" rel="noopener noreferrer">工作台</a>
+            <button class="stg-btn stg-btn-default" data-add-backtest-sid="${escapeHtml(rid)}" title="将当前策略 legs 和参数保存为回测样例">添加回测</button>
             <button class="stg-btn stg-btn-edit" data-edit-sid="${escapeHtml(rid)}">参数</button>
             <button class="stg-btn stg-btn-state" data-state-sid="${escapeHtml(rid)}">State</button>
             <button class="stg-btn stg-btn-warning" data-flat-sid="${escapeHtml(rid)}" data-flat-name="${escapeHtml(strategyName(row))}" data-flat-mode="${escapeHtml(mode)}">平仓</button>
@@ -2187,6 +2209,46 @@ function renderStrategyRows(rows) {
       </table>
     </div>
   `;
+}
+
+async function addStrategyToBacktestData(strategyId, button = null) {
+  const sid = String(strategyId || "").trim();
+  if (!sid) return;
+  const row = strategyRowCache.get(sid) || {};
+  const originalText = button?.textContent || "添加回测";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "添加中";
+  }
+  try {
+    const payload = await fetchJson(`/api/polymarket/strategies/${encodeURIComponent(sid)}/backtest`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        case_only: true,
+        metadata_only: true,
+        case_name: `${strategyName(row)} 回测样例 ${new Date().toLocaleString()}`,
+      }),
+    });
+    const data = payload.data || {};
+    const caseId = data.case?.case_id || "-";
+    if (strategyMeta) {
+      strategyMeta.textContent = `已将「${strategyName(row)}」加入回测数据：case_id=${caseId}。可在 History 页面命名、运行或删除。`;
+    }
+    if (button) {
+      button.textContent = `已添加 #${caseId}`;
+      setTimeout(() => {
+        button.disabled = false;
+        button.textContent = originalText;
+      }, 2200);
+    }
+  } catch (error) {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+    alert(`添加回测失败: ${error.message || error}`);
+  }
 }
 
 function disconnectStrategiesLive() {
@@ -2580,6 +2642,11 @@ const strategyModal = document.getElementById("strategyModal");
 const strategyModalForm = document.getElementById("strategyModalForm");
 const strategyModalTitle = document.getElementById("strategyModalTitle");
 const strategyCodeSelect = document.getElementById("strategyCodeSelect");
+const strategySignalSourceType = document.getElementById("strategySignalSourceType");
+const strategyCodeField = document.getElementById("strategyCodeField");
+const strategyLibraryAlphaField = document.getElementById("strategyLibraryAlphaField");
+const strategyLibraryAlphaSelect = document.getElementById("strategyLibraryAlphaSelect");
+const strategyLibraryAlphaSummary = document.getElementById("strategyLibraryAlphaSummary");
 const addStrategyBtn = document.getElementById("addStrategyBtn");
 const strategyDynamicMessage = document.getElementById("strategyDynamicMessage");
 const strategyStateModal = document.getElementById("strategyStateModal");
@@ -2601,6 +2668,64 @@ const strategyModalStateSections = document.getElementById("strategyModalStateSe
 
 let activeStateStrategyId = "";
 let activeStateMode = "Stop";
+let strategyLibraryAlphaSources = [];
+
+function selectedStrategyLibraryAlpha() {
+  const assetId = String(strategyLibraryAlphaSelect?.value || "").trim();
+  return strategyLibraryAlphaSources.find((item) => item.library_asset_id === assetId) || null;
+}
+
+function renderStrategyLibraryAlphaSummary() {
+  if (!strategyLibraryAlphaSummary) return;
+  const source = selectedStrategyLibraryAlpha();
+  if (!source) {
+    strategyLibraryAlphaSummary.textContent = "选择后会固定 Alpha 版本、spec hash 及其全部 Factor 依赖。执行接入尚未开放，因此只能保存为 Stop。";
+    return;
+  }
+  if (source.status === "INVALID") {
+    strategyLibraryAlphaSummary.textContent = `不可引用：${source.error || "依赖闭包无效"}`;
+    return;
+  }
+  const factors = Array.isArray(source.factor_closure) ? source.factor_closure : [];
+  const names = factors.map((item) => `${item.factor_name || item.factor_definition_id}@${item.factor_version}`).join("、");
+  strategyLibraryAlphaSummary.textContent = `将固定 ${source.alpha_name}@${source.alpha_version}，Factor ${factors.length} 个${names ? `：${names}` : ""}。当前状态：引用就绪 / 执行未接入。`;
+}
+
+async function loadStrategyLibraryAlphaSources(selectedAssetId = "") {
+  if (!strategyLibraryAlphaSelect) return;
+  try {
+    const response = await fetchJson("/api/strategy-signal-sources/library-alphas");
+    strategyLibraryAlphaSources = Array.isArray(response.data) ? response.data : [];
+    strategyLibraryAlphaSelect.innerHTML = '<option value="">-- 选择已发布 Alpha --</option>' + strategyLibraryAlphaSources.map((source) => {
+      const invalid = source.status === "INVALID";
+      const label = `${source.alpha_name || source.library_asset_id}@${source.alpha_version || source.library_asset_version || "-"}${invalid ? "（不可用）" : ""}`;
+      return `<option value="${escapeHtml(source.library_asset_id || "")}" ${invalid ? "disabled" : ""}>${escapeHtml(label)}</option>`;
+    }).join("");
+    if (selectedAssetId) strategyLibraryAlphaSelect.value = selectedAssetId;
+  } catch (error) {
+    strategyLibraryAlphaSources = [];
+    strategyLibraryAlphaSelect.innerHTML = '<option value="">Library Alpha 加载失败</option>';
+  }
+  renderStrategyLibraryAlphaSummary();
+}
+
+function applyStrategySignalSourceUi(source = null) {
+  const sourceType = String(source?.type || strategySignalSourceType?.value || "LEGACY_STRATEGY_CODE").toUpperCase();
+  if (strategySignalSourceType) strategySignalSourceType.value = sourceType;
+  const usesAlpha = sourceType === "LIBRARY_ALPHA";
+  if (strategyCodeField) strategyCodeField.hidden = usesAlpha;
+  if (strategyLibraryAlphaField) strategyLibraryAlphaField.hidden = !usesAlpha;
+  const modeSelect = strategyModalForm?.querySelector('[name="mode"]');
+  if (modeSelect) {
+    if (usesAlpha) modeSelect.value = "Stop";
+    modeSelect.disabled = usesAlpha;
+  }
+  if (usesAlpha) {
+    const dyn = document.getElementById("strategyDynamicInputs");
+    if (dyn) dyn.innerHTML = "";
+  }
+  renderStrategyLibraryAlphaSummary();
+}
 let activeModalStateStore = null;
 let strategyLegDraft = [];
 let activeConditionLegIndex = 0;
@@ -3087,6 +3212,10 @@ function openStrategyModal() {
   strategyModalForm.reset();
   strategyModalForm.querySelector('[name="strategy_id"]').value = "";
   _setField("mode", "Stop");
+  if (strategySignalSourceType) strategySignalSourceType.value = "LEGACY_STRATEGY_CODE";
+  if (strategyLibraryAlphaSelect) strategyLibraryAlphaSelect.value = "";
+  applyStrategySignalSourceUi({ type: "LEGACY_STRATEGY_CODE" });
+  loadStrategyLibraryAlphaSources().catch(() => {});
   activeStateMode = "Stop";
   strategyModalDirty = false;
   activeConditionLegIndex = 0;
@@ -3154,9 +3283,12 @@ async function openEditModal(monitorRow) {
   const reg = (regResp.status === "fulfilled" && regResp.value?.data) ? regResp.value.data : null;
   const r = reg || monitorRow;
   const stateStore = (stateResp.status === "fulfilled" && stateResp.value?.data) ? stateResp.value.data : null;
+  const signalSource = r.signal_source || { type: "LEGACY_STRATEGY_CODE", strategy_code: r.strategy_code || "" };
 
   strategyCodeSelect.innerHTML = '<option value="">-- \u9009\u62e9 --</option>' +
     codes.map((c) => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join("");
+  await loadStrategyLibraryAlphaSources(signalSource.library_asset_id || "");
+  applyStrategySignalSourceUi(signalSource);
 
   strategyModalForm.querySelector('[name="strategy_id"]').value = sid ?? "";
   _setField("strategy_name", r.strategy_name || monitorRow.strategy || monitorRow.display_name || "");
@@ -3172,10 +3304,11 @@ async function openEditModal(monitorRow) {
   _setField("strategy_bankroll", r.strategy_bankroll ?? monitorRow.strategy_bankroll ?? "");
   _setField("mode", strategyMode(r || monitorRow || {}));
   activeStateMode = strategyMode(r || monitorRow || {});
+  applyStrategySignalSourceUi(signalSource);
   renderInlineStrategyStateStore(stateStore);
 
   const codeVal = r.strategy_code || "";
-  if (codeVal) {
+  if (signalSource.type !== "LIBRARY_ALPHA" && codeVal) {
     strategyCodeSelect.value = codeVal;
     await _loadDynamicInputs(codeVal, r.input_json || {}, r.legs || []);
   } else {
@@ -3234,6 +3367,8 @@ async function openAgentApprovalStrategyModal(approval) {
   strategyModalTitle.textContent = "设置参数";
   setStrategyModalSubmitText("保存草案");
   strategyModalForm.reset();
+  if (strategySignalSourceType) strategySignalSourceType.value = "LEGACY_STRATEGY_CODE";
+  applyStrategySignalSourceUi({ type: "LEGACY_STRATEGY_CODE" });
   const pasteText = document.getElementById("strategyParamPasteText");
   if (pasteText) pasteText.value = "";
   strategyModalDirty = false;
@@ -3481,6 +3616,17 @@ function buildStrategyDraftPayload() {
     if (value !== "") inputJson[key] = value;
   });
   body.input_json = inputJson;
+  const signalSourceType = String(body.signal_source_type || "LEGACY_STRATEGY_CODE").toUpperCase();
+  const libraryAssetId = String(body.library_alpha_asset_id || "").trim();
+  delete body.signal_source_type;
+  delete body.library_alpha_asset_id;
+  body.signal_source = signalSourceType === "LIBRARY_ALPHA"
+    ? { type: "LIBRARY_ALPHA", library_asset_id: libraryAssetId }
+    : { type: "LEGACY_STRATEGY_CODE", strategy_code: body.strategy_code || "" };
+  if (signalSourceType === "LIBRARY_ALPHA") {
+    body.strategy_code = "";
+    body.mode = "Stop";
+  }
   body.legs = collectStrategyLegsForSave();
   body.condition_id = primaryStrategyConditionId();
   console.log("[strategy-autofill] draft payload", body);
@@ -3793,6 +3939,16 @@ strategyCodeSelect?.addEventListener("change", async () => {
   scheduleStrategyParamUseDataRefresh();
 });
 
+strategySignalSourceType?.addEventListener("change", () => {
+  applyStrategySignalSourceUi({ type: strategySignalSourceType.value });
+  strategyModalDirty = true;
+});
+
+strategyLibraryAlphaSelect?.addEventListener("change", () => {
+  renderStrategyLibraryAlphaSummary();
+  strategyModalDirty = true;
+});
+
 if (addStrategyBtn) {
   addStrategyBtn.addEventListener("click", openStrategyModal);
 }
@@ -3961,6 +4117,11 @@ strategyTable.addEventListener("click", async (e) => {
     return;
   }
   // 设置参数
+  const addBacktestBtn = e.target.closest("[data-add-backtest-sid]");
+  if (addBacktestBtn) {
+    await addStrategyToBacktestData(addBacktestBtn.dataset.addBacktestSid, addBacktestBtn);
+    return;
+  }
   const editBtn = e.target.closest("[data-edit-sid]");
   if (editBtn) {
     const row = strategyRowCache.get(editBtn.dataset.editSid);

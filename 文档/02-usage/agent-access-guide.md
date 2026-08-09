@@ -1,6 +1,6 @@
 # Agent 操作手册
 
-更新日期：2026-06-30
+更新日期：2026-08-01
 
 这是外部 agent 接入本系统时唯一需要优先阅读的手册。本文同时包含标准 workflow、接口入口、权限边界、EventGraph 新闻事件操作、策略草案与审批流程。
 
@@ -11,14 +11,15 @@
 agent 在本系统中的职责是：
 
 ```text
-观察 -> 检索 -> 归纳 -> 提案 -> 风控/模拟 -> 提交人工确认
+研究：理解目标 -> START/RESUME -> 构建/修改 -> 回测 -> 解释 -> 迭代
+策略：观察 -> 检索 -> 归纳 -> 提案 -> 风控/模拟 -> 提交人工确认
 ```
 
 agent 不能做：
 
 ```text
-自我授权
 自我审批
+扩大 Research Session 的研究范围或额度
 绕过风控
 直接实盘执行
 修改自己的权限
@@ -29,9 +30,9 @@ agent 不能做：
 系统分工：
 
 ```text
-agent 负责研究、检索、整理、草案、解释、提交
-系统负责权限、风控、审计、冻结快照和执行边界
-人类负责确认、资金、权限、批准、拒绝和最终执行开关
+agent 负责研究、检索、整理、实验、草案、解释和提交
+系统负责 Research Session、固定研究额度、权限、风控、审计、冻结快照和执行边界
+人类负责研究目标、关键歧义判断、资金、策略批准/拒绝和最终执行开关
 ```
 
 ## 1. 连接入口
@@ -48,7 +49,7 @@ http://127.0.0.1:5001
 | --- | --- | --- |
 | Dashboard | `/` | 总览、市场查询、策略监控入口 |
 | EventGraph | `/event-graph` | 事件图谱、新闻事件和市场信号 |
-| AgentMonitor | `/agent-monitor` | agent 总览、EventGraph 变更、外接 Agent、审计日志 |
+| AgentMonitor | `/agent-monitor` | Research Sessions、EventGraph 变更、外接 Agent、审计日志 |
 | Settings | `/settings` | 人类设置 agent 权限、预算、单笔上限 |
 | Strategy Workspace | `/strategies/<strategy_id>/workspace` | 单个策略工作台 |
 | Ledger | `/ledger` | 订单、仓位、账本诊断 |
@@ -117,6 +118,7 @@ GET /api/agent/capabilities
 - `market_query_capabilities` 市场查询能力。
 - `strategy_observation_capabilities` 策略观察能力。
 - `event_graph_capabilities` EventGraph 与新闻事件能力。
+- `research_session_capabilities` START/RESUME、恢复锚点、NEED_HUMAN 原因与监控入口。
 - `strategy_submission_template` 策略提交说明模板。
 
 权限不足时，agent 只能报告权限不足，不能绕过设置端。
@@ -141,7 +143,9 @@ POST /api/agent/activity
 GET  /api/agent/dashboard?limit=50
 ```
 
-建议 agent 在同一个 workflow 内复用同一个 `run_id`，并在每个写请求里带上 `workflow_id`。如果未提供，后端会自动为单次请求生成 `run_id` 和 `step_id`，但多接口 workflow 就无法自然串起来。
+策略/EventGraph workflow 建议复用同一个 `run_id` 与 `workflow_id`。Research workflow
+必须创建或恢复一个 `session_id`，并在所有 Project Research 写请求中携带它。后端会将
+这些请求映射到同一个持久化研究上下文。
 
 推荐上下文字段：
 
@@ -149,6 +153,16 @@ GET  /api/agent/dashboard?limit=50
 {
   "run_id": "run_<client_generated_id>",
   "workflow_id": "D_MARKET_TO_STRATEGY_DRAFTS",
+  "actor_type": "agent",
+  "actor_id": "agent_strategy_assistant"
+}
+```
+
+Research 请求上下文：
+
+```json
+{
+  "session_id": "research_session_<id>",
   "actor_type": "agent",
   "actor_id": "agent_strategy_assistant"
 }
@@ -219,16 +233,19 @@ workflow_id
 | `F_STRATEGY_HEALTH_CHECK` | 策略运行巡检 |
 | `G_APPROVAL_REVIEW` | 审批跟进 |
 | `H_ERROR_HANDLING` | 错误处理 |
+| `I_RESEARCH_START` | 从自然语言目标开始 Research Session |
+| `J_RESEARCH_RESUME` | 从已有研究锚点恢复并迭代 |
 
 agent 写 activity 时应把 workflow_id 放进 `ref_id`。
 
 ## 4.1 AgentMonitor 与调用链
 
-AgentMonitor 分成四个视图：
+AgentMonitor 分成五个视图：
 
 | 视图 | 用途 |
 | --- | --- |
 | 总览 | 聚合待确认策略、策略草案、EventGraph 变更、风控阻断计数。 |
+| Research Sessions | 展示研究状态、基线、当前分支头、迭代、额度和 NEED_HUMAN 问题。 |
 | EventGraph 变更 | 校验 patch、提交 change request、查看并执行 approve / reject / request-changes / apply。 |
 | 外接 Agent | 显示外部 agent 的策略审批、策略草案和最近活动。 |
 | 审计日志 | 显示完整流水，支持搜索、类别筛选和清除当前筛选。 |
@@ -262,6 +279,75 @@ GET /api/agent/audit?agent_kind=internal
 | `external` | 外接 agent，兼容旧 `actor_type=agent`，也支持 `external_agent`。 |
 | `human` | 人类审批、修改、拒绝、清理审计等动作。 |
 | `system` | 后台系统任务。 |
+
+## 4.2 Research Agent：START / RESUME
+
+适用任务：
+
+```text
+帮我研究 BTC 趋势策略
+从 run_123 继续，尝试降低最大回撤
+修改这个 Factor 并反复回测比较
+```
+
+START：
+
+```http
+POST /api/agent/research/sessions
+
+{
+  "entry_mode": "START",
+  "objective": "建立 BTC 趋势跟随策略",
+  "actor_type": "agent",
+  "actor_id": "agent_strategy_assistant"
+}
+```
+
+RESUME：
+
+```http
+POST /api/agent/research/sessions
+
+{
+  "entry_mode": "RESUME",
+  "anchor_type": "RUN",
+  "anchor_id": "run_123",
+  "objective": "降低最大回撤",
+  "actor_type": "agent",
+  "actor_id": "agent_strategy_assistant"
+}
+```
+
+可恢复锚点：
+
+```text
+SESSION | PROJECT | RUN | PREVIEW | BUNDLE
+| FACTOR_DEFINITION | ALPHA_DEFINITION
+```
+
+后续 Universe、Definition、Requirement、Backfill、Preview 和 Run 写请求只传
+`session_id`，不向用户请求或暴露 `grant_id`。
+
+每轮修改必须先记录一个主要假设和 Intervention Set。候选结果只允许：
+
+```text
+KEEP | REJECT | INCONCLUSIVE | NEED_HUMAN
+```
+
+`KEEP` 更新 `current_branch_head_run_id`；`original_baseline_run_id` 永不改写。
+
+只有以下情况允许 NEED_HUMAN：
+
+```text
+AMBIGUOUS_INTENT
+AMBIGUOUS_CONTEXT
+MATERIAL_SCOPE_CHANGE
+LIMIT_EXTENSION_REQUIRED
+CROSS_RESEARCH_BOUNDARY
+```
+
+普通参数选择、额度内新 Run 和可逆研究决策不能频繁询问用户。详细语义见
+[Research Agent Skill](../03-features/research-agent-skill.md)。
 
 ## 5. Workflow A：全球新闻事件刷新
 

@@ -749,10 +749,10 @@ def _run_strategy(usedata: _UseDataProxy, anchor_company: str, rank_position: in
         "force_flat": force_flat,
     }
     metrics_meta = {
-        "gap_up": {"kind": "continuous", "label": "Gap Up", "unit": "ratio"},
-        "gap_down": {"kind": "continuous", "label": "Gap Down", "unit": "ratio"},
-        "hold_buffer_yes": {"kind": "continuous", "label": "Hold Buffer Yes", "unit": "ratio"},
-        "recover_buffer_no": {"kind": "continuous", "label": "Recover Buffer No", "unit": "ratio"},
+        "gap_up": {"kind": "continuous", "label": "Gap Up", "unit": "compact_currency", "panel": "market_mcap"},
+        "gap_down": {"kind": "continuous", "label": "Gap Down", "unit": "compact_currency", "panel": "market_mcap"},
+        "hold_buffer_yes": {"kind": "continuous", "label": "Hold Buffer Yes", "unit": "compact_currency", "panel": "market_mcap"},
+        "recover_buffer_no": {"kind": "continuous", "label": "Recover Buffer No", "unit": "compact_currency", "panel": "market_mcap"},
         "day_to_end": {"kind": "continuous", "label": "Days To End", "unit": "days"},
         "yes_full_on": {"kind": "continuous", "label": "Yes Full On", "unit": "ratio"},
         "yes_off": {"kind": "continuous", "label": "Yes Off", "unit": "ratio"},

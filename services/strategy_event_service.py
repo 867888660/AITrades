@@ -335,7 +335,7 @@ def _virtual_strategy_events(row_id: int, limit: int, event_type: str = "") -> L
             f"""SELECT id, strategy_id, tick_id, mode, event_type, content, repeat_count, last_seen_utc, created_at_utc
                 FROM strategy_virtual_events
                 WHERE strategy_id = ? {type_clause}
-                ORDER BY COALESCE(NULLIF(last_seen_utc, ''), created_at_utc) DESC, id DESC
+                ORDER BY last_seen_utc DESC, id DESC
                 LIMIT ?""",
             params,
         ).fetchall()
@@ -615,13 +615,17 @@ def list_strategy_events(row_id: int, args: Dict[str, Any] | None = None, *, det
     except (TypeError, ValueError):
         limit = 50
     event_type = str(params.get("event_type") or "").strip().lower()
-    if detail is None:
-        detail = fetch_strategy_detail(row_id, allow_remote_positions=False)
     events = _workspace_events(row_id, limit)
     events.extend(_virtual_strategy_events(row_id, limit, event_type=event_type))
     include_market_events = str(params.get("include_market_events") or params.get("include_monitoring") or "").strip().lower()
     if include_market_events in {"1", "true", "yes", "on"}:
-        events.extend(_monitoring_events(detail, limit, params))
+        if detail is None:
+            detail = fetch_strategy_detail(
+                row_id,
+                allow_remote_positions=False,
+                allow_clob_book=False,
+            )
+        events.extend(_monitoring_events(detail or {}, limit, params))
     if event_type:
         events = _sort_and_dedupe_events(events)[:limit]
     else:

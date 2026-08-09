@@ -1,4 +1,4 @@
 interface:
   display_name: "DataTube"
-  short_description: "Operate DataTube research, strategy, and backtest workflows"
-  default_prompt: "Use $datatube to start DataTube and run a Polymarket/Binance research, strategy, or backtest workflow."
+  short_description: "Run and test controlled DataTube research workflows"
+  default_prompt: "Use $datatube to research a Polymarket question with controlled market data, including PIT-safe Factor Evaluation or an explicitly labeled pre-market proxy snapshot."

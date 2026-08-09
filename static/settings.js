@@ -141,6 +141,8 @@ function fillLlmSettings(settings) {
   setValue("llmBaseUrl", llm.base_url || "https://dashscope.aliyuncs.com/compatible-mode/v1");
   setValue("llmModel", llm.model || "qwen-plus");
   setValue("llmApiKey", settings.llm_api_key || "");
+  getEl("llmKeyStatus").textContent = settings.has_llm_api_key ? "已加密保存；留空会保留" : "未配置";
+  setChecked("clearLlmApiKey", false);
   setValue("llmTemperature", llm.temperature ?? 0.2);
   setValue("llmMaxTokens", llm.max_tokens ?? 2048);
   setValue("llmTimeoutSec", llm.timeout_sec ?? 60);
@@ -155,6 +157,28 @@ function buildLlmSettingsPayload() {
     temperature: getValue("llmTemperature"),
     max_tokens: getValue("llmMaxTokens"),
     timeout_sec: getValue("llmTimeoutSec"),
+  };
+}
+
+function fillOpenbbSettings(settings) {
+  const openbb = settings.openbb_settings || {};
+  setChecked("openbbEnabled", Boolean(openbb.enabled));
+  setValue("openbbBaseUrl", openbb.base_url || "http://127.0.0.1:6901");
+  setValue("openbbDefaultProvider", openbb.default_provider || "yfinance");
+  setValue("openbbAllowedProviders", arrayToLines(openbb.allowed_providers || ["yfinance"]));
+  setValue("openbbTimeoutSec", openbb.timeout_sec ?? 30);
+  setValue("openbbFredApiKey", settings.openbb_fred_api_key || "");
+  getEl("openbbFredKeyStatus").textContent = settings.has_openbb_fred_api_key ? "已加密保存；留空会保留" : "未配置";
+  setChecked("clearOpenbbFredApiKey", false);
+}
+
+function buildOpenbbSettingsPayload() {
+  return {
+    enabled: getChecked("openbbEnabled"),
+    base_url: getValue("openbbBaseUrl", "http://127.0.0.1:6901").trim(),
+    default_provider: getValue("openbbDefaultProvider", "yfinance").trim().toLowerCase(),
+    allowed_providers: linesToArray(getValue("openbbAllowedProviders")).map((item) => item.toLowerCase()),
+    timeout_sec: getValue("openbbTimeoutSec", "30"),
   };
 }
 
@@ -174,6 +198,8 @@ function renderMessage(text) {
 function fillForm(settings) {
   setValue("finnhubKeys", (settings.finnhub_api_keys || []).join("\n"));
   setValue("activeFinnhubKey", settings.active_finnhub_api_key || "");
+  getEl("finnhubKeyStatus").textContent = settings.finnhub_api_key_count ? `已加密保存 ${settings.finnhub_api_key_count} 个；留空会保留` : "未配置";
+  setChecked("clearFinnhubKeys", false);
   setValue("walletAddresses", (settings.wallet_addresses || []).join("\n"));
   setValue("sqliteDbPath", settings.sqlite_db_path || "");
   setValue("orderListDbPath", settings.order_list_db_path || "");
@@ -187,8 +213,11 @@ function fillForm(settings) {
   setValue("financeRefreshSec", settings.finance_refresh_sec || 20);
   setValue("uiRefreshSec", settings.ui_refresh_sec || 5);
   setValue("coingeckoApiKey", settings.coingecko_api_key || "");
+  getEl("coingeckoKeyStatus").textContent = settings.has_coingecko_api_key ? "已加密保存；留空会保留" : "未配置";
+  setChecked("clearCoingeckoApiKey", false);
   setValue("coingeckoApiHeader", settings.coingecko_api_key_header || "x-cg-demo-api-key");
   fillLlmSettings(settings);
+  fillOpenbbSettings(settings);
   setChecked("includeCryptoFundamentals", settings.include_crypto_fundamentals);
   fillAgentPolicy(settings.agent_policy || {});
 }
@@ -200,12 +229,28 @@ async function loadSettings() {
   renderMessage("设置已加载。");
 }
 
+async function loadOpenbbRuntimeStatus() {
+  const target = getEl("openbbRuntimeStatus");
+  if (!target) return;
+  try {
+    const response = await fetchJson("/api/research/data/providers/openbb/worker-status");
+    const data = response.data || {};
+    const provider = data.provider || {};
+    const counts = (data.worker || {}).counts || {};
+    const providerText = provider.enabled ? (provider.ok ? "服务正常" : "服务不可用") : "未启用";
+    target.textContent = `OpenBB ${providerText} | READY ${counts.READY || 0} | RUNNING ${counts.RUNNING || 0} | SUCCEEDED ${counts.SUCCEEDED || 0} | FAILED ${counts.FAILED || 0}`;
+  } catch (error) {
+    target.textContent = `OpenBB 状态读取失败: ${error.message}`;
+  }
+}
+
 settingsForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   renderMessage("保存中...");
 
   const payload = {
     finnhub_api_keys: linesToArray(getValue("finnhubKeys")),
+    clear_finnhub_api_keys: getChecked("clearFinnhubKeys"),
     active_finnhub_api_key: getValue("activeFinnhubKey").trim(),
     wallet_addresses: linesToArray(getValue("walletAddresses")),
     sqlite_db_path: getValue("sqliteDbPath").trim(),
@@ -220,9 +265,14 @@ settingsForm.addEventListener("submit", async (event) => {
     finance_refresh_sec: getValue("financeRefreshSec"),
     ui_refresh_sec: getValue("uiRefreshSec"),
     coingecko_api_key: getValue("coingeckoApiKey").trim(),
+    clear_coingecko_api_key: getChecked("clearCoingeckoApiKey"),
     coingecko_api_key_header: getValue("coingeckoApiHeader").trim(),
     llm_settings: buildLlmSettingsPayload(),
     llm_api_key: getValue("llmApiKey").trim(),
+    clear_llm_api_key: getChecked("clearLlmApiKey"),
+    openbb_settings: buildOpenbbSettingsPayload(),
+    openbb_fred_api_key: getValue("openbbFredApiKey").trim(),
+    clear_openbb_fred_api_key: getChecked("clearOpenbbFredApiKey"),
     include_crypto_fundamentals: getChecked("includeCryptoFundamentals"),
     agent_policy: buildAgentPolicyPayload(),
   };
@@ -249,3 +299,4 @@ tabButtons.forEach((button) => {
 });
 
 loadSettings().catch((error) => renderMessage(`加载失败: ${error.message}`));
+loadOpenbbRuntimeStatus();

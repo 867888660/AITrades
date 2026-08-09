@@ -1,0 +1,4 @@
+openbb-platform-api==1.3.6
+openbb-equity==1.6.2
+openbb-yfinance==1.6.3
+openbb-fred==1.6.1

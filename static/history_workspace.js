@@ -7,7 +7,8 @@
   collections: [],
   batches: [],
   runs: [],
-  strategies: [],
+  strategyCodes: [],
+  registryStrategies: [],
   strategyInputs: [],
   selectedWatchIds: new Set(),
   selectedPoolCaseIds: new Set(),
@@ -82,13 +83,43 @@ function strategyLabel(codeName) {
   return String(codeName || "");
 }
 
+function selectedRunSource() {
+  const value = String(els.runStrategy.value || "");
+  if (value.startsWith("strategy:")) {
+    const strategyId = Number(value.slice("strategy:".length));
+    const strategy = historyState.registryStrategies.find((item) => Number(item.strategy_id) === strategyId) || null;
+    const signalSource = strategy?.signal_source || { type: "LEGACY_STRATEGY_CODE", strategy_code: strategy?.strategy_code || "" };
+    return {
+      kind: "strategy",
+      strategy,
+      strategyId,
+      strategyCode: String(strategy?.strategy_code || ""),
+      signalSourceType: String(signalSource.type || "LEGACY_STRATEGY_CODE").toUpperCase(),
+      label: String(strategy?.strategy_name || `Strategy ${strategyId}`),
+    };
+  }
+  const strategyCode = value.startsWith("code:") ? value.slice("code:".length) : value;
+  return {
+    kind: strategyCode ? "code" : "",
+    strategy: null,
+    strategyId: null,
+    strategyCode,
+    signalSourceType: strategyCode ? "LEGACY_STRATEGY_CODE" : "",
+    label: strategyCode,
+  };
+}
+
 function renderStrategies() {
   const runSelected = els.runStrategy.value;
-  const options = [`<option value="">请选择 StrategyCode</option>`].concat(
-    historyState.strategies.map((codeName) => (
-      `<option value="${escapeHtml(codeName)}">${escapeHtml(strategyLabel(codeName))}</option>`
-    ))
-  );
+  const registered = historyState.registryStrategies.map((strategy) => {
+    const sourceType = String(strategy.signal_source?.type || "LEGACY_STRATEGY_CODE").toUpperCase();
+    const sourceLabel = sourceType === "LIBRARY_ALPHA" ? "Library Alpha" : "StrategyCode";
+    return `<option value="strategy:${escapeHtml(strategy.strategy_id)}">[Strategy · ${sourceLabel}] ${escapeHtml(strategy.strategy_name || strategy.strategy_id)}</option>`;
+  });
+  const codes = historyState.strategyCodes.map((codeName) => (
+    `<option value="code:${escapeHtml(codeName)}">[Code] ${escapeHtml(strategyLabel(codeName))}</option>`
+  ));
+  const options = [`<option value="">请选择 Strategy 或 StrategyCode</option>`, ...registered, ...codes];
   els.runStrategy.innerHTML = options.join("");
   if ([...els.runStrategy.options].some((option) => option.value === runSelected)) {
     els.runStrategy.value = runSelected;
@@ -258,11 +289,15 @@ function renderRunRecords() {
               const snapshot = row.case_snapshot || {};
               const metrics = row.metrics || {};
               const workspaceUrl = runWorkspaceUrl(row);
-              const strategyText = snapshot.run_strategy_code || metrics.strategy_code || row.strategy_id || "-";
+              const runtime = snapshot.run_strategy_runtime || {};
+              const sourceType = metrics.signal_source_type || runtime.signal_source_type || "LEGACY_STRATEGY_CODE";
+              const strategyText = sourceType === "LIBRARY_ALPHA"
+                ? `Library Alpha · strategy ${snapshot.run_strategy_id || row.strategy_id || "-"}`
+                : (snapshot.run_strategy_code || metrics.strategy_code || row.strategy_id || "-");
               const displayName = metrics.run_name || snapshot.run_name || row.run_name || snapshot.case_name || `Case ${row.case_id || "-"}`;
               return `
                 <tr>
-                  <td><strong>run ${escapeHtml(row.run_id)}</strong><div class="muted mono">strategy=${escapeHtml(strategyText)}</div></td>
+                  <td><strong>run ${escapeHtml(row.run_id)}</strong><div class="muted mono">strategy=${escapeHtml(strategyText)}</div><div class="muted mono">engine=${escapeHtml(metrics.engine || metrics.backtest_engine || runtime.engine || "-")}</div></td>
                   <td>
                     <strong>${editableName("run", row.run_id, displayName, `Run ${row.run_id}`)}</strong>
                     <div class="muted mono">case_id=${escapeHtml(row.case_id || "-")}${row.batch_id ? ` / batch=${escapeHtml(row.batch_id)}` : ""}</div>
@@ -628,26 +663,41 @@ async function loadCases() {
 }
 
 async function loadStrategies() {
-  const payload = await apiJson("/api/strategy-codes");
-  historyState.strategies = payload.data || [];
+  const [codesPayload, strategiesPayload] = await Promise.all([
+    apiJson("/api/strategy-codes"),
+    apiJson("/api/registry/strategies"),
+  ]);
+  historyState.strategyCodes = codesPayload.data || [];
+  historyState.registryStrategies = strategiesPayload.data || [];
   renderStrategies();
   await loadRunStrategyInputs();
 }
 
 async function loadRunStrategyInputs() {
-  const codeName = els.runStrategy.value || "";
-  if (!codeName) {
+  const source = selectedRunSource();
+  if (!source.kind) {
     renderRunParams([]);
     return;
   }
-  const payload = await apiJson(`/api/strategy-codes/${encodeURIComponent(codeName)}/inputs`);
-  renderRunParams(payload.data || []);
+  if (source.signalSourceType === "LIBRARY_ALPHA") {
+    const inputJson = source.strategy?.input_json || {};
+    const defaults = {
+      ...(inputJson.params || {}),
+      initial_cash: inputJson.params?.initial_cash ?? source.strategy?.strategy_bankroll ?? source.strategy?.initial_capital ?? 10000,
+    };
+    renderRunParams(Object.entries(defaults).map(([name, value]) => ({ name, label: name, default: value })));
+  } else if (source.strategyCode) {
+    const payload = await apiJson(`/api/strategy-codes/${encodeURIComponent(source.strategyCode)}/inputs`);
+    renderRunParams(payload.data || []);
+  } else {
+    renderRunParams([]);
+  }
   await evaluateRunCases();
 }
 
 async function evaluateRunCases() {
-  const strategyCode = els.runStrategy.value || "";
-  if (!strategyCode || !(historyState.cases || []).length) {
+  const source = selectedRunSource();
+  if (!source.kind || !(historyState.cases || []).length) {
     historyState.cases = (historyState.cases || []).map((row) => ({ ...row, run_compatibility: null }));
     renderRunCases();
     return;
@@ -657,7 +707,8 @@ async function evaluateRunCases() {
     const payload = await apiJson("/api/history/backtest-cases/evaluate", {
       method: "POST",
       body: JSON.stringify({
-        strategy_code: strategyCode,
+        strategy_id: source.strategyId,
+        strategy_code: source.strategyCode,
         legs: row.legs || [],
       }),
     });
@@ -673,11 +724,13 @@ async function evaluateCaseSelection() {
     renderCompatibility(null);
     return;
   }
+  const source = selectedRunSource();
   const payload = await apiJson("/api/history/backtest-cases/evaluate", {
     method: "POST",
     body: JSON.stringify({
       watchlist_ids: ids,
-      strategy_code: els.runStrategy.value || "",
+      strategy_id: source.strategyId,
+      strategy_code: source.strategyCode,
     }),
   });
   renderCompatibility(payload);
@@ -894,9 +947,9 @@ async function createBacktestRun(caseId, strategyCode = "", params = {}) {
 }
 
 async function runSelectedCases() {
-  const strategyCode = els.runStrategy.value || "";
-  if (!strategyCode) {
-    setStatus("Select a StrategyCode first.");
+  const source = selectedRunSource();
+  if (!source.kind) {
+    setStatus("Select a Strategy or StrategyCode first.");
     return;
   }
   const caseIds = [...historyState.selectedRunCaseIds];
@@ -910,15 +963,18 @@ async function runSelectedCases() {
     method: "POST",
     body: JSON.stringify({
       case_ids: caseIds,
-      batch_name: `${strategyCode} · ${collection} · ${new Date().toISOString().slice(0, 19).replace("T", " ")}`,
-      strategy_code: strategyCode,
+      batch_name: `${source.label} · ${collection} · ${new Date().toISOString().slice(0, 19).replace("T", " ")}`,
+      strategy_id: source.strategyId,
+      strategy_code: source.strategyCode,
       params,
     }),
   });
   const batch = payload.data || {};
   renderCoverage({
     status: "batch_created",
-    strategy_code: strategyCode,
+    strategy_id: source.strategyId,
+    strategy_code: source.strategyCode,
+    signal_source_type: source.signalSourceType,
     params,
     batch_id: batch.batch_id,
     run_count: batch.runs?.length || batch.case_count || caseIds.length,

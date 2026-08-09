@@ -5,6 +5,9 @@ const workspaceSummary = document.getElementById("workspaceSummary");
 const workspaceChartMeta = document.getElementById("workspaceChartMeta");
 const workspaceCharts = document.getElementById("workspaceCharts");
 const workspaceEvents = document.getElementById("workspaceEvents");
+const workspaceEventsPanel = document.getElementById("workspaceEventsPanel");
+const workspaceEventsLoadState = document.getElementById("workspaceEventsLoadState");
+const workspaceEventDetails = document.getElementById("workspaceEventDetails");
 const workspaceSources = document.getElementById("workspaceSources");
 const workspaceBacktest = document.getElementById("workspaceBacktest");
 const workspaceChartInsights = document.getElementById("workspaceChartInsights");
@@ -21,8 +24,15 @@ const chartToFixedWrap = document.getElementById("chartToFixedWrap");
 const chartToSummary = document.getElementById("chartToSummary");
 const chartReturnLatestBtn = document.getElementById("chartReturnLatestBtn");
 const chartResolutionMode = document.getElementById("chartResolutionMode");
+const chartLiveModeBtn = document.getElementById("chartLiveModeBtn");
+const chartInspectStatus = document.getElementById("chartInspectStatus");
+const chartFocusTime = document.getElementById("chartFocusTime");
+const chartFitHeightBtn = document.getElementById("chartFitHeightBtn");
+const chartFullscreenBtn = document.getElementById("chartFullscreenBtn");
 const chartMetricPicker = document.getElementById("chartMetricPicker");
 const chartOverlayPicker = document.getElementById("chartOverlayPicker");
+const chartTradeStatus = document.getElementById("chartTradeStatus");
+const chartSeriesLegend = document.getElementById("chartSeriesLegend");
 const workspaceMarketStatus = document.getElementById("workspaceMarketStatus");
 const workspaceTrackedMarkets = document.getElementById("workspaceTrackedMarkets");
 const workspaceMarketResults = document.getElementById("workspaceMarketResults");
@@ -39,7 +49,9 @@ const workspaceStateSelect = document.getElementById("workspaceStateSelect");
 const workspaceMachineStateSelect = document.getElementById("workspaceMachineStateSelect");
 const workspaceDebugMeta = document.getElementById("workspaceDebugMeta");
 const workspaceDebugLog = document.getElementById("workspaceDebugLog");
+const workspaceDebugDetails = workspaceDebugLog?.closest("details") || null;
 const workspaceDebugClearBtn = document.getElementById("workspaceDebugClearBtn");
+const workspaceAddBacktestCaseBtn = document.getElementById("workspaceAddBacktestCaseBtn");
 const marketUi = window.PolyMarketUi;
 const workspaceUrlParams = new URLSearchParams(window.location.search);
 let workspaceViewMode = workspaceUrlParams.get("source") === "backtest" ? "backtest" : "live";
@@ -212,17 +224,21 @@ function stateLaneSegmentColor(lane = {}, segment = {}, overrideColors = loadSta
 }
 
 const SUB_METRIC_GROUPS = [
-  { id: "positions", title: "仓位", keys: ["yes_position", "no_position"] },
-  { id: "sizes", title: "数量", keys: ["yes_qty", "no_qty"] },
-  { id: "averages", title: "均价 / 收益", keys: ["yes_avg", "no_avg", "strategy_pnl"] },
+  { id: "positions", title: "仓位", keys: ["yes_position", "no_position", "position"] },
+  { id: "sizes", title: "数量", keys: ["yes_qty", "no_qty", "qty"] },
+  { id: "averages", title: "均价 / 收益", keys: ["yes_avg", "no_avg", "avg", "strategy_pnl"] },
 ];
+const STATIC_SUB_METRIC_KEYS = new Set(SUB_METRIC_GROUPS.flatMap((group) => group.keys || []));
 const SUB_METRIC_LABELS = {
   yes_position: "Yes Position",
   no_position: "No Position",
+  position: "Position",
   yes_qty: "Yes Qty",
   no_qty: "No Qty",
+  qty: "Qty",
   yes_avg: "Yes Avg",
   no_avg: "No Avg",
+  avg: "Avg",
   strategy_pnl: "Strategy PnL",
   strategy_bankroll: "Strategy Bankroll",
   initial_capital: "Initial Capital",
@@ -250,7 +266,7 @@ const CHART_MODE_CONFIG = {
 };
 const CHART_HEIGHT_STORAGE_KEY = "workspaceChartHeight";
 const CHART_MIN_HEIGHT = 420;
-const CHART_MAX_HEIGHT = 1400;
+const CHART_MAX_HEIGHT = 4200;
 const LEG_COLOR_PAIRS = [
   { yes: "#22d3ee", no: "#0e7490" },
   { yes: "#a78bfa", no: "#6d28d9" },
@@ -297,11 +313,11 @@ const PANEL_WEIGHTS = {
   event_timeline: 10,
 };
 const DELTA_STREAM_INTERVALS = {
-  price: 2000,
-  stats: 5000,
-  metrics: 5000,
-  watch_markets: 10000,
-  overlay: 20000,
+  price: 3000,
+  stats: 8000,
+  metrics: 8000,
+  watch_markets: 15000,
+  overlay: 30000,
   events: 15000,
 };
 const EVENT_LIST_BASE_LIMIT = 120;
@@ -319,6 +335,8 @@ const TIMELINE_RANGE_MS = {
   "3d": 3 * 24 * 60 * 60 * 1000,
   "1w": 7 * 24 * 60 * 60 * 1000,
   "14d": 14 * 24 * 60 * 60 * 1000,
+  "1mo": 30 * 24 * 60 * 60 * 1000,
+  "3mo": 90 * 24 * 60 * 60 * 1000,
   "90d": 90 * 24 * 60 * 60 * 1000,
 };
 const LEGACY_RANGE_MAP = {
@@ -344,14 +362,29 @@ let activeQuickRange = "1d";
 let autoRefreshEnabled = true;
 let workspaceBootReady = false;
 let workspaceBooting = false;
+let eventsRequestedByUser = true;
 let _fullEventsList = []; // canonical list from loadEvents; SSE appends merge into this
 let refreshTimers = { chart: null, events: null, workspace: null };
 let currentLegendNameToKey = new Map();
+let chartNativeHoveredSeriesId = "";
+let chartLastPointerPosition = null;
+let chartTooltipRefreshRevision = 0;
 let currentChartRequestId = 0;
 let currentChartAbortController = null;
 let chartRefreshDebounceTimer = null;
+let subMetricRenderFrame = null;
+let subMetricSeriesAbortController = null;
+let subMetricSeriesRequestId = 0;
+let isSubMetricSeriesLoading = false;
+let metricPickerInitialized = false;
+let lastChartInteractionAt = 0;
+let lastMetricStateRefreshAt = 0;
+let deferredSeriesControlsState = null;
+const hydratedSubMetricTokens = new Set();
+const chartSeriesDataCache = new WeakMap();
 const CHART_RELOAD_DEBOUNCE_MS = 420;
 const CHART_RELOAD_BUSY_DEBOUNCE_MS = 700;
+const METRIC_STATE_REFRESH_INTERVAL_MS = 30000;
 let workspaceDebugLines = [];
 let isChartLoading = false;
 let chartViewState = {
@@ -360,7 +393,33 @@ let chartViewState = {
   startValue: null,
   endValue: null,
 };
+const timelineState = {
+  mode: "LIVE",
+  followLatest: true,
+  rangePreset: "1d",
+  spanMs: TIMELINE_RANGE_MS["1d"],
+  visibleFrom: null,
+  visibleTo: null,
+  focusTime: null,
+  focusEventId: "",
+  pendingPoints: 0,
+  pendingEvents: 0,
+};
+const chartHistoryRequests = new Map();
+let focusedWorkspaceEventIndex = -1;
+let chartHistoryLoading = false;
+let chartFullscreenRestoreHeight = null;
+let fullChartLoadCount = 0;
+let chartHistoryLoadCount = 0;
 let chartZoomSyncSuppressedUntil = 0;
+let chartAxisFitFrame = null;
+let chartAxisPanelIds = [];
+const chartManualAxisRanges = new Map();
+let chartAxisDragState = null;
+let chartAxisDragFrame = null;
+let historyExpansionTimer = null;
+let historyExpansionInFlight = false;
+let lastHistoryExpansionAt = 0;
 let chartLegendSelectedState = loadJsonStorage("workspaceLegendSelectedState", {});
 let lastSeriesControlsSignature = "";
 let lastChartStructureSignature = "";
@@ -368,6 +427,10 @@ let lastChartTimeExtent = null;
 let workspaceLiveSource = null;
 let currentChartPayload = null;
 let currentChartReloadSignature = "";
+let inlineLegendExpanded = localStorage.getItem("workspaceInlineLegendExpanded") === "1";
+let inlineLegendQuery = "";
+let inlineLegendPanel = "all";
+let inlineLegendSeries = [];
 let deltaStreamState = createDeltaStreamState();
 let lastFullChartLoadedAt = 0;
 let isEventsLoading = false;
@@ -470,7 +533,7 @@ function pushDebug(tag, payload = null) {
   if (workspaceDebugLines.length > DEBUG_MAX_LINES) {
     workspaceDebugLines = workspaceDebugLines.slice(-DEBUG_MAX_LINES);
   }
-  if (workspaceDebugLog) {
+  if (workspaceDebugLog && (!workspaceDebugDetails || workspaceDebugDetails.open)) {
     workspaceDebugLog.textContent = workspaceDebugLines.join("\n\n");
     workspaceDebugLog.scrollTop = workspaceDebugLog.scrollHeight;
   }
@@ -555,6 +618,9 @@ function summarizeSeriesRenderData(payload, option = null, targetKeys = null) {
 }
 
 function importantRenderDiagnostics(payload, option = null, targetKeys = null) {
+  if (workspaceDebugDetails && !workspaceDebugDetails.open) {
+    return [];
+  }
   const summaries = summarizeSeriesRenderData(payload, option, targetKeys);
   const important = summaries.filter((item) => (
     item.key === "market_0_yes_bid"
@@ -569,8 +635,9 @@ function importantRenderDiagnostics(payload, option = null, targetKeys = null) {
 }
 
 function compactPriceRenderSummary(payload) {
-  const byKey = new Map(summarizeSeriesRenderData(payload).map((item) => [item.key, item]));
-  return ["market_0_yes_bid", "market_0_yes_ask", "market_0_no_bid", "market_0_no_ask"]
+  const keys = ["market_0_yes_bid", "market_0_yes_ask", "market_0_no_bid", "market_0_no_ask"];
+  const byKey = new Map(summarizeSeriesRenderData(payload, null, keys).map((item) => [item.key, item]));
+  return keys
     .map((key) => {
       const item = byKey.get(key);
       if (!item) return `${key}=missing`;
@@ -683,13 +750,80 @@ function strategyParamHint(key, fallback = "") {
   return PARAM_HINTS[normalized] || fallback || "";
 }
 
+function formatLegMetricLabel(text = "") {
+  const raw = String(text || "").trim();
+  if (!raw) return raw;
+  let match = raw.match(/^L(\d+)\s+(.+)$/i);
+  if (match) {
+    return `Leg ${Number(match[1]) + 1} ${match[2]}`;
+  }
+  match = raw.match(/^L(\d+)_(yes|no)_position$/i);
+  if (match) {
+    return `Leg ${Number(match[1]) + 1} ${match[2].toUpperCase()} Position`;
+  }
+  match = raw.match(/^L(\d+)_position$/i);
+  if (match) {
+    return `Leg ${Number(match[1]) + 1} Position`;
+  }
+  match = raw.match(/^L(\d+)_(.+)$/i);
+  if (match) {
+    return `Leg ${Number(match[1]) + 1} ${humanizeParamKey(match[2])}`;
+  }
+  return raw;
+}
+
 function displaySeriesLabel(item = {}) {
   const key = String(item.key || "");
   if (SERIES_LABEL_OVERRIDES[key]) return SERIES_LABEL_OVERRIDES[key];
   if (item.base_key === "ohlc") return `${item.market_label || item.label || "BTCUSDT"} K线`;
   if (item.base_key === "close") return `${item.market_label || item.label || "BTCUSDT"} 收盘价`;
   if (item.base_key === "volume") return `${item.market_label || item.label || "BTCUSDT"} 成交量`;
-  return item.label || key || "-";
+  const baseLabel = item.label || item.base_key || key.replace(/^metric_state:/, "").replace(/^metric:/, "") || "-";
+  return formatLegMetricLabel(baseLabel);
+}
+
+function fullSeriesLabel(item = {}) {
+  return String(item.full_label || item.label || displaySeriesLabel(item) || item.key || "-").trim();
+}
+
+function inlineSeriesLabel(item = {}) {
+  const marketIndex = Number(item.market_index);
+  const hasMarketIndex = Number.isInteger(marketIndex) && marketIndex >= 0;
+  const fullMarketName = String(item.market_full_label || "").trim();
+  const questionMatch = fullMarketName.match(/^Will\s+(.+?)\s+be\s+/i);
+  const inferredMarketName = questionMatch && questionMatch[1].length <= 32 ? questionMatch[1] : "";
+  const marketName = String(inferredMarketName || item.market_short_label || item.market_label || "").trim();
+  const metricName = SERIES_LABEL_OVERRIDES[item.base_key]
+    || humanizeParamKey(item.base_key || item.label || item.key);
+  if (hasMarketIndex && marketName) {
+    return `L${marketIndex + 1} ${marketName} · ${metricName}`;
+  }
+  return displaySeriesLabel(item);
+}
+
+function isOpaqueMarketIdentifier(value = "") {
+  const text = String(value || "").trim();
+  if (!text) return false;
+  if (/^0x[0-9a-f]{16,}$/i.test(text)) return true;
+  return /^\d{20,}$/.test(text);
+}
+
+function readableTrackedMarketName(market = {}) {
+  const instrument = market.instrument_json && typeof market.instrument_json === "object"
+    ? market.instrument_json
+    : {};
+  const candidates = [
+    instrument.question,
+    instrument.title,
+    market.question,
+    market.display_name,
+    market.group_item_title,
+    market.label,
+    market.symbol,
+  ].map((value) => String(value || "").trim());
+  return candidates.find((value) => value && !isOpaqueMarketIdentifier(value))
+    || candidates.find(Boolean)
+    || "";
 }
 
 function isCryptoSeriesMeta(meta = {}) {
@@ -774,7 +908,10 @@ function localInputToIso(value) {
 
 function normalizeTimelineRange(value) {
   const text = String(value || "").trim().toLowerCase();
-  return LEGACY_RANGE_MAP[text] || text || "1d";
+  const normalized = LEGACY_RANGE_MAP[text] || text || "1d";
+  if (normalized === "30d") return "1mo";
+  if (normalized === "90d") return "3mo";
+  return normalized;
 }
 
 function formatLocalDateTimeInput(date) {
@@ -850,9 +987,67 @@ function formatTimelineLabel(value) {
   return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
 }
 
+function timelineRangeLabel(value) {
+  const range = normalizeTimelineRange(value);
+  return ({ "1mo": "1M", "3mo": "3M", ytd: "YTD", all: "ALL" })[range] || range.toUpperCase();
+}
+
 function parseRangeMs(rangeValue = activeQuickRange) {
   const range = normalizeTimelineRange(rangeValue);
+  if (range === "ytd") {
+    const now = new Date();
+    return Math.max(24 * 60 * 60 * 1000, now.getTime() - Date.UTC(now.getUTCFullYear(), 0, 1));
+  }
+  if (range === "all") {
+    const extent = currentChartPayload ? getTimeExtent(currentChartPayload.rows || [], currentChartPayload.meta || {}) : null;
+    return Math.max(TIMELINE_RANGE_MS["1d"], Number(extent?.rangeMs || 0));
+  }
   return TIMELINE_RANGE_MS[range] || TIMELINE_RANGE_MS["1d"];
+}
+
+function formatFocusTime(value) {
+  const ts = parseChartTime(value);
+  if (ts === null) return "—";
+  const date = new Date(ts);
+  return `${date.getUTCFullYear()}-${pad2(date.getUTCMonth() + 1)}-${pad2(date.getUTCDate())} ${pad2(date.getUTCHours())}:${pad2(date.getUTCMinutes())}:${pad2(date.getUTCSeconds())} UTC`;
+}
+
+function syncTimelineStateUi() {
+  const inspect = timelineState.mode === "INSPECT";
+  if (chartLiveModeBtn) {
+    chartLiveModeBtn.textContent = inspect ? "◐ INSPECT" : "● LIVE";
+    chartLiveModeBtn.classList.toggle("is-live", !inspect);
+    chartLiveModeBtn.classList.toggle("is-inspect", inspect);
+  }
+  if (chartInspectStatus) {
+    chartInspectStatus.hidden = !inspect;
+    chartInspectStatus.textContent = inspect
+      ? `历史查看 · 新增 ${timelineState.pendingPoints} 个点 · ${timelineState.pendingEvents} 条事件${chartHistoryLoading ? " · 后台补充历史" : ""}`
+      : "";
+  }
+  if (chartReturnLatestBtn) chartReturnLatestBtn.hidden = !inspect;
+  if (chartToSummary) chartToSummary.textContent = inspect ? "终点 已冻结" : "终点 最新";
+  if (chartFocusTime) chartFocusTime.textContent = `焦点 ${formatFocusTime(timelineState.focusTime)}`;
+}
+
+function setTimelineMode(mode, reason = "") {
+  const next = mode === "INSPECT" ? "INSPECT" : "LIVE";
+  timelineState.mode = next;
+  timelineState.followLatest = next === "LIVE";
+  if (next === "LIVE") {
+    timelineState.pendingPoints = 0;
+    timelineState.pendingEvents = 0;
+  }
+  lastChartInteractionAt = Date.now();
+  syncTimelineStateUi();
+  pushDebug("[WS] timeline:mode", { mode: next, reason });
+}
+
+function setTimelineFocus(value, eventId = "") {
+  timelineState.focusTime = parseChartTime(value);
+  timelineState.focusEventId = String(eventId || "");
+  syncTimelineStateUi();
+  renderChartFocusLine();
 }
 
 function deriveTimelineWindowMs() {
@@ -865,13 +1060,10 @@ function deriveTimelineWindowMs() {
 }
 
 function autoIntervalForWindowMs(windowMs) {
-  if (windowMs <= TIMELINE_RANGE_MS["15m"]) return "5s";
-  if (windowMs <= TIMELINE_RANGE_MS["1h"]) return "5s";
-  if (windowMs <= TIMELINE_RANGE_MS["6h"]) return "30s";
   if (windowMs <= TIMELINE_RANGE_MS["1d"]) return "1m";
-  if (windowMs <= TIMELINE_RANGE_MS["3d"]) return "5m";
-  if (windowMs <= TIMELINE_RANGE_MS["14d"]) return "15m";
-  if (windowMs <= TIMELINE_RANGE_MS["90d"]) return "1h";
+  if (windowMs <= TIMELINE_RANGE_MS["1w"]) return "5m";
+  if (windowMs <= TIMELINE_RANGE_MS["1mo"]) return "15m";
+  if (windowMs <= TIMELINE_RANGE_MS["3mo"]) return "1h";
   return "4h";
 }
 
@@ -888,18 +1080,34 @@ function isProgrammaticChartZoomSync() {
   return Date.now() < chartZoomSyncSuppressedUntil;
 }
 
+function cancelVisibleAxisAutoFit() {
+  if (chartAxisFitFrame !== null) {
+    cancelAnimationFrame(chartAxisFitFrame);
+    chartAxisFitFrame = null;
+  }
+}
+
+function scheduleVisibleAxisAutoFit(payload = currentChartPayload) {
+  if (!payload || !workspaceChartInstance) return;
+  cancelVisibleAxisAutoFit();
+  chartAxisFitFrame = requestAnimationFrame(() => {
+    chartAxisFitFrame = null;
+    applyVisibleWindowAxisExtents(payload);
+  });
+}
+
 function syncTimelineUi() {
   const toMode = chartToMode?.value || "latest";
   if (chartToFixedWrap) {
     chartToFixedWrap.hidden = toMode !== "specific";
   }
   if (chartToSummary) {
-    chartToSummary.textContent = toMode === "specific" && chartTo?.value
-      ? `To: ${formatTimelineLabel(chartTo.value)}`
-      : "To: Latest";
+    chartToSummary.textContent = timelineState.mode === "INSPECT"
+      ? "终点 已冻结"
+      : (toMode === "specific" && chartTo?.value ? `终点 ${formatTimelineLabel(chartTo.value)}` : "终点 最新");
   }
   if (chartReturnLatestBtn) {
-    chartReturnLatestBtn.hidden = toMode !== "specific";
+    chartReturnLatestBtn.hidden = timelineState.mode !== "INSPECT";
   }
   const interval = currentResolutionInterval();
   if (chartInterval) {
@@ -916,12 +1124,16 @@ function renderTimelineStatus(payload) {
   const meta = payload?.meta || {};
   const sources = meta.sources || {};
   const fromText = formatTimelineLabel(meta.from);
-  const toIsLatest = chartToMode?.value !== "specific";
+  const inspecting = timelineState.mode === "INSPECT";
+  const toIsLatest = !inspecting && chartToMode?.value !== "specific";
   const toText = toIsLatest ? "Latest" : formatTimelineLabel(meta.to || chartTo?.value);
   const interval = meta.interval || chartInterval?.value || autoIntervalForWindowMs(deriveTimelineWindowMs());
   const parts = [];
-  if (toIsLatest && activeQuickRange !== "custom") {
-    parts.push(`Current view: last ${String(activeQuickRange || "1d").toUpperCase()}`);
+  if (inspecting && Number.isFinite(timelineState.visibleFrom) && Number.isFinite(timelineState.visibleTo)) {
+    parts.push(`历史查看: ${formatTimelineLabel(timelineState.visibleFrom)} -> ${formatTimelineLabel(timelineState.visibleTo)}`);
+    parts.push("窗口已冻结");
+  } else if (toIsLatest && activeQuickRange !== "custom") {
+    parts.push(`Current view: ${timelineRangeLabel(activeQuickRange || "1d")}`);
     parts.push("End follows latest data");
   } else {
     parts.push(`Current view: ${fromText} -> ${toText}`);
@@ -941,7 +1153,7 @@ function renderTimelineStatus(payload) {
   if (Number(sources.history_metric_points || 0) > 0) {
     parts.push(`Metrics ${sources.history_metric_points}`);
   }
-  return parts.join(" 路 ");
+  return parts.join(" · ");
 }
 
 function openCustomTimelinePanel() {
@@ -1140,6 +1352,7 @@ function buildChartStructureSignature(payload) {
       panel: s.panel,
       render: s.render,
       label: s.label,
+      visible: (seriesStyleState[s.key] || s.style || {}).visible !== false,
     })),
     state_lanes: (payload.metric_state_lanes || []).filter(isStateLaneDisplayable).map((lane) => ({
       key: stateLaneIdentity(lane),
@@ -1319,9 +1532,27 @@ function buildDefaultMarketTargets() {
       leg_index: Number.isFinite(Number(leg.leg_index)) ? Number(leg.leg_index) : index,
       label: leg.label || symbol || `Leg ${index + 1}`,
       question: leg.question || leg.label || symbol || `Leg ${index + 1}`,
+      display_name: leg.display_name || leg.question || leg.label || symbol || `Leg ${index + 1}`,
+      leg_type: leg.leg_type || (binance ? "position" : "polymarket_binary"),
+      leg_kind: leg.leg_kind || "",
+      position_kind: leg.position_kind || (binance ? "position" : "yes_no"),
       condition_id: leg.condition_id || "",
       yes_token: leg.yes_token || "",
       no_token: leg.no_token || "",
+      yes_bid: leg.yes_bid,
+      yes_ask: leg.yes_ask ?? leg.yes_mark,
+      no_bid: leg.no_bid,
+      no_ask: leg.no_ask ?? leg.no_mark,
+      yes_qty: leg.yes_qty,
+      no_qty: leg.no_qty,
+      yes_avg: leg.yes_avg,
+      no_avg: leg.no_avg,
+      yes_position: leg.yes_position,
+      no_position: leg.no_position,
+      position: leg.position ?? leg.position_qty,
+      qty: leg.qty ?? leg.position_qty,
+      avg: leg.avg ?? leg.avg_price,
+      market_updated_at: leg.market_updated_at || leg.updated_at || "",
       symbol,
       interval: leg.interval || leg.instrument_json?.interval || "1m",
       instrument_id: leg.instrument_id || (symbol ? `crypto_spot:binance:${symbol}` : ""),
@@ -1346,6 +1577,10 @@ function normalizeTrackedMarkets(list) {
       row_id: item.row_id ? Number(item.row_id) : undefined,
       label: item.label || item.question || item.symbol || item.condition_id || `Market ${index + 1}`,
       question: item.question || item.label || "",
+      display_name: item.display_name || item.question || item.label || "",
+      leg_type: item.leg_type || (isBinanceTarget(item) ? "position" : "polymarket_binary"),
+      leg_kind: item.leg_kind || "",
+      position_kind: item.position_kind || (isBinanceTarget(item) ? "position" : "yes_no"),
       slug: item.slug || item.raw?.slug || "",
       event_slug: item.event_slug || item.eventSlug || item.raw?.eventSlug || item.raw?.event_slug || "",
       group_item_title: item.group_item_title || item.groupItemTitle || item.raw?.groupItemTitle || "",
@@ -1353,6 +1588,20 @@ function normalizeTrackedMarkets(list) {
       condition_id: item.condition_id || "",
       yes_token: item.yes_token || "",
       no_token: item.no_token || "",
+      yes_bid: item.yes_bid,
+      yes_ask: item.yes_ask ?? item.yes_mark,
+      no_bid: item.no_bid,
+      no_ask: item.no_ask ?? item.no_mark,
+      yes_qty: item.yes_qty,
+      no_qty: item.no_qty,
+      yes_avg: item.yes_avg,
+      no_avg: item.no_avg,
+      yes_position: item.yes_position,
+      no_position: item.no_position,
+      position: item.position ?? item.position_qty,
+      qty: item.qty ?? item.position_qty,
+      avg: item.avg ?? item.avg_price,
+      market_updated_at: item.market_updated_at || item.updated_at || "",
       symbol: String(item.symbol || "").toUpperCase(),
       interval: item.interval || "1m",
       instrument_id: item.instrument_id || "",
@@ -1373,6 +1622,39 @@ function normalizeTrackedMarkets(list) {
   });
   trackedMarkets = result;
   window.workspaceTrackedMarkets = trackedMarkets;
+}
+
+const MARKET_REQUEST_FIELDS = [
+  "type", "source", "venue", "asset_class", "row_id", "leg_index", "label", "question",
+  "display_name", "leg_type", "leg_kind", "position_kind", "slug", "event_slug",
+  "group_item_title", "url", "condition_id", "yes_token", "no_token", "yes_bid", "yes_ask",
+  "no_bid", "no_ask", "yes_qty", "no_qty", "yes_avg", "no_avg", "yes_position",
+  "no_position", "position", "qty", "avg", "market_updated_at", "symbol", "interval",
+  "instrument_id", "is_primary",
+];
+
+function compactMarketTargetForRequest(target, index) {
+  const output = {};
+  MARKET_REQUEST_FIELDS.forEach((key) => {
+    const value = target?.[key];
+    if (value !== undefined && value !== null && value !== "") {
+      output[key] = value;
+    }
+  });
+  output.type = output.type || "market";
+  output.leg_index = Number.isFinite(Number(output.leg_index)) ? Number(output.leg_index) : index;
+  output.is_primary = index === 0;
+  return output;
+}
+
+function marketTargetsForChartRequest() {
+  const defaults = buildDefaultMarketTargets();
+  const matchesStrategyLegs = defaults.length === trackedMarkets.length
+    && defaults.every((target, index) => marketIdentity(target) === marketIdentity(trackedMarkets[index] || {}));
+  if (matchesStrategyLegs) {
+    return [{ type: "strategy", row_id: Number(rowId) }];
+  }
+  return trackedMarkets.map(compactMarketTargetForRequest);
 }
 
 function primaryTrackedMarket() {
@@ -1429,7 +1711,7 @@ function setAutoRefresh(enabled) {
   refreshTimers = { chart: null, events: null, workspace: null };
   workspaceAutoRefreshBadge.className = `state-chip ${enabled ? "good" : "pending"}`;
   workspaceAutoRefreshBadge.textContent = enabled ? "live" : "pause";
-  workspaceAutoRefreshText.textContent = enabled ? "自动刷新中 · 主图 2s / 统计 5s / 对比 10s / overlay 20s" : "自动刷新已暂停";
+  workspaceAutoRefreshText.textContent = enabled ? "自动刷新中 · 主图 3s / 统计 8s / 对比 15s / overlay 30s" : "自动刷新已暂停";
   if (!enabled) {
     return;
   }
@@ -1442,10 +1724,10 @@ function setAutoRefresh(enabled) {
   }
   refreshTimers.chart = setInterval(() => {
     if (!document.hidden) {
-      if (isChartLoading) {
+      if (isChartLoading || isSubMetricSeriesLoading || Date.now() - lastChartInteractionAt < 1000) {
         pushDebug("[WS] auto-refresh:skip", {
           row_id: Number(rowId),
-          reason: "chart-request-in-flight",
+          reason: isChartLoading || isSubMetricSeriesLoading ? "chart-request-in-flight" : "recent-user-interaction",
         });
         return;
       }
@@ -1786,6 +2068,55 @@ function renderBacktest(backtest) {
   renderWorkspaceBacktestAnalysis(selectedRun);
 }
 
+function currentBacktestDataWindow() {
+  const range = currentTimeRangeParams();
+  const dataWindow = {};
+  if (range.from) dataWindow.start = range.from;
+  if (range.to) dataWindow.end = range.to;
+  return dataWindow;
+}
+
+async function saveWorkspaceBacktestCase() {
+  if (!workspaceAddBacktestCaseBtn) return;
+  const originalText = workspaceAddBacktestCaseBtn.textContent || "添加回测";
+  workspaceAddBacktestCaseBtn.disabled = true;
+  workspaceAddBacktestCaseBtn.textContent = "添加中...";
+  const dataWindow = currentBacktestDataWindow();
+  try {
+    const strategyName = workspaceState?.strategy?.strategy_name || workspaceState?.strategy?.display_name || workspaceTitle?.textContent || `Strategy ${rowId}`;
+    const payload = await fetchJson(`/api/polymarket/strategies/${rowId}/backtest`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        case_only: true,
+        metadata_only: true,
+        case_name: `${strategyName} 回测样例 ${new Date().toLocaleString()}`,
+        data_window: dataWindow,
+        strict_window: Boolean(dataWindow.start || dataWindow.end),
+      }),
+    });
+    const caseId = payload?.data?.case?.case_id || "-";
+    workspaceAddBacktestCaseBtn.textContent = `已添加 #${caseId}`;
+    if (workspaceDebugMeta) {
+      workspaceDebugMeta.textContent = `已加入回测数据：case_id=${caseId}。可在 History 页面命名、运行或删除。`;
+    }
+    pushDebug("[WS] backtest:case-save", {
+      row_id: Number(rowId),
+      case_id: caseId,
+      data_window: dataWindow,
+    });
+    await loadWorkspace(false, true);
+    setTimeout(() => {
+      workspaceAddBacktestCaseBtn.disabled = false;
+      workspaceAddBacktestCaseBtn.textContent = originalText;
+    }, 2200);
+  } catch (error) {
+    workspaceAddBacktestCaseBtn.disabled = false;
+    workspaceAddBacktestCaseBtn.textContent = originalText;
+    if (workspaceDebugMeta) workspaceDebugMeta.textContent = `添加回测失败: ${error.message || error}`;
+  }
+}
+
 async function createWorkspaceBacktest() {
   if (!workspaceBacktest) return;
   const button = workspaceBacktest.querySelector("[data-backtest-create]");
@@ -1796,10 +2127,7 @@ async function createWorkspaceBacktest() {
   const idleLabel = button?.textContent === "创建中..."
     ? (workspaceState?.backtest?.status === "ready" ? "创建回测" : "保存样例")
     : "创建回测";
-  const range = currentTimeRangeParams();
-  const dataWindow = {};
-  if (range.from) dataWindow.start = range.from;
-  if (range.to) dataWindow.end = range.to;
+  const dataWindow = currentBacktestDataWindow();
   const backtestReady = workspaceState?.backtest?.status === "ready";
   try {
     const payload = await fetchJson(`/api/polymarket/strategies/${rowId}/backtest`, {
@@ -1945,7 +2273,6 @@ function candidateUseDataKeys(settingKey) {
 
 function findUseDataValue(useData, settingKey, options = {}) {
   if (!useData || typeof useData !== "object") {
-    console.log("[workspace-autofill] invalid UseData", { settingKey, useData });
     return null;
   }
   const includeOriginalKey = options.includeOriginalKey !== false;
@@ -1954,20 +2281,16 @@ function findUseDataValue(useData, settingKey, options = {}) {
     if (includeOriginalKey) return true;
     return index > 0 && normalizeSettingKey(key) !== normalizedSettingKey;
   });
-  console.log("[workspace-autofill] candidates", { settingKey, includeOriginalKey, candidates, useDataKeys: Object.keys(useData) });
   for (const key of candidates) {
     if (Object.prototype.hasOwnProperty.call(useData, key) && isUsableWorkspaceUseDataValue(useData[key])) {
-      console.log("[workspace-autofill] matched direct key", { settingKey, key, value: useData[key] });
       return { key, value: useData[key] };
     }
   }
   if (!includeOriginalKey) {
-    console.log("[workspace-autofill] normalized match skipped for input_json echo", { settingKey });
     return null;
   }
   const normalized = normalizedSettingKey;
   const matchKey = Object.keys(useData).find((key) => normalizeSettingKey(key) === normalized && isUsableWorkspaceUseDataValue(useData[key]));
-  console.log("[workspace-autofill] normalized match", { settingKey, normalized, matchKey, value: matchKey ? useData[matchKey] : undefined });
   if (matchKey) {
     return { key: matchKey, value: useData[matchKey] };
   }
@@ -1980,28 +2303,30 @@ function isUsableWorkspaceUseDataValue(value) {
 
 let useDataSnapshotCache = null;
 let useDataSnapshotLoadedAt = 0;
+let useDataSnapshotPromise = null;
+let settingsUseDataRefreshTimer = null;
 
 async function loadUseDataSnapshot() {
   const now = Date.now();
-  if (useDataSnapshotCache && now - useDataSnapshotLoadedAt < 5000) {
-    console.log("[workspace-autofill] cache hit", { rowId, useDataSnapshotCache });
+  if (useDataSnapshotCache && now - useDataSnapshotLoadedAt < 60000) {
     return useDataSnapshotCache;
   }
-  const url = `/api/polymarket/strategies/${rowId}/usedata`;
-  console.log("[workspace-autofill] fetch", { rowId, url });
-  const payload = await fetchJson(url);
-  useDataSnapshotCache = payload.data?.data || {};
-  useDataSnapshotLoadedAt = now;
-  console.log("[workspace-autofill] response", { rowId, payload, useDataSnapshotCache });
-  return useDataSnapshotCache;
+  if (useDataSnapshotPromise) return useDataSnapshotPromise;
+  const url = `/api/polymarket/strategies/${rowId}/usedata?live_orderbook=0`;
+  useDataSnapshotPromise = fetchJson(url).then((payload) => {
+    useDataSnapshotCache = payload.data?.data || {};
+    useDataSnapshotLoadedAt = Date.now();
+    return useDataSnapshotCache;
+  }).finally(() => {
+    useDataSnapshotPromise = null;
+  });
+  return useDataSnapshotPromise;
 }
 
 async function autofillSettingFromUseData(button) {
   const key = button?.dataset?.autofillKey || "";
-  console.log("[workspace-autofill] click", { key, rowId, button });
   const field = Array.from(settingsForm.querySelectorAll("[data-setting-key]")).find((item) => item.dataset.settingKey === key);
   if (!field) {
-    console.log("[workspace-autofill] skipped: field not found", { key });
     return;
   }
   const previous = button.textContent;
@@ -2012,7 +2337,6 @@ async function autofillSettingFromUseData(button) {
     const useData = await loadUseDataSnapshot();
     const match = findUseDataValue(useData, key, { includeOriginalKey: false });
     if (!match) {
-      console.log("[workspace-autofill] no match", { key, rowId, useData });
       settingsMessage.textContent = `UseData 中没有找到 ${key} 的可用字段。`;
       return;
     }
@@ -2022,10 +2346,8 @@ async function autofillSettingFromUseData(button) {
     } else {
       field.value = nextValue;
     }
-    console.log("[workspace-autofill] filled", { key, matchedKey: match.key, value: match.value, fieldValue: field.type === "checkbox" ? field.checked : field.value });
     settingsMessage.textContent = `已从 UseData.${match.key} 填入 ${key}，保存后生效。`;
   } catch (error) {
-    console.log("[workspace-autofill] error", { key, rowId, error });
     settingsMessage.textContent = `UseData 读取失败: ${error.message}`;
   } finally {
     button.disabled = false;
@@ -2067,13 +2389,26 @@ async function refreshSettingsUseDataControls({ fillEmpty = false } = {}) {
         filledCount += 1;
       }
     }
-    console.log("[workspace-autofill] refreshed controls", { visibleCount, filledCount, fillEmpty });
+    pushDebug("[workspace-autofill] refreshed-controls", { visible_count: visibleCount, filled_count: filledCount });
     if (settingsMessage && filledCount > 0) {
       settingsMessage.textContent = `已从 UseData 自动填入 ${filledCount} 个参数，保存后生效。`;
     }
   } catch (error) {
-    console.log("[workspace-autofill] refresh controls error", { rowId, error });
+    pushDebug("[workspace-autofill] refresh-controls-error", { row_id: Number(rowId), message: error?.message || String(error) });
   }
+}
+
+function scheduleSettingsUseDataControlsRefresh(options = {}) {
+  clearTimeout(settingsUseDataRefreshTimer);
+  const runWhenIdle = () => {
+    if (isChartLoading || isSubMetricSeriesLoading || Date.now() - lastChartInteractionAt < 1200) {
+      settingsUseDataRefreshTimer = setTimeout(runWhenIdle, 800);
+      return;
+    }
+    settingsUseDataRefreshTimer = null;
+    refreshSettingsUseDataControls(options);
+  };
+  settingsUseDataRefreshTimer = setTimeout(runWhenIdle, 1500);
 }
 
 function parameterGroupKey(field = {}) {
@@ -2137,7 +2472,7 @@ function renderSettings(schema, strategy) {
     </div>
   `;
   settingsMessage.textContent = "已加载策略设置。";
-  refreshSettingsUseDataControls({ fillEmpty: true });
+  scheduleSettingsUseDataControlsRefresh({ fillEmpty: true });
 }
 
 function stateEditorJson(value) {
@@ -2281,9 +2616,105 @@ function renderWorkspaceRuntimeSection(stateStore, runtimeEditable) {
   `;
 }
 
+function metricGroupActions(groupId, keys, selected) {
+  const normalized = [...new Set((keys || []).filter(Boolean))];
+  if (!normalized.length) return "";
+  const selectedCount = normalized.filter((key) => selected.has(key)).length;
+  return `
+    <div class="metric-picker-group-actions" data-sub-metric-group="${escapeHtml(groupId)}" data-selected-count="${selectedCount}" data-total-count="${normalized.length}">
+      <span class="metric-picker-group-count">${selectedCount}/${normalized.length}</span>
+      <button type="button" class="metric-picker-group-action" data-sub-metric-group-action="select-all" data-sub-metric-group="${escapeHtml(groupId)}">全选</button>
+      <button type="button" class="metric-picker-group-action" data-sub-metric-group-action="select-none" data-sub-metric-group="${escapeHtml(groupId)}">全不选</button>
+    </div>
+  `;
+}
+
+function legSubMetricToken(legIndex, baseKey) {
+  return `leg:${Number(legIndex) || 0}:${String(baseKey || "")}`;
+}
+
+function parseLegSubMetricToken(token) {
+  const match = String(token || "").match(/^leg:(\d+):(yes_position|no_position|position|yes_qty|no_qty|qty|yes_avg|no_avg|avg)$/);
+  return match ? { legIndex: Number(match[1]), baseKey: match[2] } : null;
+}
+
+function isBinaryLegDefinition(leg = {}) {
+  const legType = String(leg?.leg_type || "").toLowerCase();
+  const positionKind = String(leg?.position_kind || "").toLowerCase();
+  const assetClass = String(leg?.asset_class || "").toLowerCase();
+  return positionKind === "yes_no"
+    || legType === "polymarket_binary"
+    || assetClass.includes("binary")
+    || Boolean(leg?.condition_id || leg?.yes_token || leg?.no_token);
+}
+
+function subMetricPickerOptions(group, allowed, selected, legDefinitions) {
+  if (!legDefinitions.length) {
+    return group.keys
+      .filter((key) => allowed.has(key))
+      .map((key) => ({
+        token: key,
+        label: SUB_METRIC_LABELS[key] || key,
+        title: SUB_METRIC_LABELS[key] || key,
+        checked: selected.has(key),
+      }));
+  }
+
+  const options = [];
+  legDefinitions.forEach((leg, fallbackIndex) => {
+    const rawIndex = Number(leg?.leg_index);
+    const legIndex = Number.isFinite(rawIndex) ? rawIndex : fallbackIndex;
+    const binary = isBinaryLegDefinition(leg);
+    const name = String(leg?.display_name || leg?.question || leg?.name || leg?.label || "").trim();
+    group.keys.forEach((baseKey) => {
+      if (baseKey === "strategy_pnl" || !allowed.has(baseKey)) return;
+      const applies = binary
+        ? baseKey.startsWith("yes_") || baseKey.startsWith("no_")
+        : ["position", "qty", "avg"].includes(baseKey);
+      if (!applies) return;
+      const token = legSubMetricToken(legIndex, baseKey);
+      const checked = selected.has(token) || selected.has(baseKey);
+      if (checked) selected.add(token);
+      options.push({
+        token,
+        label: `Leg ${legIndex + 1} ${SUB_METRIC_LABELS[baseKey] || baseKey}`,
+        title: name ? `Leg ${legIndex + 1} · ${name}` : `Leg ${legIndex + 1}`,
+        checked,
+      });
+    });
+  });
+  if (group.keys.includes("strategy_pnl") && allowed.has("strategy_pnl")) {
+    options.push({
+      token: "strategy_pnl",
+      label: SUB_METRIC_LABELS.strategy_pnl,
+      title: SUB_METRIC_LABELS.strategy_pnl,
+      checked: selected.has("strategy_pnl"),
+    });
+  }
+  return options;
+}
+
 function renderMetricPicker(capabilities, defaults) {
   const allowed = new Set(capabilities?.sub_allowed || []);
-  const selected = new Set(defaults?.sub_series || []);
+  const legDefinitions = workspaceState?.market_context?.legs || [];
+  const mountedSelection = metricPickerInitialized
+    ? new Set([
+        ...selectedSubMetrics(),
+        ...(isEventTimelineSelected() ? ["__event_timeline"] : []),
+      ])
+    : null;
+  const selected = mountedSelection || new Set(defaults?.sub_series || []);
+  if (!metricPickerInitialized && workspaceViewMode === "live") {
+    [...selected].forEach((token) => {
+      if (
+        String(token).startsWith("metric:")
+        || String(token).startsWith("metric_state:")
+        || token === "__event_timeline"
+      ) {
+        selected.delete(token);
+      }
+    });
+  }
   const metricCatalog = capabilities?.metric_catalog || {};
   const numericMetrics = (metricCatalog.numeric || []).filter((item) => !isBacktestDerivedMetricItem(item));
   const backtestMetrics = (metricCatalog.numeric || []).filter(isBacktestDerivedMetricItem);
@@ -2298,16 +2729,19 @@ function renderMetricPicker(capabilities, defaults) {
     <div class="metric-picker-title">副图组</div>
     <div class="metric-picker-groups">
       ${SUB_METRIC_GROUPS.map((group) => {
-        const keys = group.keys.filter((key) => allowed.has(key));
-        if (!keys.length) return "";
+        const options = subMetricPickerOptions(group, allowed, selected, legDefinitions);
+        if (!options.length) return "";
         return `
-          <div class="metric-picker-group">
-            <div class="metric-picker-group-title">${escapeHtml(group.title)}</div>
+          <div class="metric-picker-group" data-chart-picker-section="positions">
+            <div class="metric-picker-group-header">
+              <div class="metric-picker-group-title">${escapeHtml(group.title)}</div>
+              ${metricGroupActions(group.id, options.map((item) => item.token), selected)}
+            </div>
             <div class="metric-picker-options">
-              ${keys.map((key) => `
-                <label class="checkbox">
-                  <input type="checkbox" data-sub-metric="${escapeHtml(key)}" ${selected.has(key) ? "checked" : ""}>
-                  ${escapeHtml(SUB_METRIC_LABELS[key] || key)}
+              ${options.map((item) => `
+                <label class="checkbox" title="${escapeHtml(item.title)}">
+                  <input type="checkbox" data-sub-metric="${escapeHtml(item.token)}" data-sub-metric-group="${escapeHtml(group.id)}" ${item.checked ? "checked" : ""}>
+                  ${escapeHtml(item.label)}
                 </label>
               `).join("")}
             </div>
@@ -2315,57 +2749,69 @@ function renderMetricPicker(capabilities, defaults) {
         `;
       }).join("")}
       ${numericMetrics.length ? `
-        <div class="metric-picker-group">
-          <div class="metric-picker-group-title">Strategy Metrics</div>
+        <div class="metric-picker-group" data-chart-picker-section="metrics">
+          <div class="metric-picker-group-header">
+            <div class="metric-picker-group-title">Strategy Metrics</div>
+            ${metricGroupActions("strategy_metrics", numericMetrics.map((item) => `metric:${item.key}`), selected)}
+          </div>
           <div class="metric-picker-options">
             ${numericMetrics.map((item) => {
               const key = `metric:${item.key}`;
+              const label = displaySeriesLabel({ ...item, key, base_key: item.key });
               return `
                 <label class="checkbox">
-                  <input type="checkbox" data-sub-metric="${escapeHtml(key)}" ${selected.has(key) ? "checked" : ""}>
-                  ${escapeHtml(item.label || item.key)}
+                  <input type="checkbox" data-sub-metric="${escapeHtml(key)}" data-sub-metric-group="strategy_metrics" ${selected.has(key) ? "checked" : ""}>
+                  ${escapeHtml(label)}
                 </label>
               `;
             }).join("")}
           </div>
         </div>
       ` : (missingBacktestStrategyCatalog ? `
-        <div class="metric-picker-group">
+        <div class="metric-picker-group" data-chart-picker-section="metrics">
           <div class="metric-picker-group-title">Strategy Metrics</div>
           <div class="metric-picker-empty">当前回测 run 没有保存策略代码返回的 metrics；重新回测后会显示策略内部数值指标。</div>
         </div>
       ` : "")}
       ${backtestMetrics.length ? `
-        <div class="metric-picker-group">
-          <div class="metric-picker-group-title">Backtest Metrics</div>
+        <div class="metric-picker-group" data-chart-picker-section="metrics">
+          <div class="metric-picker-group-header">
+            <div class="metric-picker-group-title">Backtest Metrics</div>
+            ${metricGroupActions("backtest_metrics", backtestMetrics.map((item) => `metric:${item.key}`), selected)}
+          </div>
           <div class="metric-picker-options">
             ${backtestMetrics.map((item) => {
               const key = `metric:${item.key}`;
+              const label = displaySeriesLabel({ ...item, key, base_key: item.key });
               return `
                 <label class="checkbox">
-                  <input type="checkbox" data-sub-metric="${escapeHtml(key)}" ${selected.has(key) ? "checked" : ""}>
-                  ${escapeHtml(item.label || item.key)}
+                  <input type="checkbox" data-sub-metric="${escapeHtml(key)}" data-sub-metric-group="backtest_metrics" ${selected.has(key) ? "checked" : ""}>
+                  ${escapeHtml(label)}
                 </label>
               `;
             }).join("")}
           </div>
         </div>
       ` : (missingBacktestStrategyCatalog ? `
-        <div class="metric-picker-group">
+        <div class="metric-picker-group" data-chart-picker-section="status">
           <div class="metric-picker-group-title">State Lanes</div>
           <div class="metric-picker-empty">当前回测 run 没有保存策略代码返回的状态字段；重新回测后会显示状态机与因子状态色带。</div>
         </div>
       ` : "")}
       ${stateMetrics.length ? `
-        <div class="metric-picker-group">
-          <div class="metric-picker-group-title">State Lanes</div>
+        <div class="metric-picker-group" data-chart-picker-section="status">
+          <div class="metric-picker-group-header">
+            <div class="metric-picker-group-title">State Lanes</div>
+            ${metricGroupActions("state_lanes", stateMetrics.map((item) => `metric_state:${item.key}`), selected)}
+          </div>
           <div class="metric-picker-options">
             ${stateMetrics.map((item) => {
               const key = `metric_state:${item.key}`;
+              const label = displaySeriesLabel({ ...item, key, base_key: item.key });
               return `
                 <label class="checkbox">
-                  <input type="checkbox" data-sub-metric="${escapeHtml(key)}" ${selected.has(key) ? "checked" : ""}>
-                  ${escapeHtml(item.label || item.key)}
+                  <input type="checkbox" data-sub-metric="${escapeHtml(key)}" data-sub-metric-group="state_lanes" ${selected.has(key) ? "checked" : ""}>
+                  ${escapeHtml(label)}
                 </label>
               `;
             }).join("")}
@@ -2373,33 +2819,54 @@ function renderMetricPicker(capabilities, defaults) {
         </div>
       ` : ""}
       ${backtestStateMetrics.length ? `
-        <div class="metric-picker-group">
-          <div class="metric-picker-group-title">Backtest State</div>
+        <div class="metric-picker-group" data-chart-picker-section="status">
+          <div class="metric-picker-group-header">
+            <div class="metric-picker-group-title">Backtest State</div>
+            ${metricGroupActions("backtest_state", backtestStateMetrics.map((item) => `metric_state:${item.key}`), selected)}
+          </div>
           <div class="metric-picker-options">
             ${backtestStateMetrics.map((item) => {
               const key = `metric_state:${item.key}`;
+              const label = displaySeriesLabel({ ...item, key, base_key: item.key });
               return `
                 <label class="checkbox">
-                  <input type="checkbox" data-sub-metric="${escapeHtml(key)}" ${selected.has(key) ? "checked" : ""}>
-                  ${escapeHtml(item.label || item.key)}
+                  <input type="checkbox" data-sub-metric="${escapeHtml(key)}" data-sub-metric-group="backtest_state" ${selected.has(key) ? "checked" : ""}>
+                  ${escapeHtml(label)}
                 </label>
               `;
             }).join("")}
           </div>
         </div>
       ` : ""}
-      <div class="metric-picker-group">
-        <div class="metric-picker-group-title">事件流</div>
-        <div class="metric-picker-options">
-          <label class="checkbox">
-            <input type="checkbox" data-sub-metric="__event_timeline" ${selected.has("__event_timeline") ? "checked" : ""}>
-            事件流
-          </label>
-        </div>
-      </div>
     </div>
   `;
+  metricPickerInitialized = true;
+  syncChartToolCounts();
 }
+
+function syncChartToolCounts() {
+  const metricInputs = [...chartMetricPicker.querySelectorAll(
+    'input[data-sub-metric-group="strategy_metrics"], input[data-sub-metric-group="backtest_metrics"]'
+  )];
+  const statusInputs = [...chartMetricPicker.querySelectorAll(
+    'input[data-sub-metric-group="state_lanes"], input[data-sub-metric-group="backtest_state"]'
+  )];
+  const overlayCount = selectedOverlaySymbols("crypto").length + selectedOverlaySymbols("finance").length;
+  const setCount = (id, inputs) => {
+    const target = document.getElementById(id);
+    if (!target) return;
+    target.textContent = `${inputs.filter((input) => input.checked).length}/${inputs.length}`;
+  };
+  setCount("chartMetricsCount", metricInputs);
+  setCount("chartStatusCount", statusInputs);
+  const overlayTarget = document.getElementById("chartOverlayCount");
+  if (overlayTarget) overlayTarget.textContent = String(overlayCount);
+  document.getElementById("chartMetricsToggle")?.classList.toggle("has-selection", metricInputs.some((input) => input.checked));
+  document.getElementById("chartStatusToggle")?.classList.toggle("has-selection", statusInputs.some((input) => input.checked));
+  document.getElementById("chartOverlayToggle")?.classList.toggle("has-selection", overlayCount > 0);
+}
+
+window.syncChartToolCounts = syncChartToolCounts;
 
 function syncOverlayState(capabilities, defaults, forceReset = false) {
   const allowed = capabilities?.overlay_allowed || {};
@@ -2514,6 +2981,7 @@ function renderOverlayPicker(capabilities, defaults) {
       </div>
     </div>
   `;
+  syncChartToolCounts();
 }
 
 function toggleOverlaySymbol(type, symbol) {
@@ -2551,8 +3019,7 @@ function removeOverlaySymbol(type, symbol) {
 }
 
 function isEventTimelineSelected() {
-  const el = chartMetricPicker.querySelector("[data-sub-metric=\"__event_timeline\"]");
-  return el ? el.checked : false;
+  return true;
 }
 
 function selectedSubMetrics() {
@@ -2562,19 +3029,317 @@ function selectedSubMetrics() {
     .filter((k) => !String(k || "").startsWith("metric_state:") || !isTemporalStateLaneKey(String(k).slice("metric_state:".length)));
 }
 
+function isSubMetricPickerMounted() {
+  return Boolean(chartMetricPicker?.querySelector("[data-sub-metric]"));
+}
+
+function baseSubMetricKey(key = "") {
+  const text = String(key || "");
+  return text.replace(/__macd(?:_signal)?$/, "");
+}
+
+function subMetricTokenForSeries(item = {}) {
+  const key = String(item.key || "");
+  const explicitToken = String(item.sub_metric || "").trim();
+  if (explicitToken && (STATIC_SUB_METRIC_KEYS.has(explicitToken) || parseLegSubMetricToken(explicitToken))) {
+    return explicitToken;
+  }
+  const baseKey = baseSubMetricKey(key);
+  if (key.startsWith("metric:")) {
+    return key;
+  }
+  if (baseKey.startsWith("metric:")) {
+    return baseKey;
+  }
+  if (STATIC_SUB_METRIC_KEYS.has(baseKey)) {
+    return baseKey;
+  }
+  return "";
+}
+
+function isSubMetricControlledSeries(item = {}) {
+  return Boolean(subMetricTokenForSeries(item));
+}
+
+function chartSeriesPool(payload = {}) {
+  const byKey = new Map();
+  [...(payload.series || []), ...(payload.sub_series_catalog || [])].forEach((item) => {
+    const key = String(item?.key || "");
+    if (!key) return;
+    byKey.set(key, { ...(byKey.get(key) || {}), ...item });
+  });
+  return [...byKey.values()];
+}
+
+function availableSubMetricTokens(payload = {}) {
+  const tokens = new Set();
+  chartSeriesPool(payload).forEach((item) => {
+    const token = subMetricTokenForSeries(item);
+    if (token) {
+      tokens.add(token);
+    }
+  });
+  (payload.metric_state_lanes || []).forEach((lane) => {
+    const key = stateLaneIdentity(lane);
+    if (key) {
+      tokens.add(`metric_state:${key}`);
+    }
+  });
+  hydratedSubMetricTokens.forEach((token) => tokens.add(token));
+  return tokens;
+}
+
+function stateLaneDataSignature(lanes = []) {
+  return JSON.stringify((lanes || []).map((lane) => ({
+    key: stateLaneIdentity(lane),
+    segments: (lane.segments || []).map((segment) => ({
+      from: segment.from,
+      value: stateLaneSegmentValue(segment),
+    })),
+  })));
+}
+
+function selectedSubMetricsAvailableLocally(payload = currentChartPayload) {
+  if (!payload || !isSubMetricPickerMounted()) {
+    return false;
+  }
+  const available = availableSubMetricTokens(payload);
+  return selectedSubMetrics().every((key) => available.has(key));
+}
+
+function filterChartPayloadForSelectedSubMetrics(payload = {}) {
+  if (!payload || !isSubMetricPickerMounted()) {
+    return payload;
+  }
+  const selected = new Set(selectedSubMetrics());
+  const filteredSeries = chartSeriesPool(payload).filter((item) => {
+    const token = subMetricTokenForSeries(item);
+    return !token || selected.has(token);
+  });
+  const filteredStateLanes = (payload.metric_state_lanes || []).filter((lane) => {
+    const key = stateLaneIdentity(lane);
+    return key && selected.has(`metric_state:${key}`);
+  });
+  const usedPanels = new Set(filteredSeries.map((item) => String(item.panel || "")).filter(Boolean));
+  if (filteredStateLanes.length) {
+    usedPanels.add("metric_states");
+  }
+  const panelSource = payload.panel_catalog || payload.panels || [];
+  const filteredPanels = panelSource.filter((panel) => {
+    const panelId = String(panel.id || "");
+    if (panelId === "event_timeline" && (payload.events || []).length) {
+      return true;
+    }
+    return panelId === "main" || usedPanels.has(panelId);
+  });
+  return {
+    ...payload,
+    panels: filteredPanels.length ? filteredPanels : (payload.panels || []),
+    series: filteredSeries,
+    metric_state_lanes: filteredStateLanes,
+  };
+}
+
+function renderSubMetricSelectionLocally(reason = "sub-metric-local") {
+  if (!selectedSubMetricsAvailableLocally(currentChartPayload)) {
+    return false;
+  }
+  clearTimeout(chartRefreshDebounceTimer);
+  currentChartReloadSignature = buildChartReloadSignature();
+  if (subMetricRenderFrame !== null) {
+    cancelAnimationFrame(subMetricRenderFrame);
+  }
+  subMetricRenderFrame = requestAnimationFrame(() => {
+    subMetricRenderFrame = null;
+    renderCurrentChartPayload(reason);
+  });
+  pushDebug("[WS] chart:sub-metric-local", {
+    row_id: Number(rowId),
+    reason,
+    selected_sub_metric_count: selectedSubMetrics().length,
+    available_sub_metric_count: availableSubMetricTokens(currentChartPayload).size,
+  });
+  return true;
+}
+
 function revealSelectedSubMetricSeries(keys = selectedSubMetrics()) {
   let changed = false;
   (keys || []).forEach((key) => {
     if (!key || String(key).startsWith("metric_state:")) return;
-    const current = { ...(seriesStyleState[key] || {}) };
-    if (current.visible === false) {
-      current.visible = true;
-      seriesStyleState[key] = current;
-      changed = true;
-    }
+    const matchingSeriesKeys = chartSeriesPool(currentChartPayload || {})
+      .filter((item) => subMetricTokenForSeries(item) === key)
+      .map((item) => String(item.key || ""))
+      .filter(Boolean);
+    const styleKeys = matchingSeriesKeys.length ? matchingSeriesKeys : [key];
+    styleKeys.forEach((styleKey) => {
+      const current = { ...(seriesStyleState[styleKey] || {}) };
+      if (current.visible === false) {
+        current.visible = true;
+        seriesStyleState[styleKey] = current;
+        changed = true;
+      }
+    });
   });
   if (changed) {
     persistSeriesStyles();
+  }
+}
+
+function metricSeriesMetadataForToken(token) {
+  const text = String(token || "");
+  if (!text.startsWith("metric:")) return null;
+  const metricKey = text.slice("metric:".length);
+  const catalog = workspaceState?.chart_capabilities?.metric_catalog || {};
+  const item = (catalog.numeric || []).find((candidate) => String(candidate?.key || "") === metricKey);
+  if (!item) return null;
+  const backtestDerived = isBacktestDerivedMetricItem(item);
+  return {
+    key: text,
+    label: String(item.label || metricKey),
+    panel: String(item.panel || "") || (backtestDerived ? "backtest_metrics" : "metric_values"),
+    render: "line",
+    unit: String(item.unit || ""),
+    category: backtestDerived ? "backtest_metric" : "strategy_metric",
+    metric_key: metricKey,
+    source_label: backtestDerived ? "Backtest Metrics" : "Strategy Metrics",
+    source_detail: `metrics.${metricKey}`,
+    removable: false,
+  };
+}
+
+function stateMetricKeyForToken(token) {
+  const text = String(token || "");
+  if (!text.startsWith("metric_state:")) return "";
+  const metricKey = text.slice("metric_state:".length);
+  const catalog = workspaceState?.chart_capabilities?.metric_catalog || {};
+  return (catalog.state || []).some((item) => String(item?.key || "") === metricKey) ? metricKey : "";
+}
+
+function mergeHydratedMetricStateLanes(payload, lanes, tokens) {
+  const requestedKeys = new Set((tokens || []).map(stateMetricKeyForToken).filter(Boolean));
+  const laneMap = new Map((payload.metric_state_lanes || []).map((lane) => [stateLaneIdentity(lane), lane]));
+  requestedKeys.forEach((key) => laneMap.delete(key));
+  (lanes || []).forEach((lane) => {
+    const key = stateLaneIdentity(lane);
+    if (key) laneMap.set(key, lane);
+  });
+  payload.metric_state_lanes = [...laneMap.values()];
+  (tokens || []).forEach((token) => hydratedSubMetricTokens.add(token));
+  if (!(lanes || []).length) return;
+  const panelMap = new Map((payload.panel_catalog || payload.panels || []).map((panel) => [String(panel?.id || ""), panel]));
+  if (!panelMap.has("metric_states")) {
+    panelMap.set("metric_states", { id: "metric_states", title: "State Lanes" });
+  }
+  payload.panel_catalog = [...panelMap.values()];
+}
+
+function addHydratedMetricSeries(payload, tokens) {
+  const existing = new Map((payload.sub_series_catalog || []).map((item) => [String(item?.key || ""), item]));
+  const panelMap = new Map((payload.panel_catalog || payload.panels || []).map((panel) => [String(panel?.id || ""), panel]));
+  (tokens || []).forEach((token) => {
+    const item = metricSeriesMetadataForToken(token);
+    if (!item) return;
+    existing.set(item.key, item);
+    if (!panelMap.has(item.panel)) {
+      panelMap.set(item.panel, {
+        id: item.panel,
+        title: item.panel === "backtest_metrics" ? "Backtest Metrics" : "Strategy Metrics",
+      });
+    }
+  });
+  payload.sub_series_catalog = [...existing.values()];
+  payload.panel_catalog = [...panelMap.values()];
+}
+
+function missingSelectedSubMetricTokens(payload = currentChartPayload) {
+  const available = availableSubMetricTokens(payload || {});
+  return selectedSubMetrics().filter((token) => !available.has(token));
+}
+
+async function hydrateMissingMetricSeries(tokens, reason = "metric-fast-load") {
+  const missing = [...new Set(tokens || [])];
+  const numericTokens = missing.filter((token) => String(token).startsWith("metric:"));
+  const stateTokens = missing.filter((token) => String(token).startsWith("metric_state:"));
+  const metadata = numericTokens.map(metricSeriesMetadataForToken);
+  const stateKeys = stateTokens.map(stateMetricKeyForToken);
+  if (
+    !currentChartPayload
+    || !missing.length
+    || numericTokens.length + stateTokens.length !== missing.length
+    || metadata.some((item) => !item)
+    || stateKeys.some((key) => !key)
+  ) {
+    return false;
+  }
+  if (subMetricSeriesAbortController) {
+    subMetricSeriesAbortController.abort();
+  }
+  const controller = new AbortController();
+  subMetricSeriesAbortController = controller;
+  const requestId = ++subMetricSeriesRequestId;
+  isSubMetricSeriesLoading = true;
+  const startedAt = performance.now();
+  const params = buildChartRequestParams({ includeStyle: false });
+  const cachedExtent = cachedTimelineExtent(currentChartPayload);
+  params.delete("range");
+  params.set("from", new Date(cachedExtent.minTs).toISOString());
+  params.set("to", new Date(cachedExtent.maxTs).toISOString());
+  params.set("streams", "metrics");
+  params.set("cursor_metrics", "");
+  params.set("sub_metrics", missing.join(","));
+  if (stateTokens.length) {
+    params.set("include_metric_states", "1");
+  }
+  try {
+    const response = await fetchJson(`/api/polymarket/strategies/${rowId}/chart-delta?${params.toString()}`, {
+      signal: controller.signal,
+    });
+    if (requestId !== subMetricSeriesRequestId) return true;
+    const deltaData = response?.data || {};
+    if (deltaData.reload_required) return false;
+    const stream = deltaData.metrics || {};
+    currentChartPayload.rows = mergeDeltaPoints(
+      currentChartPayload.rows || [],
+      stream.points || [],
+      currentChartPayload.meta || {},
+    );
+    addHydratedMetricSeries(currentChartPayload, numericTokens);
+    mergeHydratedMetricStateLanes(currentChartPayload, deltaData.metric_state_lanes || [], stateTokens);
+    if (stateTokens.length) {
+      lastMetricStateRefreshAt = Date.now();
+    }
+    numericTokens.forEach((token) => hydratedSubMetricTokens.add(token));
+    if (stream.next_cursor) {
+      deltaStreamState.cursors.metrics = stream.next_cursor;
+    }
+    deltaStreamState.lastSuccessAt.metrics = Date.now();
+    currentChartReloadSignature = buildChartReloadSignature();
+    renderSubMetricSelectionLocally(reason);
+    pushDebug("[WS] chart:metric-fast-load", {
+      row_id: Number(rowId),
+      token_count: missing.length,
+      numeric_count: numericTokens.length,
+      state_count: stateTokens.length,
+      points: (stream.points || []).length,
+      state_lanes: (deltaData.metric_state_lanes || []).length,
+      total_ms: Number((performance.now() - startedAt).toFixed(1)),
+    });
+    return true;
+  } catch (error) {
+    if (isAbortError(error)) return true;
+    pushDebug("[WS] chart:metric-fast-load-error", {
+      row_id: Number(rowId),
+      token_count: missing.length,
+      message: error?.message || String(error),
+    });
+    return false;
+  } finally {
+    if (requestId === subMetricSeriesRequestId) {
+      isSubMetricSeriesLoading = false;
+    }
+    if (subMetricSeriesAbortController === controller) {
+      subMetricSeriesAbortController = null;
+    }
   }
 }
 
@@ -2597,7 +3362,7 @@ function renderTrackedMarkets() {
     return;
   }
   workspaceTrackedMarkets.innerHTML = trackedMarkets.map((market, index) => `
-    <div class="tracked-market-chip ${index === 0 ? "" : "secondary-chip"}">
+    <div class="tracked-market-chip">
       <div class="tracked-market-head">
         ${isBinanceTarget(market)
           ? `<span class="table-link-button">${escapeHtml(market.label || market.symbol || "Binance")}</span>`
@@ -2608,20 +3373,17 @@ function renderTrackedMarkets() {
         </div>
       </div>
       <div class="tracked-market-meta">
-        <span>${isBinanceTarget(market) ? "Binance" : (market.type === "strategy" ? "策略默认" : "附加市场")}</span>
-        <span>${isBinanceTarget(market) ? `${escapeHtml(market.symbol || "-")} · ${escapeHtml(market.interval || "1m")}` : `Condition ${escapeHtml(market.condition_id || "-")}`}</span>
+        <span>Leg ${index + 1} · ${escapeHtml(market.leg_type || (isBinanceTarget(market) ? "Position" : "Polymarket Yes/No"))}</span>
+        <span>${isBinanceTarget(market) ? `${escapeHtml(market.symbol || market.label || "-")} · ${escapeHtml(market.interval || "1m")}` : escapeHtml(market.question || market.display_name || market.condition_id || "-")}</span>
       </div>
     </div>
   `).join("");
 }
 
 function renderMarketStatus() {
-  const primary = trackedMarkets[0];
-  workspaceMarketStatus.textContent = primary
-    ? (isBinanceTarget(primary)
-        ? `当前主标的 ${primary.label || primary.symbol} | Binance ${primary.symbol || "-"} ${primary.interval || "1m"} | 已加载 ${trackedMarkets.length} 个数据集`
-        : `当前主市场 ${primary.label} | Condition ${primary.condition_id || "-"} | 已加载 ${trackedMarkets.length} 个市场数据集`)
-    : "当前没有市场数据集。";
+  workspaceMarketStatus.textContent = trackedMarkets.length
+    ? `已加载 ${trackedMarkets.length} 个 strategy legs；图表按每个 leg 的 instrument 类型展示。`
+    : "当前没有 strategy legs。";
 }
 
 function renderMarketResults() {
@@ -2731,6 +3493,9 @@ function backtestEventsForWorkspace(run = {}) {
 }
 
 function renderWorkspaceModeEvents() {
+  if (!eventsRequestedByUser) {
+    return;
+  }
   if (workspaceViewMode === "backtest" && selectedBacktestResults?.selected_run) {
     _fullEventsList = backtestEventsForWorkspace(selectedBacktestResults.selected_run);
     renderEvents(_fullEventsList);
@@ -2756,6 +3521,9 @@ function patchWorkspaceSummary(fields) {
 function eventIdentity(event) {
   if (!event || typeof event !== "object") {
     return "";
+  }
+  if (event.id !== null && event.id !== undefined && String(event.id).trim()) {
+    return String(event.id);
   }
   return [
     event.ts || "",
@@ -2822,11 +3590,231 @@ function appendWorkspaceEvent(event) {
     workspaceState = {};
   }
   const base = _fullEventsList.length ? _fullEventsList : (Array.isArray(workspaceState.recent_events) ? workspaceState.recent_events : []);
+  const eventKey = chartEventIdentity(event);
+  const isNewEvent = !base.some((item) => chartEventIdentity(item) === eventKey);
   const next = limitEventsWithTypeGuarantee([event, ...base]);
   _fullEventsList = next;
   workspaceState.recent_events = next.slice(0, 30);
+  if (currentChartPayload) {
+    currentChartPayload.events = mergeDeltaEvents(currentChartPayload.events || [], [event], currentChartPayload.meta || {});
+  }
+  if (
+    timelineState.mode === "INSPECT"
+    && isNewEvent
+    && (timelineState.visibleTo === null || (parseTimeSafe(event.ts) || 0) > timelineState.visibleTo)
+  ) {
+    timelineState.pendingEvents += 1;
+    syncTimelineStateUi();
+  }
   renderEvents(next);
 }
+
+function compactWorkspaceEventSummary(value) {
+  const cleaned = String(value || "-")
+    .replace(/===DB_JSON_BEGIN===[\s\S]*$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned.length > 420 ? `${cleaned.slice(0, 417)}…` : cleaned;
+}
+
+function closeWorkspaceEventDetails() {
+  if (!workspaceEventDetails) return;
+  workspaceEventDetails.classList.remove("is-open");
+  window.setTimeout(() => {
+    if (!workspaceEventDetails.classList.contains("is-open")) {
+      workspaceEventDetails.hidden = true;
+    }
+  }, 180);
+}
+
+function renderWorkspaceEventDetails(event = {}) {
+  if (!workspaceEventDetails) return;
+  const payload = tradeEventPayload(event);
+  const summary = event.summary || event.label || event.event_type || event.type || "-";
+  const details = {
+    time: event.ts || "",
+    type: event.event_type || event.type || "",
+    leg: event.leg ?? payload.leg ?? payload.leg_index ?? "",
+    severity: event.severity || "",
+    source: event.source || event.env || "",
+    summary,
+    related_id: event.related_id || event.correlation_id || event.order_id || payload.order_id || "",
+    payload: event.payload || payload,
+  };
+  const typeLabel = String(details.type || "event").toUpperCase();
+  const summaryText = compactWorkspaceEventSummary(summary);
+  const metaItems = [
+    ["时间", details.time ? formatFocusTime(details.time) : "—"],
+    ["来源", details.source || "—"],
+    ["Leg", details.leg === "" ? "—" : String(details.leg)],
+    ["级别", details.severity || "—"],
+    ["关联 ID", details.related_id || "—"],
+  ];
+  workspaceEventDetails.hidden = false;
+  workspaceEventDetails.innerHTML = `
+    <div class="ws3-event-details-shell">
+      <header class="ws3-event-details-head">
+        <div class="ws3-event-details-heading">
+          <span class="ws3-event-details-eyebrow">EVENT INSPECT</span>
+          <div class="ws3-event-details-title">
+            <span class="ws3-event-details-type">${escapeHtml(typeLabel)}</span>
+            <strong>事件详情</strong>
+          </div>
+        </div>
+        <button class="ws3-event-details-close" type="button" data-close-event-details aria-label="关闭事件详情" title="关闭详情，保留图表焦点">×</button>
+      </header>
+      <div class="ws3-event-details-body">
+        <section class="ws3-event-details-summary">
+          <span class="ws3-event-details-section-label">摘要</span>
+          <p>${escapeHtml(summaryText)}</p>
+        </section>
+        <dl class="ws3-event-details-meta">
+          ${metaItems.map(([label, value]) => `
+            <div>
+              <dt>${escapeHtml(label)}</dt>
+              <dd title="${escapeHtml(value)}">${escapeHtml(value)}</dd>
+            </div>
+          `).join("")}
+        </dl>
+        <details class="ws3-event-payload">
+          <summary>
+            <span>Payload JSON</span>
+            <span class="ws3-event-payload-hint">按需展开</span>
+          </summary>
+          <pre>${escapeHtml(JSON.stringify(details.payload || {}, null, 2))}</pre>
+        </details>
+      </div>
+      <footer class="ws3-event-details-actions">
+        <button type="button" data-event-nav="previous" title="上一条事件 (K)">← 上一条 <kbd>K</kbd></button>
+        <button type="button" data-event-nav="next" title="下一条事件 (J)">下一条 <kbd>J</kbd> →</button>
+        <button type="button" data-event-return-latest title="回到最新 (L)">回到最新 <kbd>L</kbd></button>
+        <button type="button" data-event-clear-focus title="取消事件焦点 (Esc)">取消焦点 <kbd>Esc</kbd></button>
+      </footer>
+    </div>
+  `;
+  requestAnimationFrame(() => workspaceEventDetails.classList.add("is-open"));
+}
+
+async function loadWorkspaceEventDetails(event = {}) {
+  renderWorkspaceEventDetails(event);
+  const eventId = String(event.id || "");
+  const focusId = chartEventIdentity(event);
+  if (!eventId) return;
+  try {
+    const payload = await fetchJson(`/api/polymarket/strategies/${rowId}/events/${encodeURIComponent(eventId)}`);
+    if (timelineState.focusEventId === focusId && payload?.data) {
+      renderWorkspaceEventDetails(payload.data);
+    }
+  } catch (error) {
+    pushDebug("[WS] event-detail:error", {
+      event_id: eventId,
+      message: error?.message || String(error),
+    });
+  }
+}
+
+function highlightEventContext(event = {}) {
+  if (!workspaceChartInstance) return;
+  const payload = tradeEventPayload(event);
+  const leg = Number(event.leg ?? payload.leg ?? payload.leg_index);
+  const targetId = chartEventIdentity(event);
+  const option = workspaceChartInstance.getOption?.() || {};
+  workspaceChartInstance.dispatchAction({ type: "downplay" });
+  (option.series || []).forEach((series, seriesIndex) => {
+    const id = String(series?.id || "");
+    if (Number.isFinite(leg) && (id.startsWith(`market_${leg}_`) || id.includes(`leg_${leg}`))) {
+      workspaceChartInstance.dispatchAction({ type: "highlight", seriesIndex });
+    }
+    if (id.startsWith("__event_timeline:")) {
+      const dataIndex = (series.data || []).findIndex((item) => String(item?.eventId || "") === targetId);
+      if (dataIndex >= 0) {
+        workspaceChartInstance.dispatchAction({ type: "highlight", seriesIndex, dataIndex });
+      }
+    }
+  });
+}
+
+function revealWorkspaceEventInList(item) {
+  if (!workspaceEvents || !item) return;
+  const listRect = workspaceEvents.getBoundingClientRect();
+  const itemRect = item.getBoundingClientRect();
+  if (itemRect.top >= listRect.top && itemRect.bottom <= listRect.bottom) return;
+  workspaceEvents.scrollBy({
+    top: itemRect.top - listRect.top - Math.max(0, (workspaceEvents.clientHeight - itemRect.height) * 0.4),
+    behavior: "smooth",
+  });
+}
+
+function navigateWorkspaceEvent(direction) {
+  if (!_fullEventsList.length || typeof window.focusWorkspaceEvent !== "function") return;
+  const ordered = [..._fullEventsList].sort(
+    (left, right) => (parseTimeSafe(left.ts) || 0) - (parseTimeSafe(right.ts) || 0),
+  );
+  const current = ordered.findIndex((item) => chartEventIdentity(item) === timelineState.focusEventId);
+  const step = direction >= 0 ? 1 : -1;
+  const next = current < 0
+    ? (step > 0 ? 0 : ordered.length - 1)
+    : Math.max(0, Math.min(ordered.length - 1, current + step));
+  window.focusWorkspaceEvent(chartEventIdentity(ordered[next]), "navigation");
+}
+
+window.focusWorkspaceEvent = function focusWorkspaceEvent(eventId, source = "list") {
+  const id = String(eventId || "");
+  const combined = [..._fullEventsList, ...(currentChartPayload?.events || [])];
+  const event = combined.find((item) => chartEventIdentity(item) === id);
+  if (!event) return;
+  const ts = parseTimeSafe(event.ts);
+  if (ts === null) return;
+  const extent = cachedTimelineExtent();
+  const visible = resolveVisibleTimeWindow(extent);
+  const span = Math.max(
+    60 * 1000,
+    Number(timelineState.spanMs) || Math.max(60 * 1000, visible.maxTs - visible.minTs),
+  );
+  const from = ts - span * 0.4;
+  const to = from + span;
+  timelineState.focusEventId = id;
+  window.workspaceFocusedEventId = id;
+  focusedWorkspaceEventIndex = _fullEventsList.findIndex((item) => chartEventIdentity(item) === id);
+  setTimelineFocus(ts, id);
+  applyLocalTimeWindow(from, to, { mode: "INSPECT", reason: `event-${source}` });
+  loadWorkspaceEventDetails(event);
+  highlightEventContext(event);
+  document.querySelectorAll(".ws3-event-item").forEach((item) => {
+    const focused = item.dataset.eventId === id;
+    item.classList.toggle("is-focused", focused);
+    item.setAttribute("aria-selected", focused ? "true" : "false");
+    if (focused && source !== "list") revealWorkspaceEventInList(item);
+  });
+  if (from < extent.minTs || to > extent.maxTs) {
+    loadChartHistory(Math.min(from, extent.minTs), Math.max(to, extent.maxTs), "event-focus")
+      .then(() => {
+        applyLocalTimeWindow(from, to, { mode: "INSPECT", reason: "event-focus-ready" });
+        setTimelineFocus(ts, id);
+        highlightEventContext(event);
+      })
+      .catch((error) => pushDebug("[WS] history:error", { reason: "event-focus", message: error?.message || String(error) }));
+  }
+};
+
+workspaceEventDetails?.addEventListener("click", (event) => {
+  if (event.target.closest("[data-close-event-details]")) {
+    closeWorkspaceEventDetails();
+    return;
+  }
+  const navigation = event.target.closest("[data-event-nav]");
+  if (navigation) {
+    navigateWorkspaceEvent(navigation.dataset.eventNav === "next" ? 1 : -1);
+    return;
+  }
+  if (event.target.closest("[data-event-return-latest]")) {
+    returnTimelineToLatest("event-drawer");
+    return;
+  }
+  if (event.target.closest("[data-event-clear-focus]")) {
+    clearTimelineFocus();
+  }
+});
 
 function disconnectWorkspaceLive() {
   if (workspaceLiveSource) {
@@ -2837,7 +3825,7 @@ function disconnectWorkspaceLive() {
 
 function connectWorkspaceLive() {
   disconnectWorkspaceLive();
-  workspaceLiveSource = new EventSource(`/api/live/strategies/${encodeURIComponent(rowId)}/workspace`);
+  workspaceLiveSource = new EventSource(`/api/live/strategies/${encodeURIComponent(rowId)}/workspace?include_events=1`);
 
   workspaceLiveSource.addEventListener("summary", (evt) => {
     try {
@@ -2847,6 +3835,7 @@ function connectWorkspaceLive() {
   });
 
   workspaceLiveSource.addEventListener("event_append", (evt) => {
+    if (!eventsRequestedByUser) return;
     try {
       const payload = JSON.parse(evt.data || "{}");
       appendWorkspaceEvent(payload);
@@ -2925,6 +3914,7 @@ function ensureChartShell() {
   if (workspaceChartInstance && workspaceChartInstance.getDom() !== canvas) {
     workspaceChartInstance.dispose();
     workspaceChartInstance = null;
+    window.workspaceChartInstance = null;
   }
   if (workspaceChartInstance) workspaceChartInstance.resize();
   return canvas;
@@ -2983,14 +3973,10 @@ function setupChartResizeHandle() {
   });
 }
 
-function ensureReadableBacktestChartHeight(payload = {}) {
-  if (chartHeightUserAdjusted || workspaceViewMode !== "backtest") {
-    return;
-  }
-  const expandedPanels = expandChartPanels(payload.panels || [], payload.metric_state_lanes || [], payload.events || []);
-  const panelCount = expandedPanels.length || 1;
-  const targetHeight = panelCount >= 7 ? 980 : panelCount >= 6 ? 900 : panelCount >= 5 ? 820 : 0;
-  if (targetHeight && workspaceChartHeight < targetHeight) {
+function ensureReadableChartHeight(payload = {}) {
+  if (chartHeightUserAdjusted) return;
+  const targetHeight = recommendedChartHeight(payload);
+  if (workspaceChartHeight < targetHeight) {
     applyChartHeight(targetHeight, false);
   }
 }
@@ -3032,11 +4018,485 @@ function setupEventTimelineHover(chart) {
   });
 }
 
+function chartDatumValue(datum) {
+  if (datum && typeof datum === "object" && !Array.isArray(datum)) return datum.value;
+  return datum;
+}
+
+function setupChartPointerTracking(chart) {
+  if (!chart || chart.__workspacePointerTrackingBound) return;
+  chart.__workspacePointerTrackingBound = true;
+  const viewport = chart.getZr()?.painter?.getViewportRoot?.();
+  if (!viewport) return;
+  const rememberPointerPosition = (event) => {
+    const bounds = viewport.getBoundingClientRect();
+    if (!bounds.width || !bounds.height) return;
+    chartLastPointerPosition = [
+      (event.clientX - bounds.left) * (chart.getWidth() / bounds.width),
+      (event.clientY - bounds.top) * (chart.getHeight() / bounds.height),
+    ];
+  };
+  viewport.addEventListener("mousemove", rememberPointerPosition, true);
+  viewport.addEventListener("mouseleave", () => {
+    chartNativeHoveredSeriesId = "";
+    chartLastPointerPosition = null;
+    chartTooltipRefreshRevision += 1;
+  }, true);
+}
+
+function refreshAxisTooltipForNativeHover(chart) {
+  const point = chartLastPointerPosition;
+  if (!chart || !Array.isArray(point)) return;
+  const revision = ++chartTooltipRefreshRevision;
+  window.requestAnimationFrame(() => {
+    if (revision !== chartTooltipRefreshRevision || !Array.isArray(chartLastPointerPosition)) return;
+    chart.dispatchAction({ type: "hideTip" });
+    chart.dispatchAction({ type: "showTip", x: chartLastPointerPosition[0], y: chartLastPointerPosition[1] });
+  });
+}
+
+function resetChartTooltipFocus(chart) {
+  chartTooltipRefreshRevision += 1;
+  chartNativeHoveredSeriesId = "";
+  chartLastPointerPosition = null;
+  if (!chart) return;
+  chart.dispatchAction({ type: "hideTip" });
+  chart.dispatchAction({ type: "updateAxisPointer", currTrigger: "leave" });
+}
+
+function setupNativeLineTooltipFocus(chart) {
+  if (!chart || chart.__workspaceNativeLineTooltipBound) return;
+  chart.__workspaceNativeLineTooltipBound = true;
+  chart.on("mouseover", (params) => {
+    if (params?.componentType !== "series" || params?.seriesType !== "line" || !params?.seriesId) return;
+    chartNativeHoveredSeriesId = String(params.seriesId);
+    refreshAxisTooltipForNativeHover(chart);
+  });
+  chart.on("mouseout", (params) => {
+    if (params?.componentType !== "series" || params?.seriesType !== "line") return;
+    const leavingSeriesId = String(params?.seriesId || "");
+    window.setTimeout(() => {
+      if (chartNativeHoveredSeriesId !== leavingSeriesId) return;
+      chartNativeHoveredSeriesId = "";
+      refreshAxisTooltipForNativeHover(chart);
+    }, 0);
+  });
+}
+
+function dataZoomAbsoluteWindow(dataZoomState = {}, payload = currentChartPayload) {
+  if (!payload) return null;
+  const extent = getTimeExtent(payload.rows || [], payload.meta || {});
+  let from = parseChartTime(dataZoomState.startValue);
+  let to = parseChartTime(dataZoomState.endValue);
+  if (from === null || to === null) {
+    const start = Number(dataZoomState.start);
+    const end = Number(dataZoomState.end);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+    from = extent.minTs + extent.rangeMs * Math.min(start, end) / 100;
+    to = extent.minTs + extent.rangeMs * Math.max(start, end) / 100;
+  }
+  if (!Number.isFinite(from) || !Number.isFinite(to) || from === to) return null;
+  return {
+    from: Math.min(from, to),
+    to: Math.max(from, to),
+    span: Math.max(60 * 1000, Math.abs(to - from)),
+    extent,
+  };
+}
+
+function applyLocalTimeWindow(from, to, options = {}) {
+  const start = Number(from);
+  const end = Number(to);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) return;
+  chartViewState = { start: null, end: null, startValue: start, endValue: end };
+  timelineState.visibleFrom = start;
+  timelineState.visibleTo = end;
+  timelineState.spanMs = end - start;
+  if (options.preset) timelineState.rangePreset = normalizeTimelineRange(options.preset);
+  setTimelineMode(options.mode === "LIVE" ? "LIVE" : "INSPECT", options.reason || "local-window");
+  if (workspaceChartInstance) {
+    suppressProgrammaticChartZoomSync();
+    workspaceChartInstance.dispatchAction({ type: "dataZoom", startValue: start, endValue: end });
+    scheduleVisibleAxisAutoFit(currentChartPayload);
+    syncChartInteractionState(workspaceChartInstance);
+    renderChartFocusLine();
+  }
+}
+
+function cachedTimelineExtent(payload = currentChartPayload) {
+  if (!payload) {
+    const now = Date.now();
+    return { minTs: now - TIMELINE_RANGE_MS["1d"], maxTs: now, rangeMs: TIMELINE_RANGE_MS["1d"] };
+  }
+  return getTimeExtent(payload.rows || [], payload.meta || {});
+}
+
+function presetTimelineWindow(rangeValue, payload = currentChartPayload) {
+  const range = normalizeTimelineRange(rangeValue);
+  const extent = cachedTimelineExtent(payload);
+  const to = extent.maxTs;
+  if (range === "all") {
+    const requestedFrom = Date.UTC(2015, 0, 1);
+    return { from: extent.minTs, to, requestedFrom };
+  }
+  if (range === "ytd") {
+    const date = new Date(to);
+    const requestedFrom = Date.UTC(date.getUTCFullYear(), 0, 1);
+    return { from: Math.max(extent.minTs, requestedFrom), to, requestedFrom };
+  }
+  const span = parseRangeMs(range);
+  const requestedFrom = to - span;
+  return { from: Math.max(extent.minTs, requestedFrom), to, requestedFrom };
+}
+
+function mergeHistoryPayload(current, incoming) {
+  if (!current) return cloneChartPayload(incoming);
+  if (!incoming) return current;
+  const currentMeta = current.meta || {};
+  const incomingMeta = incoming.meta || {};
+  const fromCandidates = [currentMeta.from, incomingMeta.from].map(parseTimeSafe).filter(Number.isFinite);
+  const toCandidates = [currentMeta.to, incomingMeta.to].map(parseTimeSafe).filter(Number.isFinite);
+  const meta = {
+    ...currentMeta,
+    ...incomingMeta,
+    from: fromCandidates.length ? new Date(Math.min(...fromCandidates)).toISOString() : (incomingMeta.from || currentMeta.from),
+    to: toCandidates.length ? new Date(Math.max(...toCandidates)).toISOString() : (incomingMeta.to || currentMeta.to),
+    sources: { ...(currentMeta.sources || {}), ...(incomingMeta.sources || {}) },
+  };
+  return {
+    ...current,
+    ...incoming,
+    meta,
+    panels: (incoming.panels || []).length ? incoming.panels : (current.panels || []),
+    panel_catalog: (incoming.panel_catalog || []).length ? incoming.panel_catalog : (current.panel_catalog || []),
+    series: (incoming.series || []).length ? incoming.series : (current.series || []),
+    sub_series_catalog: (incoming.sub_series_catalog || []).length ? incoming.sub_series_catalog : (current.sub_series_catalog || []),
+    rows: mergeDeltaPoints(current.rows || [], incoming.rows || [], meta),
+    events: mergeDeltaEvents(current.events || [], incoming.events || [], meta),
+    metric_state_lanes: (incoming.metric_state_lanes || []).length
+      ? incoming.metric_state_lanes
+      : (current.metric_state_lanes || []),
+  };
+}
+
+async function loadChartHistory(from, to, reason = "prefetch") {
+  if (!currentChartPayload || workspaceViewMode === "backtest") return null;
+  const start = Number(from);
+  const end = Number(to);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) return null;
+  const key = `${currentResolutionInterval()}|${Math.round(start)}|${Math.round(end)}`;
+  if (chartHistoryRequests.has(key)) return chartHistoryRequests.get(key);
+  const frozenView = { ...chartViewState };
+  const request = (async () => {
+    chartHistoryLoading = true;
+    chartHistoryLoadCount += 1;
+    syncTimelineStateUi();
+    syncChartInteractionState();
+    const params = buildChartRequestParams({ includeStyle: false });
+    params.delete("range");
+    params.set("from", new Date(start).toISOString());
+    params.set("to", new Date(end).toISOString());
+    params.set("include_events", "1");
+    try {
+      const payload = await fetchJson(`/api/polymarket/strategies/${rowId}/chart-history?${params.toString()}`);
+      currentChartPayload = mergeHistoryPayload(currentChartPayload, payload?.data || {});
+      chartViewState = frozenView;
+      currentChartReloadSignature = buildChartReloadSignature();
+      renderCharts(currentChartPayload);
+      if (Number.isFinite(Number(frozenView.startValue)) && Number.isFinite(Number(frozenView.endValue))) {
+        applyLocalTimeWindow(Number(frozenView.startValue), Number(frozenView.endValue), {
+          mode: timelineState.mode,
+          reason: `${reason}-preserve-view`,
+        });
+      }
+      return currentChartPayload;
+    } finally {
+      chartHistoryLoading = false;
+      chartHistoryRequests.delete(key);
+      syncTimelineStateUi();
+    }
+  })();
+  chartHistoryRequests.set(key, request);
+  return request;
+}
+
+function activateTimelinePreset(rangeValue, reason = "preset") {
+  const range = normalizeTimelineRange(rangeValue);
+  const window = presetTimelineWindow(range);
+  activeQuickRange = range;
+  timelineState.rangePreset = range;
+  timelineState.spanMs = Math.max(60 * 1000, window.to - window.requestedFrom);
+  if (chartFrom) chartFrom.value = "";
+  if (chartTo) chartTo.value = "";
+  if (chartToMode) chartToMode.value = "latest";
+  closeCustomTimelinePanel();
+  updateQuickRangeButtons();
+  currentChartReloadSignature = buildChartReloadSignature();
+  applyLocalTimeWindow(window.from, window.to, { mode: "LIVE", reason, preset: range });
+  if (window.requestedFrom < window.from) {
+    loadChartHistory(window.requestedFrom, window.from, `${reason}-${range}`)
+      .then(() => applyLocalTimeWindow(window.requestedFrom, window.to, { mode: "LIVE", reason: `${reason}-ready`, preset: range }))
+      .catch((error) => pushDebug("[WS] history:error", { reason, message: error?.message || String(error) }));
+  }
+}
+
+function returnTimelineToLatest(reason = "return-latest") {
+  const extent = cachedTimelineExtent();
+  const span = Math.max(60 * 1000, Number(timelineState.spanMs) || parseRangeMs(activeQuickRange));
+  setTimelineToLatest();
+  applyLocalTimeWindow(extent.maxTs - span, extent.maxTs, { mode: "LIVE", reason });
+}
+
+function scheduleEarlierHistoryLoad(dataZoomState) {
+  const window = dataZoomAbsoluteWindow(dataZoomState);
+  if (
+    !window
+    || historyExpansionInFlight
+    || workspaceViewMode === "backtest"
+    || Date.now() - lastHistoryExpansionAt < 800
+  ) return;
+  const distanceFromLeft = (window.from - window.extent.minTs) / Math.max(1, window.extent.rangeMs);
+  if (distanceFromLeft > 0.20) return;
+  clearTimeout(historyExpansionTimer);
+  historyExpansionTimer = setTimeout(() => {
+    if (historyExpansionInFlight || !currentChartPayload) return;
+    const chunk = Math.max(window.span, Number(timelineState.spanMs) || TIMELINE_RANGE_MS["1d"]);
+    const requestFrom = window.extent.minTs - chunk;
+    historyExpansionInFlight = true;
+    lastHistoryExpansionAt = Date.now();
+    loadChartHistory(requestFrom, window.extent.minTs, "left-edge-prefetch")
+      .catch((error) => pushDebug("[WS] history:error", { reason: "left-edge-prefetch", message: error?.message || String(error) }))
+      .finally(() => {
+        historyExpansionInFlight = false;
+      });
+  }, 100);
+}
+
+function chartDimensionToPixels(value, total) {
+  if (typeof value === "string" && value.endsWith("%")) {
+    return total * (Number.parseFloat(value) / 100);
+  }
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : 0;
+}
+
+function chartAxisIndexAtPoint(chart, point) {
+  if (!chart || !Array.isArray(point) || point.length < 2) return -1;
+  const width = chart.getWidth();
+  const height = chart.getHeight();
+  if (point[0] < width - 92 || point[0] > width) return -1;
+  const grids = chart.getOption?.()?.grid || [];
+  return grids.findIndex((grid, index) => {
+    const top = chartDimensionToPixels(grid?.top, height);
+    const gridHeight = chartDimensionToPixels(grid?.height, height);
+    const panelId = chartAxisPanelIds[index] || "";
+    return (
+      point[1] >= top
+      && point[1] <= top + gridHeight
+      && panelId !== "event_timeline"
+      && !panelId.startsWith("metric_state_lane:")
+    );
+  });
+}
+
+function applyAxisDragScale(chart) {
+  chartAxisDragFrame = null;
+  const state = chartAxisDragState;
+  if (!state || !chart || !Number.isFinite(state.latestY)) return;
+  const factor = Math.exp((state.latestY - state.startY) / 180);
+  const half = Math.max(Number.EPSILON, state.startHalf * factor);
+  chartManualAxisRanges.set(state.panelId, {
+    min: state.center - half,
+    max: state.center + half,
+  });
+  lastChartInteractionAt = Date.now();
+  applyVisibleWindowAxisExtents(currentChartPayload);
+  syncChartInteractionState(chart);
+  renderChartFocusLine();
+}
+
+function syncChartInteractionState(chart = workspaceChartInstance) {
+  const canvas = chart?.getDom?.();
+  if (!canvas) return;
+  const dz = chart.getOption?.()?.dataZoom?.[0] || {};
+  const writeNumber = (key, value) => {
+    const numeric = Number(value);
+    canvas.dataset[key] = Number.isFinite(numeric) ? String(numeric) : "";
+  };
+  writeNumber("viewStart", dz.start);
+  writeNumber("viewEnd", dz.end);
+  writeNumber("viewStartValue", dz.startValue);
+  writeNumber("viewEndValue", dz.endValue);
+  canvas.dataset.manualAxisCount = String(chartManualAxisRanges.size);
+  canvas.dataset.timelineMode = timelineState.mode;
+  canvas.dataset.timelineSpanMs = String(Math.max(0, Number(timelineState.spanMs) || 0));
+  canvas.dataset.focusEventId = timelineState.focusEventId;
+  canvas.dataset.fullLoadCount = String(fullChartLoadCount);
+  canvas.dataset.historyLoadCount = String(chartHistoryLoadCount);
+}
+
+function setupDirectAxisScaling(chart) {
+  if (!chart || chart.__workspaceDirectAxisScalingBound) return;
+  chart.__workspaceDirectAxisScalingBound = true;
+  const zr = chart.getZr();
+  zr.on("mousedown", (event) => {
+    const point = [event.offsetX, event.offsetY];
+    const axisIndex = chartAxisIndexAtPoint(chart, point);
+    if (axisIndex < 0) return;
+    const yAxis = chart.getOption?.()?.yAxis?.[axisIndex] || {};
+    const min = Number(yAxis.min);
+    const max = Number(yAxis.max);
+    if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return;
+    chartAxisDragState = {
+      axisIndex,
+      panelId: chartAxisPanelIds[axisIndex],
+      startY: event.offsetY,
+      latestY: event.offsetY,
+      center: (min + max) / 2,
+      startHalf: (max - min) / 2,
+    };
+    zr.setCursorStyle("ns-resize");
+  });
+  zr.on("mousemove", (event) => {
+    if (chartAxisDragState) {
+      chartAxisDragState.latestY = event.offsetY;
+      if (chartAxisDragFrame === null) {
+        chartAxisDragFrame = requestAnimationFrame(() => applyAxisDragScale(chart));
+      }
+      return;
+    }
+    zr.setCursorStyle(chartAxisIndexAtPoint(chart, [event.offsetX, event.offsetY]) >= 0 ? "ns-resize" : "default");
+  });
+  const endDrag = () => {
+    chartAxisDragState = null;
+    if (chartAxisDragFrame !== null) {
+      cancelAnimationFrame(chartAxisDragFrame);
+      chartAxisDragFrame = null;
+    }
+    zr.setCursorStyle("default");
+  };
+  zr.on("mouseup", endDrag);
+  zr.on("globalout", endDrag);
+}
+
+function setupShiftRangeSelection(chart) {
+  if (!chart || chart.__workspaceShiftRangeBound) return;
+  chart.__workspaceShiftRangeBound = true;
+  const zr = chart.getZr();
+  let selection = null;
+  const clearSelection = () => {
+    selection = null;
+    renderChartFocusLine();
+  };
+  zr.on("mousedown", (event) => {
+    const nativeEvent = event?.event?.event || event?.event;
+    if (!nativeEvent?.shiftKey || chartAxisIndexAtPoint(chart, [event.offsetX, event.offsetY]) >= 0) return;
+    selection = { startX: event.offsetX, endX: event.offsetX };
+    nativeEvent.preventDefault?.();
+    nativeEvent.stopPropagation?.();
+  });
+  zr.on("mousemove", (event) => {
+    if (!selection) return;
+    selection.endX = event.offsetX;
+    const left = Math.min(selection.startX, selection.endX);
+    chart.setOption({
+      graphic: [{
+        id: "workspace-range-selection",
+        type: "rect",
+        silent: true,
+        z: 120,
+        shape: {
+          x: left,
+          y: 8,
+          width: Math.abs(selection.endX - selection.startX),
+          height: Math.max(20, chart.getHeight() - 48),
+        },
+        style: { fill: "rgba(240, 185, 11, 0.12)", stroke: "#f0b90b", lineWidth: 1 },
+      }],
+    }, { replaceMerge: ["graphic"], lazyUpdate: true, silent: true });
+  });
+  zr.on("mouseup", () => {
+    if (!selection) return;
+    const { startX, endX } = selection;
+    if (Math.abs(endX - startX) < 8) {
+      clearSelection();
+      return;
+    }
+    const from = parseChartTime(chart.convertFromPixel({ xAxisIndex: 0 }, Math.min(startX, endX)));
+    const to = parseChartTime(chart.convertFromPixel({ xAxisIndex: 0 }, Math.max(startX, endX)));
+    clearSelection();
+    if (from !== null && to !== null && from < to) {
+      applyLocalTimeWindow(from, to, { mode: "INSPECT", reason: "shift-range" });
+    }
+  });
+  zr.on("globalout", () => {
+    if (selection) clearSelection();
+  });
+}
+
+function renderChartFocusLine() {
+  if (!workspaceChartInstance) return;
+  const focusTs = parseChartTime(timelineState.focusTime);
+  let graphic = [];
+  if (focusTs !== null) {
+    const x = workspaceChartInstance.convertToPixel({ xAxisIndex: 0 }, focusTs);
+    if (Number.isFinite(x)) {
+      graphic = [
+        {
+          id: "workspace-focus-line",
+          type: "line",
+          silent: true,
+          z: 100,
+          shape: { x1: x, y1: 10, x2: x, y2: Math.max(30, workspaceChartInstance.getHeight() - 40) },
+          style: { stroke: "#f0b90b", lineWidth: 1, lineDash: [5, 4], opacity: 0.9 },
+        },
+        {
+          id: "workspace-focus-label",
+          type: "text",
+          silent: true,
+          z: 101,
+          x: Math.min(Math.max(8, x + 6), Math.max(8, workspaceChartInstance.getWidth() - 190)),
+          y: 12,
+          style: {
+            text: formatFocusTime(focusTs),
+            fill: "#f0b90b",
+            font: "12px ui-monospace, SFMono-Regular, Menlo, monospace",
+            backgroundColor: "rgba(15, 18, 23, 0.9)",
+            padding: [4, 6],
+            borderRadius: 3,
+          },
+        },
+      ];
+    }
+  }
+  workspaceChartInstance.setOption({ graphic }, {
+    replaceMerge: ["graphic"],
+    lazyUpdate: true,
+    silent: true,
+  });
+}
+
+function clearTimelineFocus() {
+  timelineState.focusTime = null;
+  timelineState.focusEventId = "";
+  focusedWorkspaceEventIndex = -1;
+  window.workspaceFocusedEventId = "";
+  closeWorkspaceEventDetails();
+  document.querySelectorAll(".ws3-event-item.is-focused").forEach((item) => {
+    item.classList.remove("is-focused");
+    item.setAttribute("aria-selected", "false");
+  });
+  syncTimelineStateUi();
+  renderChartFocusLine();
+  syncChartInteractionState();
+}
+
 function ensureChartInstance() {
   if (!window.echarts) throw new Error("ECharts 未加载");
   const canvas = ensureChartShell();
   if (!workspaceChartInstance) {
     workspaceChartInstance = window.echarts.init(canvas, null, { renderer: "canvas" });
+    window.workspaceChartInstance = workspaceChartInstance;
     workspaceChartInstance.on("legendselectchanged", (params) => {
       chartLegendSelectedState = { ...(params.selected || {}) };
       persistLegendSelectedState();
@@ -3048,20 +4508,54 @@ function ensureChartInstance() {
       const option = workspaceChartInstance.getOption();
       const dz = option?.dataZoom?.[0];
       if (!dz) return;
+      const visible = dataZoomAbsoluteWindow(dz);
+      if (!visible) return;
       chartViewState = {
-        start: dz.start ?? null,
-        end: dz.end ?? null,
-        startValue: dz.startValue ?? null,
-        endValue: dz.endValue ?? null,
+        start: null,
+        end: null,
+        startValue: visible.from,
+        endValue: visible.to,
       };
+      timelineState.visibleFrom = visible.from;
+      timelineState.visibleTo = visible.to;
+      timelineState.spanMs = visible.span;
+      setTimelineMode("INSPECT", "pan-or-zoom");
+      syncChartInteractionState(workspaceChartInstance);
+      scheduleVisibleAxisAutoFit(currentChartPayload);
+      scheduleEarlierHistoryLoad(dz);
     });
-    workspaceChartInstance.getZr().on("dblclick", () => {
-      chartViewState = { start: null, end: null, startValue: null, endValue: null };
-      setTimelineToLatest();
-      closeCustomTimelinePanel();
-      scheduleChartReload();
+    workspaceChartInstance.getZr().on("dblclick", (event) => {
+      const axisIndex = chartAxisIndexAtPoint(workspaceChartInstance, [event.offsetX, event.offsetY]);
+      if (axisIndex >= 0) {
+        chartManualAxisRanges.delete(chartAxisPanelIds[axisIndex]);
+        scheduleVisibleAxisAutoFit(currentChartPayload);
+        syncChartInteractionState(workspaceChartInstance);
+        return;
+      }
+      chartManualAxisRanges.clear();
+      cancelVisibleAxisAutoFit();
+      activateTimelinePreset(activeQuickRange === "custom" ? timelineState.rangePreset : activeQuickRange, "double-click");
+    });
+    workspaceChartInstance.on("updateAxisPointer", (params) => {
+      if (timelineState.focusEventId) return;
+      const axis = (params?.axesInfo || []).find((item) => item.axisDim === "x");
+      const ts = parseChartTime(axis?.value);
+      if (ts === null) return;
+      timelineState.focusTime = ts;
+      syncTimelineStateUi();
+    });
+    workspaceChartInstance.on("click", (params) => {
+      if (!String(params?.seriesId || "").startsWith("__event_timeline:")) return;
+      const eventId = String(params?.data?.eventId || "");
+      if (eventId && typeof window.focusWorkspaceEvent === "function") {
+        window.focusWorkspaceEvent(eventId, "chart");
+      }
     });
     setupEventTimelineHover(workspaceChartInstance);
+    setupChartPointerTracking(workspaceChartInstance);
+    setupNativeLineTooltipFocus(workspaceChartInstance);
+    setupDirectAxisScaling(workspaceChartInstance);
+    setupShiftRangeSelection(workspaceChartInstance);
   }
   return workspaceChartInstance;
 }
@@ -3083,18 +4577,43 @@ function chartPanelWeight(panel) {
   return PANEL_WEIGHTS[panel.id] || 12;
 }
 
+function chartPanelMinimumHeight(panel = {}) {
+  if (panel.id === "main") return 360;
+  if (panel.id === "event_timeline") return 90;
+  if (isStateLanePanel(panel)) return 68;
+  if (panel.id === "metric_values" || panel.id === "market_mcap") return 160;
+  if (panel.id === "indicator_macd") return 150;
+  return 122;
+}
+
+function recommendedChartHeight(payload = currentChartPayload) {
+  if (!payload) return workspaceChartHeight;
+  const panels = expandChartPanels(payload.panels || [], payload.metric_state_lanes || [], payload.events || []);
+  const required = panels.reduce((sum, panel) => sum + chartPanelMinimumHeight(panel), 0)
+    + 10 * Math.max(0, panels.length - 1)
+    + 58;
+  return clampChartHeight(Math.max(CHART_MODE_CONFIG.standard.height, required));
+}
+
 function buildPanelLayout(panels) {
-  const mode = getChartLayoutConfig();
   const panelCount = panels.length || 1;
-  const totalGap = mode.gap * Math.max(0, panelCount - 1);
-  const available = mode.usable - totalGap;
+  const gap = 10;
+  const topStart = 14;
+  const bottomReserve = 42;
+  const totalGap = gap * Math.max(0, panelCount - 1);
+  const available = Math.max(1, workspaceChartHeight - topStart - bottomReserve - totalGap);
+  const minimums = panels.map((panel) => chartPanelMinimumHeight(panel));
+  const minimumSum = minimums.reduce((sum, item) => sum + item, 0);
+  const distributable = Math.max(0, available - minimumSum);
   const weights = panels.map((panel) => chartPanelWeight(panel));
   const weightSum = weights.reduce((sum, item) => sum + item, 0) || 1;
-  let top = mode.topStart;
+  let top = topStart;
   return panels.map((panel, index) => {
-    const height = (weights[index] / weightSum) * available;
-    const layout = { panel, top: `${top}%`, height: `${height}%` };
-    top += height + mode.gap;
+    const height = minimumSum <= available
+      ? minimums[index] + (weights[index] / weightSum) * distributable
+      : Math.max(44, (minimums[index] / Math.max(1, minimumSum)) * available);
+    const layout = { panel, top, height };
+    top += height + gap;
     return layout;
   });
 }
@@ -3220,7 +4739,7 @@ function formatTooltipValue(value, unit, meta = {}) {
   const text = formatChartValue(value, unit);
   if (text === "-") return text;
   if (unit === "price" && isCryptoSeriesMeta(meta)) return `${text} USDT`;
-  if (unit === "currency") {
+  if (unit === "currency" || unit === "compact_currency") {
     const suffix = isCryptoSeriesMeta(meta) || String(meta.key || "").startsWith("backtest_") ? "USDT" : "USD";
     return `${text} ${suffix}`;
   }
@@ -3255,6 +4774,110 @@ function chartTimeExtentKey(rows, meta = {}) {
 
 function chartTimeExtentEqual(a, b) {
   return Boolean(a && b && a.minTs === b.minTs && a.maxTs === b.maxTs);
+}
+
+function resolveVisibleTimeWindow(fullExtent) {
+  const fallback = {
+    minTs: fullExtent.minTs,
+    maxTs: fullExtent.maxTs,
+  };
+  if (!Number.isFinite(fullExtent.minTs) || !Number.isFinite(fullExtent.maxTs) || fullExtent.maxTs <= fullExtent.minTs) {
+    return fallback;
+  }
+  const startValue = parseChartTime(chartViewState.startValue);
+  const endValue = parseChartTime(chartViewState.endValue);
+  if (startValue !== null && endValue !== null) {
+    return {
+      minTs: Math.max(fullExtent.minTs, Math.min(startValue, endValue)),
+      maxTs: Math.min(fullExtent.maxTs, Math.max(startValue, endValue)),
+    };
+  }
+  const startPct = Number(chartViewState.start);
+  const endPct = Number(chartViewState.end);
+  if (!Number.isFinite(startPct) || !Number.isFinite(endPct)) {
+    return fallback;
+  }
+  const span = fullExtent.maxTs - fullExtent.minTs;
+  return {
+    minTs: fullExtent.minTs + span * (Math.min(startPct, endPct) / 100),
+    maxTs: fullExtent.minTs + span * (Math.max(startPct, endPct) / 100),
+  };
+}
+
+function seriesStyleForRender(item = {}) {
+  return seriesStyleState[item.key] || item.style || {};
+}
+
+function updatePanelExtent(extent, value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return;
+  extent.min = extent.min === null ? numeric : Math.min(extent.min, numeric);
+  extent.max = extent.max === null ? numeric : Math.max(extent.max, numeric);
+}
+
+function buildVisiblePanelExtents(payload = {}, visibleWindow = null) {
+  const rows = payload.rows || [];
+  const series = (payload.series || []).filter((item) => {
+    if (!item?.panel || isStateLanePanel({ id: item.panel }) || item.panel === "event_timeline") return false;
+    return seriesStyleForRender(item).visible !== false;
+  });
+  const windowStart = Number(visibleWindow?.minTs);
+  const windowEnd = Number(visibleWindow?.maxTs);
+  const extents = new Map();
+  rows.forEach((row) => {
+    const ts = parseTimeSafe(row.ts);
+    if (ts === null) return;
+    if (Number.isFinite(windowStart) && ts < windowStart) return;
+    if (Number.isFinite(windowEnd) && ts > windowEnd) return;
+    series.forEach((item) => {
+      const extent = extents.get(item.panel) || { min: null, max: null };
+      if (item.render === "candlestick") {
+        const raw = row[item.key];
+        const values = Array.isArray(raw)
+          ? raw.map((value) => Number(value))
+          : [
+              Number(row[item.key.replace(/ohlc$/, "open")]),
+              Number(row[item.key.replace(/ohlc$/, "close")]),
+              Number(row[item.key.replace(/ohlc$/, "low")]),
+              Number(row[item.key.replace(/ohlc$/, "high")]),
+            ];
+        if (values.length >= 4 && values.every((value) => Number.isFinite(value))) {
+          updatePanelExtent(extent, values[2]);
+          updatePanelExtent(extent, values[3]);
+        }
+      } else {
+        updatePanelExtent(extent, row[item.key]);
+      }
+      extents.set(item.panel, extent);
+    });
+  });
+  return extents;
+}
+
+function paddedAxisBounds(extent, panelId) {
+  if (!extent || extent.min === null || extent.max === null) {
+    return { min: undefined, max: undefined };
+  }
+  const rawMin = Number(extent.min);
+  const rawMax = Number(extent.max);
+  if (!Number.isFinite(rawMin) || !Number.isFinite(rawMax)) {
+    return { min: undefined, max: undefined };
+  }
+  const ratioLike = rawMin >= 0 && rawMax <= 1;
+  const span = rawMax - rawMin;
+  const basePadding = span > 0
+    ? span * (panelId === "main" ? 0.06 : 0.08)
+    : Math.max(Math.abs(rawMax || rawMin || 1) * 0.04, ratioLike ? 0.015 : 0.25);
+  let min = rawMin - basePadding;
+  let max = rawMax + basePadding;
+  if (ratioLike) {
+    min = Math.max(0, min);
+    max = Math.min(1, max);
+  }
+  if (min === max) {
+    max = min + (ratioLike ? 0.01 : 1);
+  }
+  return { min, max };
 }
 
 /** Matches `strategy_chart_service._ema` for incremental MACD refresh. */
@@ -3385,7 +5008,7 @@ function buildReferenceTooltipLines(payload = {}, rawTs, seenSeriesIds = new Set
     const value = Number(row[item.key]);
     if (!Number.isFinite(value)) return null;
     const color = colorForSeries(item.key);
-    return `${tooltipMarker(color)}${escapeHtml(item.label || item.key)}: ${escapeHtml(formatChartValue(value, item.unit))} <span style="color:#90a5c3">(ref)</span>`;
+    return `${tooltipMarker(color)}${escapeHtml(fullSeriesLabel(item))}: ${escapeHtml(formatChartValue(value, item.unit))} <span style="color:#90a5c3">(ref)</span>`;
   }).filter(Boolean);
 }
 
@@ -3406,16 +5029,18 @@ function formatEventTooltipLine(data = {}, summaryLimit = 160) {
 }
 
 function buildTooltipFormatter(seriesMap, payload = {}) {
-  const rows = prepareTooltipRows(payload);
-  const referenceSeries = (payload.series || []).filter(isBidAskReferenceSeries);
   return function formatter(params) {
-    const items = Array.isArray(params) ? params : (params ? [params] : []);
+    const rawItems = Array.isArray(params) ? params : (params ? [params] : []);
+    const nativeSeriesId = String(chartNativeHoveredSeriesId || "");
+    const hasNativeFocusedLine = Boolean(nativeSeriesId && seriesMap.has(nativeSeriesId));
+    const nativeHoveredItems = nativeSeriesId
+      ? rawItems.filter((param) => String(param?.seriesId || "") === nativeSeriesId)
+      : [];
+    const items = hasNativeFocusedLine ? nativeHoveredItems : rawItems;
     if (!items.length) return "";
     const rawTs = Array.isArray(items[0].value) ? items[0].value[0] : (items[0].axisValue || "");
     const lines = [escapeHtml(formatTime(rawTs))];
-    const seenSeriesIds = new Set();
     items.forEach((param) => {
-      if (param.seriesId) seenSeriesIds.add(param.seriesId);
       if (String(param.seriesId || "").startsWith("__event_timeline")) {
         const d = param.data || {};
         lines.push(formatEventTooltipLine(d, 180));
@@ -3434,7 +5059,7 @@ function buildTooltipFormatter(seriesMap, payload = {}) {
       }
       const meta = seriesMap.get(param.seriesId || param.seriesName);
       if (!meta) return;
-      const label = displaySeriesLabel(meta);
+      const label = fullSeriesLabel(meta);
       if (meta.render === "candlestick") {
         const values = Array.isArray(param.value) ? param.value.slice(1) : [];
         if (values.length >= 4) {
@@ -3446,7 +5071,6 @@ function buildTooltipFormatter(seriesMap, payload = {}) {
       if (rawValue === null || rawValue === undefined || rawValue === "") return;
       lines.push(`${param.marker}${escapeHtml(label)}: ${escapeHtml(formatTooltipValue(rawValue, meta?.unit, meta))}`);
     });
-    lines.push(...buildReferenceTooltipLines(payload, rawTs, seenSeriesIds, rows, referenceSeries));
     return lines.join("<br>");
   };
 }
@@ -3459,15 +5083,15 @@ function buildChartDataZoom(layout) {
 }
 
 function applyChartViewStateToDataZoom(dataZoom) {
-  if (chartViewState.start === null || chartViewState.end === null) {
+  const hasPercentWindow = chartViewState.start !== null && chartViewState.end !== null;
+  const hasValueWindow = chartViewState.startValue !== null && chartViewState.endValue !== null;
+  if (!hasPercentWindow && !hasValueWindow) {
     return dataZoom;
   }
   return (dataZoom || []).map((dz) => ({
     ...dz,
-    start: chartViewState.start,
-    end: chartViewState.end,
-    startValue: chartViewState.startValue,
-    endValue: chartViewState.endValue,
+    ...(hasPercentWindow ? { start: chartViewState.start, end: chartViewState.end } : {}),
+    ...(hasValueWindow ? { startValue: chartViewState.startValue, endValue: chartViewState.endValue } : {}),
   }));
 }
 
@@ -3507,7 +5131,10 @@ function buildChartCoordinateState(payload) {
   const rows = payload.rows || [];
   const layout = buildPanelLayout(panels);
   const { minTs, maxTs, rangeMs } = getTimeExtent(rows, payload.meta || {});
+  const visibleWindow = resolveVisibleTimeWindow({ minTs, maxTs });
+  const panelExtents = buildVisiblePanelExtents(payload, visibleWindow);
   const panelIndex = new Map(layout.map((item, index) => [item.panel.id, index]));
+  chartAxisPanelIds = layout.map((item) => String(item.panel.id || ""));
   const grid = layout.map((item) => ({
     left: item.panel.id === "event_timeline" ? 92 : 22,
     right: 82,
@@ -3532,13 +5159,15 @@ function buildChartCoordinateState(payload) {
     const isMainPanel = item.panel.id === "main";
     const eventLaneCount = EVENT_TIMELINE_CATEGORIES.length;
     const eventLaneLabels = new Map(EVENT_TIMELINE_CATEGORIES.map((cat) => [cat.lane, cat.label]));
+    const axisBounds = !isStatePanel && !isEventPanel ? paddedAxisBounds(panelExtents.get(item.panel.id), item.panel.id) : { min: undefined, max: undefined };
+    const manualBounds = chartManualAxisRanges.get(item.panel.id);
     return {
       type: "value",
       gridIndex: index,
       position: isEventPanel ? "left" : "right",
       scale: !isStatePanel && !isEventPanel,
-      min: isStatePanel ? 0 : (isEventPanel ? -0.5 : undefined),
-      max: isStatePanel ? 1 : (isEventPanel ? eventLaneCount - 0.5 : undefined),
+      min: isStatePanel ? 0 : (isEventPanel ? -0.5 : (manualBounds?.min ?? axisBounds.min)),
+      max: isStatePanel ? 1 : (isEventPanel ? eventLaneCount - 0.5 : (manualBounds?.max ?? axisBounds.max)),
       name: item.panel.title,
       nameLocation: "end",
       nameGap: isMainPanel ? 12 : 8,
@@ -3574,10 +5203,103 @@ function buildChartCoordinateState(payload) {
   };
 }
 
-function buildChartSeriesOption(payload, targetKeys = null) {
+function applyVisibleWindowAxisExtents(payload) {
+  if (!payload || !workspaceChartInstance) return;
+  const renderPayload = filterChartPayloadForSelectedSubMetrics(payload);
+  const { yAxis } = buildChartCoordinateState(renderPayload);
+  suppressProgrammaticChartZoomSync(120);
+  workspaceChartInstance.setOption({
+    yAxis,
+  }, {
+    notMerge: false,
+    lazyUpdate: true,
+    silent: true,
+  });
+}
+
+function appendUniqueSeriesPoint(output, point) {
+  if (!point) return;
+  const last = output[output.length - 1];
+  if (last && last[0] === point[0] && last[1] === point[1]) return;
+  output.push(point);
+}
+
+function compressStepSeriesData(data) {
+  if ((data || []).length < 3) return data || [];
+  const output = [data[0]];
+  let previousValue = data[0]?.[1];
+  for (let index = 1; index < data.length; index += 1) {
+    const point = data[index];
+    if (point?.[1] === previousValue) continue;
+    appendUniqueSeriesPoint(output, data[index - 1]);
+    appendUniqueSeriesPoint(output, point);
+    previousValue = point?.[1];
+  }
+  appendUniqueSeriesPoint(output, data[data.length - 1]);
+  return output;
+}
+
+function downsampleSeriesData(data, maxPoints) {
+  if (!Array.isArray(data) || data.length <= maxPoints || maxPoints < 8) return data || [];
+  const output = [data[0]];
+  const bucketCount = Math.max(1, Math.floor((maxPoints - 2) / 2));
+  const bucketWidth = Math.max(1, (data.length - 2) / bucketCount);
+  for (let bucket = 0; bucket < bucketCount; bucket += 1) {
+    const start = 1 + Math.floor(bucket * bucketWidth);
+    const end = Math.min(data.length - 1, 1 + Math.floor((bucket + 1) * bucketWidth));
+    let minIndex = -1;
+    let maxIndex = -1;
+    for (let index = start; index < end; index += 1) {
+      const value = Number(data[index]?.[1]);
+      if (!Number.isFinite(value)) continue;
+      if (minIndex < 0 || value < Number(data[minIndex]?.[1])) minIndex = index;
+      if (maxIndex < 0 || value > Number(data[maxIndex]?.[1])) maxIndex = index;
+    }
+    const indexes = [...new Set([minIndex, maxIndex].filter((index) => index >= 0))].sort((a, b) => a - b);
+    if (!indexes.length && start < data.length - 1) indexes.push(start);
+    indexes.forEach((index) => appendUniqueSeriesPoint(output, data[index]));
+  }
+  appendUniqueSeriesPoint(output, data[data.length - 1]);
+  return output;
+}
+
+function seriesPointBudget(seriesCount, item, isPriceSeries, rowCount) {
+  if (isPriceSeries || item?.panel === "main") return Math.min(rowCount, 1000);
+  if (item?.render === "step") return Math.min(rowCount, 700);
+  const sharedBudget = Math.floor(60000 / Math.max(1, seriesCount));
+  return Math.min(rowCount, Math.max(240, Math.min(900, sharedBudget)));
+}
+
+function cachedLineSeriesData(rows, item, isPriceSeries, maxPoints) {
+  let rowCache = chartSeriesDataCache.get(rows);
+  if (!rowCache) {
+    rowCache = new Map();
+    chartSeriesDataCache.set(rows, rowCache);
+  }
+  const cacheKey = `${String(item?.key || "")}|${isPriceSeries ? "price" : "value"}|${maxPoints}`;
+  if (rowCache.has(cacheKey)) return rowCache.get(cacheKey);
+  let finitePointCount = 0;
+  let data = rows.map((row) => {
+    const value = Number(row[item.key]);
+    if (Number.isFinite(value)) {
+      finitePointCount += 1;
+      return [row.ts, value];
+    }
+    return isPriceSeries ? [row.ts, null] : null;
+  }).filter(Boolean);
+  if (item?.render === "step") {
+    data = compressStepSeriesData(data);
+  }
+  data = downsampleSeriesData(data, maxPoints);
+  const result = { data, finitePointCount };
+  rowCache.set(cacheKey, result);
+  return result;
+}
+
+function buildChartSeriesOption(payload, targetKeys = null, coordinateState = null) {
   const series = payload.series || [];
   const rows = payload.rows || [];
-  const { panelIndex } = buildChartCoordinateState(payload);
+  const { panelIndex } = coordinateState || buildChartCoordinateState(payload);
   const seriesMetaById = new Map();
   const allowedKeys = targetKeys ? new Set(targetKeys) : null;
   const chartSeries = series.map((item) => {
@@ -3625,17 +5347,16 @@ function buildChartSeriesOption(payload, targetKeys = null) {
     const isBar = item.render === "bar";
     const isBidAsk = /_(bid|ask)$/.test(item.key);
     const isPriceSeries = item.category === "market_target" || item.category === "price" || /_(bid|ask|mid|last_price)$/.test(item.key);
-    const data = rows.map((row) => {
-      const value = Number(row[item.key]);
-      if (Number.isFinite(value)) return [row.ts, value];
-      return isPriceSeries ? [row.ts, null] : null;
-    }).filter(Boolean);
-    const hasFiniteValue = data.some((point) => Array.isArray(point) && Number.isFinite(point[1]));
+    const maxPoints = seriesPointBudget(series.length, item, isPriceSeries, rows.length);
+    const cachedData = cachedLineSeriesData(rows, item, isPriceSeries, maxPoints);
+    const data = cachedData.data;
+    const hasFiniteValue = cachedData.finitePointCount > 0;
     const style = seriesStyleState[item.key] || item.style || {};
     if (style.visible === false) return null;
     const color = style.color || colorForSeries(item.key);
     const isMetric = item.category === "strategy_metric";
-    const forceSparseSymbols = hasFiniteValue && (data.filter((point) => Number.isFinite(point?.[1])).length < 2 || isMetric);
+    const finitePointCount = cachedData.finitePointCount;
+    const forceSparseSymbols = hasFiniteValue && (finitePointCount < 2 || (isMetric && finitePointCount <= 24));
     seriesMetaById.set(item.key, item);
     return {
       id: item.key,
@@ -3648,11 +5369,15 @@ function buildChartSeriesOption(payload, targetKeys = null) {
       connectNulls: !isBar && !isPriceSeries,
       step: item.render === "step" ? "end" : false,
       smooth: isBar ? false : Boolean(style.smooth),
+      sampling: !isBar && data.length > 320 && (isPriceSeries || isMetric) ? "lttb" : undefined,
+      progressive: !isBar && data.length > 640 ? 500 : 0,
+      progressiveThreshold: !isBar && data.length > 640 ? 800 : 0,
       data,
       barMaxWidth: isBar ? 12 : undefined,
       lineStyle: isBar ? undefined : { width: Number(style.width || (item.panel === "main" ? 2.4 : 2)), type: style.line_type || (isBidAsk ? "dashed" : "solid"), color, opacity: isBidAsk ? 0.55 : 0.95 },
       itemStyle: { color, opacity: isBidAsk ? 0.75 : 1 },
       emphasis: { focus: "series" },
+      triggerLineEvent: true,
     };
   }).filter(Boolean).filter((item) => item.data.some((point) => Array.isArray(point) && Number.isFinite(point[1])));
   return { chartSeries, seriesMetaById };
@@ -3703,8 +5428,13 @@ function buildEventMarkLineSeries(payload, panelIndex) {
   return [];
 }
 
-function tradeEventSide(event = {}) {
-  const direct = String(event.side || event.action || "").trim().toUpperCase();
+function tradeEventPayload(event = {}) {
+  return event.payload && typeof event.payload === "object" ? event.payload : {};
+}
+
+function tradeEventAction(event = {}) {
+  const payload = tradeEventPayload(event);
+  const direct = String(event.action || payload.action || payload.action_type || "").trim().toUpperCase();
   if (direct === "BUY" || direct === "SELL") return direct;
   const text = String(event.label || event.summary || event.type || event.event_type || "").toUpperCase();
   if (text.includes("SELL")) return "SELL";
@@ -3713,7 +5443,8 @@ function tradeEventSide(event = {}) {
 }
 
 function tradeEventPrice(event = {}) {
-  const direct = numericValue(event.price);
+  const payload = tradeEventPayload(event);
+  const direct = numericValue(event.price ?? payload.price);
   if (direct !== null) return direct;
   const text = String(event.label || event.summary || "");
   const match = text.match(/(?:price=|@|price\s+)([0-9,.]+)/i);
@@ -3722,33 +5453,191 @@ function tradeEventPrice(event = {}) {
 }
 
 function tradeEventQuantity(event = {}) {
-  const direct = numericValue(event.quantity);
+  const payload = tradeEventPayload(event);
+  const direct = numericValue(event.quantity ?? event.qty ?? payload.quantity ?? payload.qty);
   if (direct !== null) return direct;
   const text = String(event.label || event.summary || "");
   const match = text.match(/qty=([0-9,.]+)/i);
   return match ? numericValue(match[1].replaceAll(",", "")) : null;
 }
 
+function tradeEventStatus(event = {}) {
+  const payload = tradeEventPayload(event);
+  const direct = String(event.status || event.subtype || event.event_subtype || payload.status || "").trim().toLowerCase();
+  if (direct) return direct;
+  const type = String(event.type || event.event_type || "").trim().toLowerCase();
+  const source = String(event.source || "").trim().toLowerCase();
+  return (type === "trade" && (source.includes("replay") || source.includes("virtual"))) ? "filled" : "unknown";
+}
+
+function tradeEventOutcomeSide(event = {}) {
+  const payload = tradeEventPayload(event);
+  const side = String(event.outcome_side || event.side || payload.outcome_side || payload.side || "").trim().toUpperCase();
+  return side === "YES" || side === "NO" ? side : "";
+}
+
+function tradeEventLegIndex(event = {}) {
+  const payload = tradeEventPayload(event);
+  const raw = event.leg_index ?? event.leg ?? payload.leg_index ?? payload.leg;
+  const index = Number(raw);
+  return Number.isInteger(index) && index >= 0 ? index : null;
+}
+
+function tradeEventDetails(event = {}) {
+  const payload = tradeEventPayload(event);
+  const fills = Array.isArray(payload.fills) && payload.fills.length ? payload.fills : [null];
+  return fills.map((fill) => {
+    const merged = fill && typeof fill === "object"
+      ? { ...event, ...payload, ...fill, payload: { ...payload, ...fill } }
+      : { ...event, ...payload, payload };
+    const legIndex = tradeEventLegIndex(merged);
+    const market = legIndex === null ? null : (trackedMarkets[legIndex] || null);
+    const eventMarketName = String(merged.market_name || merged.market_label || "").trim();
+    const trackedMarketName = readableTrackedMarketName(market || {});
+    const marketName = (
+      eventMarketName && !isOpaqueMarketIdentifier(eventMarketName)
+        ? eventMarketName
+        : trackedMarketName || eventMarketName
+    ).trim();
+    const source = String(merged.source || event.source || "").trim().toLowerCase();
+    const orderRefs = Array.isArray(merged.order_refs)
+      ? merged.order_refs.map(String).filter(Boolean)
+      : [merged.order_ref].map(String).filter((value) => value && value !== "undefined");
+    return {
+      action: tradeEventAction(merged),
+      status: tradeEventStatus(merged),
+      outcomeSide: tradeEventOutcomeSide(merged),
+      legIndex,
+      marketName,
+      price: tradeEventPrice(merged),
+      quantity: tradeEventQuantity(merged),
+      positionQtyBefore: numericValue(merged.position_qty_before),
+      positionQtyAfter: numericValue(merged.position_qty_after),
+      positionBefore: numericValue(merged.position_before),
+      positionAfter: numericValue(merged.position_after),
+      fee: numericValue(merged.fee),
+      netCashChange: numericValue(merged.net_cash_change),
+      liquidityRole: String(merged.liquidity_role || "").trim(),
+      orderRefs,
+      reason: String(merged.reason || event.reason || "").trim(),
+      label: String(event.label || event.summary || "").trim(),
+      source,
+      ts: event.ts || merged.ts,
+      eventType: String(event.type || event.event_type || "").trim().toLowerCase(),
+    };
+  });
+}
+
+function tradeStatusMeta(status = "") {
+  const normalized = String(status || "unknown").toLowerCase();
+  const values = {
+    filled: { label: "已成交", icon: "✓", tone: "filled" },
+    failed: { label: "交易失败", icon: "!", tone: "failed" },
+    blocked: { label: "已拦截", icon: "!", tone: "blocked" },
+    cancelled: { label: "已取消", icon: "×", tone: "cancelled" },
+    canceled: { label: "已取消", icon: "×", tone: "cancelled" },
+    pending: { label: "待成交", icon: "…", tone: "pending" },
+    submitted: { label: "已提交", icon: "…", tone: "pending" },
+    open: { label: "挂单中", icon: "…", tone: "pending" },
+  };
+  return values[normalized] || { label: normalized && normalized !== "unknown" ? normalized : "状态未知", icon: "?", tone: "unknown" };
+}
+
+function tradeSourceLabel(source = "") {
+  const normalized = String(source || "").toLowerCase();
+  if (normalized.includes("virtual")) return "虚拟";
+  if (normalized.includes("backtest")) return "回测";
+  if (normalized.includes("real") || normalized.includes("live")) return "实盘";
+  return "";
+}
+
+function tradeCurrency(detail = {}) {
+  const market = detail.legIndex === null ? trackedMarkets[0] : trackedMarkets[detail.legIndex];
+  return isBinanceTarget(market || {}) ? "USDT" : "USDC";
+}
+
+function tradeDetailSignature(detail = {}) {
+  return [
+    detail.ts,
+    detail.action,
+    detail.status,
+    detail.outcomeSide,
+    detail.legIndex,
+    detail.price,
+    detail.quantity,
+  ].join("|");
+}
+
+function collectTradeDetails(events = []) {
+  const ordered = [...(events || [])].sort((left, right) => {
+    const leftTrade = ["trade", "fill", "order"].includes(String(left?.type || left?.event_type || "").toLowerCase()) ? 0 : 1;
+    const rightTrade = ["trade", "fill", "order"].includes(String(right?.type || right?.event_type || "").toLowerCase()) ? 0 : 1;
+    return leftTrade - rightTrade;
+  });
+  const seen = new Set();
+  const details = [];
+  ordered.forEach((event) => {
+    tradeEventDetails(event).forEach((detail) => {
+      if (!detail.action || !detail.ts) return;
+      const signature = tradeDetailSignature(detail);
+      if (seen.has(signature)) return;
+      seen.add(signature);
+      details.push(detail);
+    });
+  });
+  return details;
+}
+
+function renderLatestTradeStatus(payload = {}) {
+  if (!chartTradeStatus) return;
+  const details = collectTradeDetails(payload.events || [])
+    .sort((left, right) => (parseChartTime(right.ts) || 0) - (parseChartTime(left.ts) || 0));
+  const detail = details[0];
+  if (!detail) {
+    chartTradeStatus.hidden = true;
+    chartTradeStatus.innerHTML = "";
+    return;
+  }
+  const status = tradeStatusMeta(detail.status);
+  const source = tradeSourceLabel(detail.source);
+  const marketName = detail.marketName || "未标记市场";
+  const legLabel = detail.legIndex === null ? marketName : `Leg ${detail.legIndex + 1} · ${marketName}`;
+  const qty = detail.quantity === null ? "-" : formatNumber(detail.quantity, 8);
+  const price = detail.price === null ? "-" : formatNumber(detail.price, 6);
+  const positionChange = detail.positionQtyBefore !== null && detail.positionQtyAfter !== null
+    ? `仓位 ${formatNumber(detail.positionQtyBefore, 6)} → ${formatNumber(detail.positionQtyAfter, 6)}`
+    : "";
+  chartTradeStatus.hidden = false;
+  chartTradeStatus.className = `chart-trade-status is-${status.tone}`;
+  chartTradeStatus.innerHTML = [
+    `<span class="trade-status-badge">${escapeHtml(status.icon)} ${escapeHtml(source ? `${source}${status.label}` : status.label)}</span>`,
+    `<span class="trade-status-market" title="${escapeHtml(legLabel)}">${escapeHtml(legLabel)}</span>`,
+    `<span class="trade-status-detail">${escapeHtml([detail.action, detail.outcomeSide].filter(Boolean).join(" "))} · ${escapeHtml(qty)} @ ${escapeHtml(price)} ${escapeHtml(tradeCurrency(detail))}${positionChange ? ` · ${escapeHtml(positionChange)}` : ""}</span>`,
+    `<span class="trade-status-time">${escapeHtml(formatTime(detail.ts))}</span>`,
+  ].join("");
+}
+
 function buildTradeMarkerSeries(payload, panelIndex) {
   const mainPanelIndex = panelIndex.get("main") ?? 0;
   const bySide = { BUY: [], SELL: [] };
-  (payload.events || []).forEach((event) => {
-    const side = tradeEventSide(event);
-    if (!side || !bySide[side]) return;
-    const price = tradeEventPrice(event);
-    const ts = event.ts;
+  collectTradeDetails(payload.events || []).forEach((detail) => {
+    const action = detail.action;
+    if (!action || !bySide[action]) return;
+    const price = detail.price;
+    const ts = detail.ts;
     if (!ts || price === null) return;
-    bySide[side].push({
+    const status = tradeStatusMeta(detail.status);
+    const filled = detail.status === "filled";
+    const fillColor = action === "BUY" ? "#22c55e" : "#ef4444";
+    const pendingColor = detail.status === "failed" || detail.status === "blocked" ? "#f97316" : "#f59e0b";
+    bySide[action].push({
       value: [ts, price],
-      side,
-      price,
-      quantity: tradeEventQuantity(event),
-      reason: event.reason || "",
-      label: event.label || event.summary || "",
-      ts,
+      ...detail,
+      side: action,
+      statusLabel: status.label,
       itemStyle: {
-        color: side === "BUY" ? "#22c55e" : "#ef4444",
-        borderColor: side === "BUY" ? "#bbf7d0" : "#fecdd3",
+        color: filled ? fillColor : pendingColor,
+        borderColor: filled ? (action === "BUY" ? "#bbf7d0" : "#fecdd3") : "#fde68a",
         borderWidth: 1,
       },
     });
@@ -3774,10 +5663,29 @@ function buildTradeMarkerSeries(payload, panelIndex) {
         formatter(param) {
           const d = param.data || {};
           const qty = d.quantity === null || d.quantity === undefined ? "-" : formatNumber(d.quantity, 8);
+          const status = tradeStatusMeta(d.status);
+          const source = tradeSourceLabel(d.source);
+          const marketName = d.marketName || "未标记市场";
+          const legLabel = d.legIndex === null || d.legIndex === undefined
+            ? marketName
+            : `Leg ${Number(d.legIndex) + 1} · ${marketName}`;
+          const orderLine = [d.liquidityRole, (d.orderRefs || []).length ? `Order ${d.orderRefs.join(", ")}` : ""].filter(Boolean).join(" · ");
+          const positionQtyLine = d.positionQtyBefore !== null && d.positionQtyBefore !== undefined && d.positionQtyAfter !== null && d.positionQtyAfter !== undefined
+            ? `仓位数量: ${formatNumber(d.positionQtyBefore, 8)} → ${formatNumber(d.positionQtyAfter, 8)}`
+            : "";
+          const positionRatioLine = d.positionBefore !== null && d.positionBefore !== undefined && d.positionAfter !== null && d.positionAfter !== undefined
+            ? `组合占比: ${formatPercent(d.positionBefore, 3)} → ${formatPercent(d.positionAfter, 3)}`
+            : "";
           return [
-            `<strong style="color:${isBuy ? "#86efac" : "#fca5a5"}">${escapeHtml(side)}</strong> <span style="color:#90a5c3">${escapeHtml(formatTime(d.ts))}</span>`,
-            `Price: ${escapeHtml(formatCurrency(d.price, 2, "USDT"))}`,
-            `Qty: ${escapeHtml(qty)}`,
+            `<strong style="color:${status.tone === "filled" ? "#86efac" : "#fbbf24"}">${escapeHtml(status.icon)} ${escapeHtml(source ? `${source}${status.label}` : status.label)}</strong> <span style="color:#90a5c3">${escapeHtml(formatTime(d.ts))}</span>`,
+            `<strong>${escapeHtml(legLabel)}</strong>`,
+            `交易: ${escapeHtml([side, d.outcomeSide].filter(Boolean).join(" "))}`,
+            `成交价: ${escapeHtml(formatNumber(d.price, 6))} ${escapeHtml(tradeCurrency(d))}`,
+            `数量: ${escapeHtml(qty)}`,
+            positionQtyLine,
+            positionRatioLine,
+            d.fee === null || d.fee === undefined ? "" : `手续费: ${escapeHtml(formatNumber(d.fee, 6))} ${escapeHtml(tradeCurrency(d))}`,
+            orderLine ? escapeHtml(orderLine) : "",
             d.reason ? `Reason: ${escapeHtml(d.reason)}` : "",
           ].filter(Boolean).join("<br>");
         },
@@ -3890,6 +5798,7 @@ function buildEventTimelineSeries(payload, panelIndex) {
     const summary = event.summary || event.label || event.event_type || event.type || "-";
     dataByCategory.get(info.key)?.push({
       value: [ts, info.lane, summary],
+      eventId: chartEventIdentity(event),
       itemStyle: { color },
       category: info.label,
       categoryKey: info.key,
@@ -3923,12 +5832,10 @@ function buildEventTimelineSeries(payload, panelIndex) {
           const d = param.data || {};
           const ts = new Date(Array.isArray(param.value) ? param.value[0] : "");
           const timeStr = Number.isFinite(ts.getTime()) ? `${formatTime(d.ts || ts.toISOString())}` : "-";
-          const rawTs = d.ts || (Array.isArray(param.value) ? param.value[0] : null);
           const lines = [
             `<strong>${escapeHtml(d.category || "Event")}</strong> <span style="color:#90a5c3">${escapeHtml(timeStr)}</span>`,
             formatEventTooltipLine(d, 220),
           ];
-          lines.push(...buildReferenceTooltipLines(payload, rawTs));
           return lines.join("<br>");
         },
       },
@@ -3937,8 +5844,9 @@ function buildEventTimelineSeries(payload, panelIndex) {
 }
 
 function buildChartOption(payload) {
-  const { grid, xAxis, yAxis, dataZoom, panelIndex } = buildChartCoordinateState(payload);
-  const { chartSeries, seriesMetaById } = buildChartSeriesOption(payload);
+  const coordinateState = buildChartCoordinateState(payload);
+  const { grid, xAxis, yAxis, dataZoom, panelIndex } = coordinateState;
+  const { chartSeries, seriesMetaById } = buildChartSeriesOption(payload, null, coordinateState);
   const stateSeries = buildMetricStateSeries(payload, panelIndex);
   const eventTimelineSeries = buildEventTimelineSeries(payload, panelIndex);
   const tradeMarkerSeries = buildTradeMarkerSeries(payload, panelIndex);
@@ -3958,7 +5866,10 @@ function buildChartOption(payload) {
     backgroundColor: "transparent",
     animation: false,
     legend: {
-      show: chartSeries.length > 0,
+      // The workbench uses the always-visible HTML legend above the canvas.
+      // ECharts' canvas legend becomes unusable for multi-leg strategies and
+      // was previously disabled entirely once the series count exceeded 48.
+      show: false,
       type: "scroll",
       top: 0,
       left: 8,
@@ -3973,7 +5884,7 @@ function buildChartOption(payload) {
       data: legendNames.map((name) => ({ name, icon: "roundRect" })),
       selected: legendSelected,
     },
-    tooltip: { trigger: "axis", axisPointer: { type: "cross", link: [{ xAxisIndex: "all" }], lineStyle: { color: "rgba(226, 232, 240, 0.45)" } }, confine: true, backgroundColor: "rgba(2, 6, 23, 0.96)", borderColor: "rgba(148, 163, 184, 0.22)", borderWidth: 1, padding: [8, 10], textStyle: { color: "#e5eefc", fontSize: 12, lineHeight: 18 }, formatter: buildTooltipFormatter(seriesMetaById, payload) },
+    tooltip: { trigger: "axis", triggerOn: "mousemove|click", confine: true, extraCssText: "max-height:72vh;overflow-y:auto;", backgroundColor: "rgba(2, 6, 23, 0.96)", borderColor: "rgba(148, 163, 184, 0.22)", borderWidth: 1, padding: [8, 10], textStyle: { color: "#e5eefc", fontSize: 12, lineHeight: 18 }, formatter: buildTooltipFormatter(seriesMetaById, payload) },
     axisPointer: { link: [{ xAxisIndex: "all" }], label: { backgroundColor: "#1e293b" } },
     dataZoom,
     grid,
@@ -4145,9 +6056,120 @@ function renderStateLaneColorControls(container, payload = {}) {
   container.appendChild(row);
 }
 
+function inlineLegendPanelLabel(panel) {
+  return ({
+    main: "价格",
+    leg_positions: "实际仓位",
+    leg_position_metrics: "单腿上限指标",
+    capital: "资金",
+    edge: "优势 / 概率",
+    metrics: "策略指标",
+    diagnostics: "诊断",
+  })[panel] || panel || "其他";
+}
+
+function applyInlineLegendFilter() {
+  if (!chartSeriesLegend) return;
+  const query = inlineLegendQuery.trim().toLowerCase();
+  let matched = 0;
+  chartSeriesLegend.querySelectorAll(".chart-inline-legend-grid .series-legend-chip").forEach((button) => {
+    const panelMatches = inlineLegendPanel === "all" || button.dataset.legendPanel === inlineLegendPanel;
+    const queryMatches = !query || (button.dataset.legendSearch || "").includes(query);
+    button.hidden = !(panelMatches && queryMatches);
+    if (!button.hidden) matched += 1;
+  });
+  const result = chartSeriesLegend.querySelector("[data-inline-legend-result]");
+  if (result) result.textContent = `${matched} 项`;
+}
+
+function renderInlineSeriesLegend(series = []) {
+  if (!chartSeriesLegend) return;
+  inlineLegendSeries = series || [];
+  const panels = [...new Set(inlineLegendSeries.map((item) => item.panel || "other"))];
+  if (inlineLegendPanel !== "all" && !panels.includes(inlineLegendPanel)) inlineLegendPanel = "all";
+  const visibleCount = inlineLegendSeries.filter((item) => (seriesStyleState[item.key] || {}).visible !== false).length;
+  const overlayAllowed = workspaceState?.chart_capabilities?.overlay_allowed || {};
+  const overlayLoaderGroup = (type, title) => {
+    const symbols = normalizeSymbols(overlayAllowed[type] || []);
+    if (!symbols.length) return "";
+    const selected = new Set(selectedOverlayState[type]?.symbols || []);
+    return [
+      `<div class="chart-inline-overlay-group" data-overlay-loader-group="${escapeHtml(type)}">`,
+      `<span class="chart-inline-overlay-label">${escapeHtml(title)}</span>`,
+      ...symbols.map((symbol) => `
+        <button type="button" class="overlay-chip ${selected.has(symbol) ? "active" : ""}" data-inline-overlay-toggle="${escapeHtml(symbol)}" data-overlay-type="${escapeHtml(type)}" aria-pressed="${selected.has(symbol) ? "true" : "false"}">
+          <span class="overlay-dot ${escapeHtml(type)}"></span>
+          ${escapeHtml(symbol)}
+        </button>
+      `),
+      "</div>",
+    ].join("");
+  };
+  chartSeriesLegend.classList.toggle("is-expanded", inlineLegendExpanded);
+  chartSeriesLegend.innerHTML = [
+    '<div class="chart-inline-legend-toolbar">',
+    `<button type="button" class="chart-inline-legend-summary" data-inline-legend-toggle aria-expanded="${inlineLegendExpanded ? "true" : "false"}">`,
+    '<span class="chart-inline-legend-icon" aria-hidden="true">≡</span>',
+    '<span>线段管理</span>',
+    `<strong>${visibleCount}/${inlineLegendSeries.length}</strong>`,
+    `<span class="chart-inline-legend-chevron" aria-hidden="true">${inlineLegendExpanded ? "⌃" : "⌄"}</span>`,
+    "</button>",
+    '<span class="chart-inline-legend-hint">悬浮仅显示当前线；展开后可逐条控制</span>',
+    "</div>",
+    '<div class="chart-inline-legend-body">',
+    '<div class="chart-inline-legend-filters">',
+    `<input type="search" data-inline-legend-search value="${escapeHtml(inlineLegendQuery)}" placeholder="搜索 Leg、市场或指标" aria-label="搜索图表线段">`,
+    '<select data-inline-legend-panel aria-label="按图表区域筛选">',
+    `<option value="all"${inlineLegendPanel === "all" ? " selected" : ""}>全部区域</option>`,
+    ...panels.map((panel) => `<option value="${escapeHtml(panel)}"${inlineLegendPanel === panel ? " selected" : ""}>${escapeHtml(inlineLegendPanelLabel(panel))}</option>`),
+    "</select>",
+    '<span data-inline-legend-result></span>',
+    '<span class="chart-inline-legend-spacer"></span>',
+    '<button type="button" class="ghost-btn" data-inline-legend-bulk="show">显示筛选项</button>',
+    '<button type="button" class="ghost-btn" data-inline-legend-bulk="hide">隐藏筛选项</button>',
+    "</div>",
+    '<div class="chart-inline-overlay-loader">',
+    '<span class="chart-inline-overlay-heading">加载额外数据</span>',
+    overlayLoaderGroup("crypto", "Crypto"),
+    overlayLoaderGroup("finance", "Stock"),
+    "</div>",
+    '<div class="chart-inline-legend-grid"></div>',
+    "</div>",
+  ].join("");
+  const grid = chartSeriesLegend.querySelector(".chart-inline-legend-grid");
+  inlineLegendSeries.forEach((item) => {
+    const style = seriesStyleState[item.key] || {};
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "series-legend-chip" + (style.visible === false ? " is-off" : "");
+    button.dataset.seriesStyle = item.key;
+    button.dataset.styleField = "visible";
+    button.setAttribute("aria-pressed", style.visible === false ? "false" : "true");
+    const completeName = fullSeriesLabel(item);
+    const source = seriesCardSubtitle(item);
+    button.title = [completeName, source].filter(Boolean).join("\n");
+    button.dataset.legendPanel = item.panel || "other";
+    button.dataset.legendSearch = [completeName, inlineSeriesLabel(item), source, item.key].filter(Boolean).join(" ").toLowerCase();
+    const dot = document.createElement("span");
+    dot.className = "series-control-dot";
+    dot.style.background = style.color || colorForSeries(item.key);
+    const label = document.createElement("span");
+    label.textContent = inlineSeriesLabel(item);
+    button.append(dot, label);
+    grid.appendChild(button);
+  });
+  applyInlineLegendFilter();
+}
+
 function renderSeriesControls(series, payload = {}) {
   const container = document.getElementById("workspaceSeriesControls");
   if (!container) return;
+  const chartStylePane = container.closest('[data-drawer-pane="chart-style"]');
+  if (chartStylePane && !chartStylePane.classList.contains("active")) {
+    deferredSeriesControlsState = { series: series || [], payload };
+    return;
+  }
+  deferredSeriesControlsState = null;
   ensureSeriesStyleState(series);
   const list = series || [];
   const mainSeries = list.filter((item) => item.panel === "main");
@@ -4163,7 +6185,7 @@ function renderSeriesControls(series, payload = {}) {
 
   const legendRow = document.createElement("div");
   legendRow.className = "series-legend-row";
-  list.slice(0, 48).forEach((item) => {
+  list.slice(0, 32).forEach((item) => {
     const style = seriesStyleState[item.key] || {};
     const button = document.createElement("button");
     button.type = "button";
@@ -4188,7 +6210,8 @@ function renderSeriesControls(series, payload = {}) {
 
   const row = document.createElement("div");
   row.className = "series-control-row";
-  controlSeries.forEach((item) => {
+  const visibleControlSeries = controlSeries.slice(0, 18);
+  visibleControlSeries.forEach((item) => {
     const style = seriesStyleState[item.key] || {};
     const card = document.createElement("div");
     card.className = "series-control-chip";
@@ -4261,6 +6284,12 @@ function renderSeriesControls(series, payload = {}) {
     }
     row.appendChild(card);
   });
+  if (controlSeries.length > visibleControlSeries.length) {
+    const more = document.createElement("div");
+    more.className = "series-control-chip series-control-more-notice";
+    more.textContent = `其余 ${controlSeries.length - visibleControlSeries.length} 条线可通过上方图例和副图选择器管理`;
+    row.appendChild(more);
+  }
   container.appendChild(row);
 
   renderStateLaneColorControls(container, payload);
@@ -4289,11 +6318,24 @@ function renderSeriesControls(series, payload = {}) {
   });
   container.appendChild(etRow);
 }
+
+document.addEventListener("click", (event) => {
+  const tab = event.target.closest('[data-drawer-tab="chart-style"]');
+  if (!tab) return;
+  requestAnimationFrame(() => {
+    const state = deferredSeriesControlsState;
+    const payload = state?.payload || filterChartPayloadForSelectedSubMetrics(currentChartPayload || {});
+    renderSeriesControls(state?.series || payload.series || [], payload);
+  });
+});
+
 function renderCharts(payload) {
-  const panels = payload.panels || [];
-  const series = payload.series || [];
-  const rows = payload.rows || [];
-  const target = payload.meta?.target || {};
+  const renderStartedAt = performance.now();
+  const renderPayload = filterChartPayloadForSelectedSubMetrics(payload || {});
+  const panels = renderPayload.panels || [];
+  const series = renderPayload.series || [];
+  const rows = renderPayload.rows || [];
+  const target = renderPayload.meta?.target || {};
   pushDebug("[WS] renderCharts:start", {
     row_id: Number(rowId),
     rows: rows.length,
@@ -4301,10 +6343,13 @@ function renderCharts(payload) {
     panels: panels.length,
   });
 
-  workspaceChartMeta.textContent = renderTimelineStatus(payload);
+  workspaceChartMeta.textContent = renderTimelineStatus(renderPayload);
+  ensureSeriesStyleState(series);
+  renderInlineSeriesLegend(series);
+  renderLatestTradeStatus(renderPayload);
 
-  const hasStateLanes = (payload.metric_state_lanes || []).some((lane) => (lane.segments || []).length);
-  const hasEvents = (payload.events || []).length > 0;
+  const hasStateLanes = (renderPayload.metric_state_lanes || []).some((lane) => (lane.segments || []).length);
+  const hasEvents = (renderPayload.events || []).length > 0;
   if (!panels.length || (!series.length && !hasStateLanes && !hasEvents) || !rows.length) {
     pushDebug("[WS] renderCharts:empty", {
       row_id: Number(rowId),
@@ -4317,29 +6362,33 @@ function renderCharts(payload) {
     return;
   }
 
-  renderChartInsights(payload);
-  ensureReadableBacktestChartHeight(payload);
+  renderChartInsights(renderPayload);
+  ensureReadableChartHeight(renderPayload);
   ensureChartShell();
 
-  const controlsSignature = buildSeriesControlsSignature(series, payload);
+  const controlsSignature = buildSeriesControlsSignature(series, renderPayload);
   if (controlsSignature !== lastSeriesControlsSignature) {
-    renderSeriesControls(series, payload);
+    renderSeriesControls(series, renderPayload);
     lastSeriesControlsSignature = controlsSignature;
   }
 
   const chart = ensureChartInstance();
-  const option = buildChartOption(payload);
-  const renderDiagnostics = importantRenderDiagnostics(payload, option);
-  const structureSignature = buildChartStructureSignature(payload);
-  lastChartTimeExtent = chartTimeExtentKey(rows, payload.meta || {});
+  const option = buildChartOption(renderPayload);
+  chart.__workspaceLineHoverSeries = option.series || [];
+  const renderDiagnostics = importantRenderDiagnostics(renderPayload, option);
+  const structureSignature = buildChartStructureSignature(renderPayload);
+  lastChartTimeExtent = chartTimeExtentKey(rows, renderPayload.meta || {});
+  resetChartTooltipFocus(chart);
 
   if (structureSignature !== lastChartStructureSignature) {
     suppressProgrammaticChartZoomSync();
     chart.setOption(option, {
-      notMerge: true,
-      lazyUpdate: true,
+      notMerge: false,
+      replaceMerge: ["series", "grid", "xAxis", "yAxis"],
+      lazyUpdate: false,
       silent: true,
     });
+    chart.dispatchAction({ type: "hideTip" });
     lastChartStructureSignature = structureSignature;
   } else {
     suppressProgrammaticChartZoomSync();
@@ -4355,6 +6404,8 @@ function renderCharts(payload) {
       silent: true,
     });
   }
+  syncChartInteractionState(chart);
+  renderChartFocusLine();
   pushDebug("[WS] renderCharts:done", {
     row_id: Number(rowId),
     rows: rows.length,
@@ -4362,6 +6413,7 @@ function renderCharts(payload) {
     panels: panels.length,
     chart_option_series: option.series?.length || 0,
     render_diagnostics: renderDiagnostics,
+    total_ms: Number((performance.now() - renderStartedAt).toFixed(1)),
   });
 }
 
@@ -4378,7 +6430,7 @@ function seriesKeysForDeltaStreams(payload, streamKeys) {
     if (requested.has("stats") && marketIndex === 0 && category === "market_target") {
       output.add(key);
     }
-    if (requested.has("stats") && !key.startsWith("market_") && ["position", "size", "average", "capital"].includes(category)) {
+    if (requested.has("stats") && ["position", "size", "average", "capital"].includes(category) && (!key.startsWith("market_") || item.sub_metric)) {
       output.add(key);
     }
     if (requested.has("metrics") && category === "strategy_metric") {
@@ -4417,25 +6469,27 @@ function applyDeltaChartPatch(payload, streamKeys) {
     renderCharts(payload);
     return;
   }
-  const structureSignature = buildChartStructureSignature(payload);
+  const renderPayload = filterChartPayloadForSelectedSubMetrics(payload);
+  const structureSignature = buildChartStructureSignature(renderPayload);
   if (structureSignature !== lastChartStructureSignature) {
-    renderCharts(payload);
+    renderCharts(renderPayload);
     return;
   }
-  const targetKeys = expandMacdTargetKeys(seriesKeysForDeltaStreams(payload, streamKeys));
+  const targetKeys = expandMacdTargetKeys(seriesKeysForDeltaStreams(renderPayload, streamKeys));
   if (!targetKeys.length) {
     return;
   }
   const chart = ensureChartInstance();
-  const extentNow = chartTimeExtentKey(payload.rows || [], payload.meta || {});
+  const extentNow = chartTimeExtentKey(renderPayload.rows || [], renderPayload.meta || {});
   const axesUnchanged = lastChartTimeExtent && chartTimeExtentEqual(lastChartTimeExtent, extentNow);
   lastChartTimeExtent = extentNow;
-  const { xAxis, yAxis, dataZoom } = buildChartCoordinateState(payload);
-  const { chartSeries } = buildChartSeriesOption(payload, targetKeys);
+  const coordinateState = buildChartCoordinateState(renderPayload);
+  const { xAxis, yAxis, dataZoom } = coordinateState;
+  const { chartSeries } = buildChartSeriesOption(renderPayload, targetKeys, coordinateState);
   if (!chartSeries.length) {
     return;
   }
-  const renderDiagnostics = importantRenderDiagnostics(payload, { series: chartSeries }, targetKeys);
+  const renderDiagnostics = importantRenderDiagnostics(renderPayload, { series: chartSeries }, targetKeys);
   const patch = axesUnchanged
     ? { series: chartSeries }
     : { xAxis, yAxis, dataZoom, series: chartSeries };
@@ -4449,7 +6503,8 @@ function applyDeltaChartPatch(payload, streamKeys) {
   pushDebug("[WS] chart:delta-patch", {
     row_id: Number(rowId),
     streams: streamKeys,
-    target_keys: targetKeys,
+    target_key_count: targetKeys.length,
+    target_keys: targetKeys.slice(0, 12),
     series_only_patch: Boolean(axesUnchanged),
     chart_option_series: chartSeries.length,
     render_diagnostics: renderDiagnostics,
@@ -4518,7 +6573,9 @@ function cloneChartPayload(payload) {
     ...payload,
     meta: { ...(payload.meta || {}) },
     panels: [...(payload.panels || [])].map((item) => ({ ...item })),
+    panel_catalog: [...(payload.panel_catalog || payload.panels || [])].map((item) => ({ ...item })),
     series: [...(payload.series || [])].map((item) => ({ ...item })),
+    sub_series_catalog: [...(payload.sub_series_catalog || [])].map((item) => ({ ...item })),
     events: [...(payload.events || [])].map((item) => ({ ...item })),
     rows: [...(payload.rows || [])].map((row) => ({ ...row })),
   } : null;
@@ -4570,11 +6627,15 @@ function syncDeltaStateFromChartPayload(payload, reason = "chart-load") {
 }
 
 function cacheChartPayload(payload, reason = "chart-load") {
+  if (reason === "full-load") {
+    hydratedSubMetricTokens.clear();
+  }
   currentChartPayload = cloneChartPayload(normalizeChartPayloadRows(payload, reason));
   currentChartReloadSignature = buildChartReloadSignature();
   syncDeltaStateFromChartPayload(currentChartPayload, reason);
   if (reason === "full-load") {
     lastFullChartLoadedAt = Date.now();
+    lastMetricStateRefreshAt = (currentChartPayload?.metric_state_lanes || []).length ? Date.now() : 0;
   }
 }
 
@@ -4701,13 +6762,48 @@ function mergeDeltaPoints(rows, points, meta) {
   return sampleRows(trimRowsToMetaRange(output, meta));
 }
 
+function chartEventIdentity(event = {}) {
+  const payload = tradeEventPayload(event);
+  return String(event.id || [
+    event.ts,
+    event.type || event.event_type,
+    event.status || event.subtype || payload.status,
+    event.action || payload.action || payload.action_type,
+    event.leg ?? payload.leg ?? payload.leg_index,
+    event.side || payload.side,
+    event.price ?? payload.price,
+    event.quantity ?? payload.qty ?? payload.quantity,
+    event.label || event.summary,
+  ].join("|"));
+}
+
+function mergeDeltaEvents(events = [], incoming = [], meta = {}) {
+  const merged = new Map();
+  [...events, ...incoming].forEach((event) => {
+    if (!event || !event.ts) return;
+    merged.set(chartEventIdentity(event), event);
+  });
+  const from = parseTimeSafe(meta.from);
+  const to = parseTimeSafe(meta.to);
+  return [...merged.values()]
+    .filter((event) => {
+      const ts = parseTimeSafe(event.ts);
+      if (ts === null) return false;
+      if (from !== null && ts < from) return false;
+      if (to !== null && ts > to) return false;
+      return true;
+    })
+    .sort((left, right) => (parseTimeSafe(left.ts) || 0) - (parseTimeSafe(right.ts) || 0))
+    .slice(-240);
+}
+
 function streamIsDue(streamKey, now = Date.now()) {
   const interval = DELTA_STREAM_INTERVALS[streamKey] || 10000;
   return now - Number(deltaStreamState.lastSuccessAt[streamKey] || 0) >= interval;
 }
 
 function dueDeltaStreams(now = Date.now()) {
-  return Object.keys(DELTA_STREAM_INTERVALS).filter((key) => key !== "events" && streamIsDue(key, now));
+  return Object.keys(DELTA_STREAM_INTERVALS).filter((key) => streamIsDue(key, now));
 }
 
 function expectedSeriesStyleKeys() {
@@ -4767,7 +6863,7 @@ function buildChartRequestParams(options = {}) {
     overlay_finance: selectedOverlaySymbols("finance").join(","),
     overlay_crypto_fields: selectedOverlayFields("crypto").join(","),
     overlay_finance_fields: selectedOverlayFields("finance").join(","),
-    market_targets_json: JSON.stringify(trackedMarkets),
+    market_targets_json: JSON.stringify(marketTargetsForChartRequest()),
   });
   if (workspaceViewMode === "backtest" && selectedBacktestRunId) {
     params.set("backtest_run_id", selectedBacktestRunId);
@@ -5005,6 +7101,7 @@ async function loadWorkspace(forceResetOverlay = false, silent = false) {
   syncMarketSelectorInputs(!silent);
   renderTrackedMarkets();
   renderMarketStatus();
+  renderHeader(workspaceState.strategy || {});
   renderSummary(workspaceState.strategy || {});
   renderWorkspaceModeEvents();
   renderBacktest(workspaceState.backtest || null);
@@ -5032,6 +7129,7 @@ async function loadWorkspace(forceResetOverlay = false, silent = false) {
 
 async function loadChart() {
   const t0 = performance.now();
+  fullChartLoadCount += 1;
   syncTimelineUi();
   console.log("[WS] loadChart start", {
     interval: chartInterval.value,
@@ -5089,8 +7187,22 @@ async function loadChart() {
       return;
     }
     const chartData = payload?.data || {};
+    if (Array.isArray(chartData.events)) {
+      _fullEventsList = limitEventsWithTypeGuarantee(chartData.events);
+      renderEvents(_fullEventsList);
+      if (workspaceEventsLoadState) {
+        workspaceEventsLoadState.textContent = "实时刷新";
+        workspaceEventsLoadState.classList.remove("is-loading");
+      }
+    }
     cacheChartPayload(chartData, "full-load");
     const renderPayload = currentChartPayload || chartData;
+    const loadedExtent = cachedTimelineExtent(renderPayload);
+    timelineState.visibleFrom = loadedExtent.minTs;
+    timelineState.visibleTo = loadedExtent.maxTs;
+    timelineState.spanMs = loadedExtent.rangeMs;
+    timelineState.rangePreset = activeQuickRange === "custom" ? timelineState.rangePreset : activeQuickRange;
+    syncTimelineStateUi();
     renderCharts(renderPayload);
     const t3 = performance.now();
     console.log(
@@ -5101,7 +7213,7 @@ async function loadChart() {
       row_count: (renderPayload.rows || []).length,
       series_count: (renderPayload.series || []).length,
       panel_count: (renderPayload.panels || []).length,
-      meta: renderPayload.meta || {},
+      chart_debug: chartDebugSummary(renderPayload),
       prepare_ms: Number((t1 - t0).toFixed(1)),
       fetch_ms: Number((t2 - t1).toFixed(1)),
       render_ms: Number((t3 - t2).toFixed(1)),
@@ -5163,6 +7275,21 @@ async function loadChartDelta(streams) {
   const requestId = ++currentChartRequestId;
   const params = buildChartRequestParams({ includeStyle: false });
   params.set("streams", requestedStreams.join(","));
+  const includesMetrics = requestedStreams.includes("metrics");
+  if (!includesMetrics) {
+    params.delete("sub_metrics");
+  } else {
+    params.set(
+      "sub_metrics",
+      selectedSubMetrics().filter((token) => (
+        String(token).startsWith("metric:") || String(token).startsWith("metric_state:")
+      )).join(","),
+    );
+    const hasSelectedStateMetrics = selectedSubMetrics().some((token) => String(token).startsWith("metric_state:"));
+    if (hasSelectedStateMetrics && Date.now() - lastMetricStateRefreshAt >= METRIC_STATE_REFRESH_INTERVAL_MS) {
+      params.set("include_metric_states", "1");
+    }
+  }
   requestedStreams.forEach((streamKey) => {
     params.set(`cursor_${streamKey}`, deltaStreamState.cursors[streamKey] || "");
   });
@@ -5217,14 +7344,26 @@ async function loadChartDelta(streams) {
     events: currentChartPayload.events || [],
     rows: currentChartPayload.rows || [],
   };
+  const previousMeta = nextPayload.meta || {};
+  const incomingMeta = deltaData.meta || {};
   nextPayload.meta = {
-    ...(nextPayload.meta || {}),
-    ...(deltaData.meta || {}),
+    ...previousMeta,
+    ...incomingMeta,
+    from: timelineState.mode === "INSPECT" ? (previousMeta.from || incomingMeta.from) : (incomingMeta.from || previousMeta.from),
+    sources: { ...(previousMeta.sources || {}), ...(incomingMeta.sources || {}) },
   };
   let rowsChanged = false;
+  let stateLanesChanged = false;
+  let eventsChanged = false;
+  let incomingPointCount = 0;
+  let incomingEventCount = 0;
   requestedStreams.forEach((streamKey) => {
     const streamPayload = deltaData[streamKey] || {};
     if (Array.isArray(streamPayload.points) && streamPayload.points.length) {
+      incomingPointCount += streamPayload.points.filter((point) => {
+        const ts = parseTimeSafe(point?.ts);
+        return ts !== null && (timelineState.visibleTo === null || ts > timelineState.visibleTo);
+      }).length;
       nextPayload.rows = mergeDeltaPoints(nextPayload.rows || [], streamPayload.points, nextPayload.meta);
       rowsChanged = true;
     }
@@ -5234,16 +7373,68 @@ async function loadChartDelta(streams) {
     deltaStreamState.lastSuccessAt[streamKey] = Date.now();
     deltaStreamState.failureCount[streamKey] = 0;
   });
+  if (Array.isArray(deltaData.events?.items) && deltaData.events.items.length) {
+    const previousEventIds = new Set((nextPayload.events || []).map(chartEventIdentity));
+    incomingEventCount = deltaData.events.items.filter((event) => (
+      !previousEventIds.has(chartEventIdentity(event))
+      && (timelineState.visibleTo === null || (parseTimeSafe(event.ts) || 0) > timelineState.visibleTo)
+    )).length;
+    const previousEventSignature = (nextPayload.events || []).map(chartEventIdentity).join(";");
+    nextPayload.events = mergeDeltaEvents(nextPayload.events || [], deltaData.events.items, nextPayload.meta);
+    const nextEventSignature = nextPayload.events.map(chartEventIdentity).join(";");
+    eventsChanged = previousEventSignature !== nextEventSignature;
+    if (eventsChanged) {
+      _fullEventsList = limitEventsWithTypeGuarantee([
+        ...deltaData.events.items,
+        ..._fullEventsList,
+      ]);
+      renderEvents(_fullEventsList);
+    }
+  }
+  if (Array.isArray(deltaData.metric_state_lanes)) {
+    lastMetricStateRefreshAt = Date.now();
+    const previousSignature = stateLaneDataSignature(nextPayload.metric_state_lanes || []);
+    const nextSignature = stateLaneDataSignature(deltaData.metric_state_lanes);
+    stateLanesChanged = previousSignature !== nextSignature;
+    if (stateLanesChanged) {
+      nextPayload.metric_state_lanes = deltaData.metric_state_lanes;
+    }
+    selectedSubMetrics()
+      .filter((token) => String(token).startsWith("metric_state:"))
+      .forEach((token) => hydratedSubMetricTokens.add(token));
+  }
   if (rowsChanged && streamsRequireMacdRecompute(nextPayload, requestedStreams)) {
     recomputeMacdOverlayColumns(nextPayload.rows, nextPayload.series);
   }
+  if (timelineState.mode === "INSPECT") {
+    timelineState.pendingPoints += incomingPointCount;
+    if (eventsChanged) timelineState.pendingEvents += incomingEventCount;
+  } else if (rowsChanged) {
+    const latest = getTimeExtent(nextPayload.rows || [], nextPayload.meta || {}).maxTs;
+    const span = Math.max(60 * 1000, Number(timelineState.spanMs) || parseRangeMs(activeQuickRange));
+    chartViewState = {
+      start: null,
+      end: null,
+      startValue: latest - span,
+      endValue: latest,
+    };
+    timelineState.visibleFrom = latest - span;
+    timelineState.visibleTo = latest;
+  }
+  syncTimelineStateUi();
   currentChartPayload = nextPayload;
   currentChartReloadSignature = buildChartReloadSignature();
-  applyDeltaChartPatch(currentChartPayload, requestedStreams);
+  if (stateLanesChanged || eventsChanged) {
+    renderCharts(currentChartPayload);
+  } else {
+    applyDeltaChartPatch(currentChartPayload, requestedStreams);
+  }
   pushDebug("[WS] delta:done", {
     row_id: Number(rowId),
     streams: requestedStreams,
     rows: (currentChartPayload.rows || []).length,
+    state_lanes_changed: stateLanesChanged,
+    events_changed: eventsChanged,
     render_summary: compactPriceRenderSummary(currentChartPayload),
     total_ms: Number((performance.now() - t0).toFixed(1)),
   });
@@ -5259,6 +7450,9 @@ async function refreshChartAuto() {
     });
     return;
   }
+  if (isChartLoading || isSubMetricSeriesLoading || Date.now() - lastChartInteractionAt < 1000) {
+    return;
+  }
   if (needsFullReload("auto-refresh")) {
     resetDeltaState("auto-refresh-full-reload");
     await loadChart();
@@ -5268,27 +7462,20 @@ async function refreshChartAuto() {
       await loadChartDelta(streams);
     }
   }
-  if (streamIsDue("events") && !isEventsLoading) {
-    isEventsLoading = true;
-    try {
-      await loadEvents();
-      deltaStreamState.lastSuccessAt.events = Date.now();
-      deltaStreamState.failureCount.events = 0;
-    } catch (error) {
-      deltaStreamState.failureCount.events = Number(deltaStreamState.failureCount.events || 0) + 1;
-      pushDebug("[WS] events:auto:error", {
-        row_id: Number(rowId),
-        message: error?.message || String(error),
-      });
-    } finally {
-      isEventsLoading = false;
-    }
-  }
 }
 
 async function loadEvents() {
+  eventsRequestedByUser = true;
+  if (workspaceEventsLoadState) {
+    workspaceEventsLoadState.textContent = "加载中";
+    workspaceEventsLoadState.classList.add("is-loading");
+  }
   if (workspaceViewMode === "backtest" && selectedBacktestResults?.selected_run) {
     renderWorkspaceModeEvents();
+    if (workspaceEventsLoadState) {
+      workspaceEventsLoadState.textContent = "已加载";
+      workspaceEventsLoadState.classList.remove("is-loading");
+    }
     return;
   }
   const t0 = performance.now();
@@ -5296,8 +7483,12 @@ async function loadEvents() {
   pushDebug("[WS] loadEvents:start", { row_id: Number(rowId) });
   let payload;
   try {
-    payload = await fetchJson(`/api/polymarket/strategies/${rowId}/events?limit=120`);
+    payload = await fetchJson(`/api/polymarket/strategies/${rowId}/events?limit=120&compact=1`);
   } catch (error) {
+    if (workspaceEventsLoadState) {
+      workspaceEventsLoadState.textContent = "加载失败";
+      workspaceEventsLoadState.classList.remove("is-loading");
+    }
     pushDebug("[WS] loadEvents:error", {
       row_id: Number(rowId),
       message: error?.message || String(error),
@@ -5320,9 +7511,20 @@ async function loadEvents() {
   });
   deltaStreamState.lastSuccessAt.events = Date.now();
   deltaStreamState.failureCount.events = 0;
+  if (workspaceEventsLoadState) {
+    workspaceEventsLoadState.textContent = "实时刷新";
+    workspaceEventsLoadState.classList.remove("is-loading");
+  }
 }
 
 window.loadWorkspaceEvents = loadEvents;
+
+workspaceEventsPanel?.addEventListener("toggle", () => {
+  if (!workspaceEventsPanel.open || eventsRequestedByUser) return;
+  loadEvents().catch((error) => {
+    setStatus(workspaceEvents, error?.message || String(error));
+  });
+});
 
 if (workspaceDebugClearBtn) {
   workspaceDebugClearBtn.addEventListener("click", () => {
@@ -5333,6 +7535,12 @@ if (workspaceDebugClearBtn) {
     setDebugMeta("日志已清空。");
   });
 }
+
+workspaceDebugDetails?.addEventListener("toggle", () => {
+  if (!workspaceDebugDetails.open || !workspaceDebugLog) return;
+  workspaceDebugLog.textContent = workspaceDebugLines.join("\n\n");
+  workspaceDebugLog.scrollTop = workspaceDebugLog.scrollHeight;
+});
 
 function collectSettingsPayload() {
   const payload = {};
@@ -5440,12 +7648,94 @@ chartOverlayPicker.addEventListener("click", (event) => {
   }
 });
 
-chartMetricPicker.addEventListener("change", () => {
+function syncMetricGroupActionCounts() {
+  chartMetricPicker.querySelectorAll(".metric-picker-group-actions").forEach((container) => {
+    const groupId = container.dataset.subMetricGroup || "";
+    const inputs = [...chartMetricPicker.querySelectorAll("input[data-sub-metric]")]
+      .filter((input) => input.dataset.subMetricGroup === groupId);
+    const count = container.querySelector(".metric-picker-group-count");
+    if (count) count.textContent = `${inputs.filter((input) => input.checked).length}/${inputs.length}`;
+  });
+}
+
+function handleMetricPickerChange(reason = "metric-picker-change") {
+  lastChartInteractionAt = Date.now();
+  syncMetricGroupActionCounts();
+  syncChartToolCounts();
   revealSelectedSubMetricSeries();
+  if (renderSubMetricSelectionLocally(reason)) {
+    return;
+  }
+  const missing = missingSelectedSubMetricTokens();
+  const canFastLoadMetrics = missing.length > 0 && missing.every((token) => (
+    String(token).startsWith("metric:") || String(token).startsWith("metric_state:")
+  ));
+  if (canFastLoadMetrics) {
+    clearTimeout(chartRefreshDebounceTimer);
+    hydrateMissingMetricSeries(missing, reason).then((loaded) => {
+      if (!loaded) scheduleChartReload();
+    });
+    return;
+  }
   scheduleChartReload();
+}
+
+chartMetricPicker.addEventListener("change", () => {
+  handleMetricPickerChange();
+});
+
+chartMetricPicker.addEventListener("click", (event) => {
+  const action = event.target.closest("[data-sub-metric-group-action]");
+  if (!action) return;
+  event.preventDefault();
+  const groupId = action.dataset.subMetricGroup || "";
+  const checked = action.dataset.subMetricGroupAction === "select-all";
+  const inputs = [...chartMetricPicker.querySelectorAll("input[data-sub-metric]")]
+    .filter((input) => input.dataset.subMetricGroup === groupId);
+  let changed = false;
+  inputs.forEach((input) => {
+    if (input.checked !== checked) {
+      input.checked = checked;
+      changed = true;
+    }
+  });
+  if (!changed && !missingSelectedSubMetricTokens().length) {
+    syncMetricGroupActionCounts();
+    return;
+  }
+  handleMetricPickerChange(`metric-group-${checked ? "all" : "none"}:${groupId}`);
 });
 
 document.addEventListener("click", (event) => {
+  const inlineOverlayToggle = event.target.closest("[data-inline-overlay-toggle]");
+  if (inlineOverlayToggle) {
+    toggleOverlaySymbol(inlineOverlayToggle.dataset.overlayType, inlineOverlayToggle.dataset.inlineOverlayToggle);
+    renderOverlayPicker(workspaceState?.chart_capabilities || {}, workspaceState?.chart_defaults || {});
+    renderInlineSeriesLegend(inlineLegendSeries);
+    scheduleChartReload();
+    return;
+  }
+  const legendManagerToggle = event.target.closest("[data-inline-legend-toggle]");
+  if (legendManagerToggle) {
+    inlineLegendExpanded = !inlineLegendExpanded;
+    localStorage.setItem("workspaceInlineLegendExpanded", inlineLegendExpanded ? "1" : "0");
+    renderInlineSeriesLegend(inlineLegendSeries);
+    return;
+  }
+  const legendBulkAction = event.target.closest("[data-inline-legend-bulk]");
+  if (legendBulkAction) {
+    const visible = legendBulkAction.dataset.inlineLegendBulk === "show";
+    chartSeriesLegend?.querySelectorAll(".chart-inline-legend-grid .series-legend-chip").forEach((button) => {
+      if (button.hidden) return;
+      seriesStyleState[button.dataset.seriesStyle] = {
+        ...(seriesStyleState[button.dataset.seriesStyle] || {}),
+        visible,
+      };
+    });
+    persistSeriesStyles();
+    renderCurrentChartPayload(`legend-bulk-${visible ? "show" : "hide"}`);
+    return;
+  }
   const legendToggle = event.target.closest(".series-legend-chip[data-series-style]");
   if (legendToggle) {
     const seriesKey = legendToggle.dataset.seriesStyle;
@@ -5464,6 +7754,12 @@ document.addEventListener("click", (event) => {
 });
 
 document.addEventListener("input", (event) => {
+  const legendSearch = event.target.closest("[data-inline-legend-search]");
+  if (legendSearch) {
+    inlineLegendQuery = legendSearch.value || "";
+    applyInlineLegendFilter();
+    return;
+  }
   const target = event.target.closest("[data-series-style]");
   if (!target) return;
 
@@ -5491,6 +7787,12 @@ document.addEventListener("input", (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  const legendPanel = event.target.closest("[data-inline-legend-panel]");
+  if (legendPanel) {
+    inlineLegendPanel = legendPanel.value || "all";
+    applyInlineLegendFilter();
+    return;
+  }
   const machineStateSelect = event.target.closest("#workspaceMachineStateSelect, [data-machine-state-key='state']");
   if (machineStateSelect) {
     const prev = machineStateSelect.dataset.prev || workspaceMachineState(workspaceState?.strategy || {}, workspaceStateStore);
@@ -5566,7 +7868,7 @@ document.addEventListener("change", (event) => {
     }).catch((error) => {
       stateSelect.value = prev;
       stateSelect.className = `state-select workspace-state-select state-${prev}`;
-      alert("鐘舵€佸垏鎹㈠け璐? " + (error?.message || error));
+      alert("模式切换失败: " + (error?.message || error));
     }).finally(() => {
       stateSelect.disabled = false;
     });
@@ -5582,7 +7884,9 @@ document.getElementById("workspaceRefreshBtn").addEventListener("click", async (
   try {
     await loadWorkspace(false, true);
     await loadChart();
-    loadEvents().catch(() => {});
+    if (eventsRequestedByUser) {
+      loadEvents().catch(() => {});
+    }
     if (workspaceViewMode === "backtest") {
       disconnectWorkspaceLive();
       setAutoRefresh(false);
@@ -5592,6 +7896,12 @@ document.getElementById("workspaceRefreshBtn").addEventListener("click", async (
   } catch (error) {
     setStatus(workspaceSummary, error.message);
   }
+});
+
+workspaceAddBacktestCaseBtn?.addEventListener("click", () => {
+  saveWorkspaceBacktestCase().catch((error) => {
+    if (workspaceDebugMeta) workspaceDebugMeta.textContent = `添加回测失败: ${error.message || error}`;
+  });
 });
 
 document.getElementById("chartReloadBtn").addEventListener("click", () => {
@@ -5707,14 +8017,7 @@ workspaceBacktest?.addEventListener("click", (event) => {
 
 document.querySelectorAll("[data-range-value]").forEach((button) => {
   button.addEventListener("click", () => {
-    activeQuickRange = normalizeTimelineRange(button.dataset.rangeValue);
-    chartFrom.value = "";
-    chartTo.value = "";
-    if (chartToMode) chartToMode.value = "latest";
-    closeCustomTimelinePanel();
-    chartViewState = { start: null, end: null, startValue: null, endValue: null };
-    updateQuickRangeButtons();
-    scheduleChartReload();
+    activateTimelinePreset(button.dataset.rangeValue, "range-preset");
   });
 });
 
@@ -5737,9 +8040,65 @@ chartCustomToggle?.addEventListener("click", () => {
 });
 
 chartReturnLatestBtn?.addEventListener("click", () => {
-  chartViewState = { start: null, end: null, startValue: null, endValue: null };
-  setTimelineToLatest();
-  scheduleChartReload();
+  returnTimelineToLatest("button");
+});
+
+chartLiveModeBtn?.addEventListener("click", () => {
+  returnTimelineToLatest("live-badge");
+});
+
+chartFitHeightBtn?.addEventListener("click", () => {
+  chartHeightUserAdjusted = true;
+  applyChartHeight(recommendedChartHeight(currentChartPayload), true);
+  if (currentChartPayload) renderCharts(currentChartPayload);
+});
+
+chartFullscreenBtn?.addEventListener("click", async () => {
+  try {
+    if (document.fullscreenElement === workspaceCharts) {
+      await document.exitFullscreen();
+      return;
+    }
+    chartFullscreenRestoreHeight = workspaceChartHeight;
+    await workspaceCharts.requestFullscreen();
+  } catch (error) {
+    pushDebug("[WS] chart:fullscreen:error", { message: error?.message || String(error) });
+  }
+});
+
+document.addEventListener("fullscreenchange", () => {
+  const active = document.fullscreenElement === workspaceCharts;
+  if (chartFullscreenBtn) chartFullscreenBtn.textContent = active ? "退出全屏" : "全屏";
+  if (active) {
+    workspaceCharts.style.height = "100vh";
+  } else if (chartFullscreenRestoreHeight !== null) {
+    applyChartHeight(chartFullscreenRestoreHeight, false);
+    chartFullscreenRestoreHeight = null;
+  }
+  requestAnimationFrame(() => {
+    workspaceChartInstance?.resize();
+    renderChartFocusLine();
+  });
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey) return;
+  const tag = String(event.target?.tagName || "").toLowerCase();
+  if (["input", "textarea", "select"].includes(tag) || event.target?.isContentEditable) return;
+  const key = event.key.toLowerCase();
+  if (key === "l") {
+    event.preventDefault();
+    returnTimelineToLatest("keyboard-l");
+    return;
+  }
+  if (event.key === "Escape") {
+    clearTimelineFocus();
+    return;
+  }
+  if ((key === "j" || key === "k") && _fullEventsList.length && typeof window.focusWorkspaceEvent === "function") {
+    event.preventDefault();
+    navigateWorkspaceEvent(key === "j" ? 1 : -1);
+  }
 });
 
 [chartMainSide].forEach((element) => {
@@ -5864,16 +8223,10 @@ async function boot() {
   workspaceBooting = true;
   workspaceBootReady = false;
   try {
-    await loadWorkspace(true);
-    const initialEventsLoad = loadEvents().catch((error) => {
-      pushDebug("[WS] boot:events:error", {
-        row_id: Number(rowId),
-        message: error?.message || String(error),
-      });
-    });
-    await loadChart();
+    const workspaceLoad = loadWorkspace(true);
+    const chartLoad = loadChart();
+    await Promise.all([workspaceLoad, chartLoad]);
     workspaceBootReady = true;
-    initialEventsLoad.catch(() => {});
     if (workspaceViewMode === "backtest") {
       disconnectWorkspaceLive();
       setAutoRefresh(false);

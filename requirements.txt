@@ -6,3 +6,6 @@ pymongo
 tqdm
 websockets
 websockets-proxy
+pyarrow
+duckdb
+PyYAML

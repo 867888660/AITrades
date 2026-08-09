@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -26,6 +27,7 @@ DEFAULT_PORT = 5001
 DEFAULT_BASE_URL = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
 DEFAULT_REPO_URL = "https://github.com/867888660/AITrades.git"
 PID_FILE = ".datatube/datatube.pid"
+OPENBB_PID_FILE = ".datatube/openbb.pid"
 
 
 def emit(payload: Dict[str, Any], as_json: bool) -> None:
@@ -205,15 +207,117 @@ def write_pid(runtime_root: Path, pid: int) -> None:
     path.write_text(str(pid), encoding="utf-8")
 
 
+def _windows_listener_pids(port: int) -> List[int]:
+    """Return TCP listener PIDs so a stale Flask reloader PID can be recovered."""
+    result = subprocess.run(
+        ["netstat", "-ano", "-p", "tcp"],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    if result.returncode != 0:
+        return []
+    suffix = f":{int(port)}"
+    pids: set[int] = set()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[0].upper() != "TCP":
+            continue
+        if not parts[1].endswith(suffix) or parts[3].upper() != "LISTENING":
+            continue
+        try:
+            pids.add(int(parts[4]))
+        except ValueError:
+            continue
+    return sorted(pids)
+
+
+def openbb_config(runtime_root: Path) -> Dict[str, Any]:
+    path = runtime_root / "web_settings.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"enabled": False}
+    value = payload.get("openbb_settings")
+    return value if isinstance(value, dict) else {"enabled": False}
+
+
+def ensure_openbb_companion(runtime_root: Path, wait_seconds: int) -> Dict[str, Any]:
+    config = openbb_config(runtime_root)
+    if not bool(config.get("enabled")):
+        return ok(status="disabled")
+    from urllib.parse import urlparse
+
+    parsed = urlparse(str(config.get("base_url") or "http://127.0.0.1:6901"))
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 6901
+    base_url = f"http://{host}:{port}"
+    try:
+        http_json("/openapi.json", base_url=base_url, timeout=2.5)
+        return ok(status="already_running", base_url=base_url)
+    except Exception:
+        pass
+
+    openbb_root = runtime_root / ".openbb-venv"
+    openbb_py = openbb_root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if not openbb_py.exists():
+        created = subprocess.run(
+            [sys.executable, "-m", "venv", str(openbb_root)], cwd=str(runtime_root), capture_output=True, text=True,
+        )
+        if created.returncode != 0:
+            return fail("failed to create isolated OpenBB environment", stderr=created.stderr.strip())
+
+    site_packages = openbb_root / ("Lib/site-packages" if os.name == "nt" else "lib")
+    required_markers = ["openbb_platform_api-", "openbb_equity-", "openbb_yfinance-"]
+    marker_names = [path.name.lower() for path in site_packages.rglob("*.dist-info")] if site_packages.exists() else []
+    if any(not any(name.startswith(marker) for name in marker_names) for marker in required_markers):
+        req = runtime_root / "requirements-openbb.txt"
+        if not req.exists():
+            return fail("requirements-openbb.txt is missing")
+        installed = subprocess.run(
+            [str(openbb_py), "-m", "pip", "install", "-r", str(req)],
+            cwd=str(runtime_root), capture_output=True, text=True,
+        )
+        if installed.returncode != 0:
+            return fail("failed to install OpenBB provider requirements", stderr=installed.stderr.strip())
+
+    log_path = runtime_root / ".datatube" / "openbb.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log = open(log_path, "ab", buffering=0)
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_NO_WINDOW", 0)  # type: ignore[attr-defined]
+    proc = subprocess.Popen(
+        [str(openbb_py), "scripts/openbb_service.py", "run"],
+        cwd=str(runtime_root), stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+        creationflags=creationflags, start_new_session=(os.name != "nt"),
+    )
+    pid_path = runtime_root / OPENBB_PID_FILE
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(str(proc.pid), encoding="utf-8")
+    deadline = time.time() + max(5, wait_seconds)
+    while time.time() < deadline:
+        time.sleep(0.6)
+        try:
+            http_json("/openapi.json", base_url=base_url, timeout=2.5)
+            return ok(status="started", pid=proc.pid, base_url=base_url, log=str(log_path))
+        except Exception:
+            pass
+        if proc.poll() is not None:
+            break
+    return fail("OpenBB gateway did not become ready", pid=proc.pid, log=str(log_path))
+
+
 def start_runtime(args: argparse.Namespace, script_dir: Path) -> Dict[str, Any]:
     ensured = ensure_runtime(args, script_dir)
     if not ensured.get("ok"):
         return ensured
     runtime_root = Path(str(ensured["runtime_root"]))
     base_url = args.base_url
+    openbb = ensure_openbb_companion(runtime_root, args.wait_seconds)
     status = runtime_status(runtime_root, base_url)
     if status.get("ok"):
-        return ok(status="already_running", runtime_root=str(runtime_root), base_url=base_url, messages=["DataTube is already responding."])
+        return ok(status="already_running", runtime_root=str(runtime_root), base_url=base_url, openbb=openbb, messages=["DataTube is already responding."])
 
     py = venv_python(runtime_root)
     if not py.exists():
@@ -247,6 +351,7 @@ def start_runtime(args: argparse.Namespace, script_dir: Path) -> Dict[str, Any]:
                 pid=proc.pid,
                 log=str(log_path),
                 health=last_status.get("health"),
+                openbb=openbb,
             )
     return fail("DataTube did not become healthy before timeout", pid=proc.pid, log=str(log_path), last_status=last_status)
 
@@ -258,6 +363,30 @@ def stop_runtime(args: argparse.Namespace, script_dir: Path) -> Dict[str, Any]:
     pid = read_pid(runtime_root)
     if not pid:
         return ok(status="no_pid", messages=["No bootstrap-managed PID file found."])
+    if os.name == "nt":
+        parsed = urllib.parse.urlparse(args.base_url)
+        host = parsed.hostname or DEFAULT_HOST
+        port = parsed.port or DEFAULT_PORT
+        targets = sorted({pid, *_windows_listener_pids(port)})
+        stopped: List[int] = []
+        for target in targets:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(target), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if result.returncode == 0:
+                stopped.append(target)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and is_port_open(host, port):
+            time.sleep(0.2)
+        if is_port_open(host, port):
+            return fail("failed to stop process listening on DataTube port", pid=pid, targets=targets)
+        try:
+            (runtime_root / PID_FILE).unlink()
+        except FileNotFoundError:
+            pass
+        return ok(status="stopped" if stopped else "not_running", pid=pid, stopped_pids=stopped)
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:

@@ -54,6 +54,10 @@ DEFAULT_AGENT_POLICY = {
         "event_news_refresh": True,
         "event_news_search": True,
         "event_graph_change_request": True,
+        "research_read": True,
+        "research_project_create": True,
+        "research_autonomous_write": True,
+        "research_run_execute": True,
     },
     "limits": {
         "max_strategy_budget_usdc": 100.0,
@@ -93,6 +97,14 @@ DEFAULT_LLM_SETTINGS = {
     "temperature": 0.2,
     "max_tokens": 2048,
     "timeout_sec": 60,
+}
+
+DEFAULT_OPENBB_SETTINGS = {
+    "enabled": False,
+    "base_url": "http://127.0.0.1:6901",
+    "default_provider": "yfinance",
+    "allowed_providers": ["yfinance"],
+    "timeout_sec": 30,
 }
 
 
@@ -291,6 +303,22 @@ def _normalize_llm_settings(settings: Any) -> Dict[str, Any]:
     return normalized
 
 
+def _normalize_openbb_settings(settings: Any) -> Dict[str, Any]:
+    incoming = settings if isinstance(settings, dict) else {}
+    providers = [item.lower() for item in _to_clean_list(incoming.get("allowed_providers", ["yfinance"]))]
+    default_provider = str(incoming.get("default_provider") or "yfinance").strip().lower() or "yfinance"
+    if default_provider not in providers:
+        providers.insert(0, default_provider)
+    base_url = str(incoming.get("base_url") or DEFAULT_OPENBB_SETTINGS["base_url"]).strip().rstrip("/")
+    return {
+        "enabled": _to_setting_bool(incoming.get("enabled"), False),
+        "base_url": base_url or DEFAULT_OPENBB_SETTINGS["base_url"],
+        "default_provider": default_provider,
+        "allowed_providers": list(dict.fromkeys(providers)),
+        "timeout_sec": _to_setting_int(incoming.get("timeout_sec"), 30, 2, 120),
+    }
+
+
 def _looks_like_sqlite_path(value: Any) -> bool:
     text = str(value or "").strip().lower()
     if not text:
@@ -401,6 +429,8 @@ def get_default_web_settings() -> Dict[str, Any]:
         "agent_policy": _normalize_agent_policy({}),
         "llm_settings": _normalize_llm_settings({}),
         "llm_api_key": "",
+        "openbb_settings": _normalize_openbb_settings({}),
+        "openbb_fred_api_key": "",
     }
 
 
@@ -417,6 +447,7 @@ def _load_web_settings_uncached() -> Dict[str, Any]:
     defaults["finance_symbols"] = _to_clean_list(defaults.get("finance_symbols", []), uppercase=True)
     defaults["agent_policy"] = _normalize_agent_policy(defaults.get("agent_policy", {}))
     defaults["llm_settings"] = _normalize_llm_settings(defaults.get("llm_settings", {}))
+    defaults["openbb_settings"] = _normalize_openbb_settings(defaults.get("openbb_settings", {}))
     defaults = _normalize_strategy_storage_settings(defaults)
     defaults = _normalize_db_paths(defaults)
     return _normalize_dir_paths(defaults)
@@ -454,11 +485,17 @@ def load_public_web_settings() -> Dict[str, Any]:
 def save_web_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     current = load_web_settings()
     current["wallet_addresses"] = _to_clean_list(payload.get("wallet_addresses", current.get("wallet_addresses", [])))
-    current["finnhub_api_keys"] = _to_clean_list(payload.get("finnhub_api_keys", current.get("finnhub_api_keys", [])))
+    incoming_finnhub_keys = _to_clean_list(payload.get("finnhub_api_keys", []))
+    if payload.get("clear_finnhub_api_keys"):
+        current["finnhub_api_keys"] = []
+    elif incoming_finnhub_keys:
+        current["finnhub_api_keys"] = incoming_finnhub_keys
     current["crypto_symbols"] = _to_clean_list(payload.get("crypto_symbols", current.get("crypto_symbols", [])), uppercase=True)
     current["finance_symbols"] = _to_clean_list(payload.get("finance_symbols", current.get("finance_symbols", [])), uppercase=True)
 
-    active_key = str(payload.get("active_finnhub_api_key", current.get("active_finnhub_api_key", ""))).strip()
+    active_key = str(payload.get("active_finnhub_api_key") or current.get("active_finnhub_api_key", "")).strip()
+    if payload.get("clear_finnhub_api_keys"):
+        active_key = ""
     if not active_key and current["finnhub_api_keys"]:
         active_key = current["finnhub_api_keys"][0]
     current["active_finnhub_api_key"] = active_key
@@ -488,12 +525,21 @@ def save_web_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     current["strategy_metrics_db_dir"] = str(
         payload.get("strategy_metrics_db_dir", current.get("strategy_metrics_db_dir", ""))
     ).strip() or str(BASE_DIR / "strategy_metrics_dbs")
-    current["coingecko_api_key"] = str(payload.get("coingecko_api_key", current.get("coingecko_api_key", ""))).strip()
+    for secret_key, clear_key in (
+        ("coingecko_api_key", "clear_coingecko_api_key"),
+        ("llm_api_key", "clear_llm_api_key"),
+        ("openbb_fred_api_key", "clear_openbb_fred_api_key"),
+    ):
+        incoming_secret = str(payload.get(secret_key) or "").strip()
+        if payload.get(clear_key):
+            current[secret_key] = ""
+        elif incoming_secret:
+            current[secret_key] = incoming_secret
     current["coingecko_api_key_header"] = str(payload.get("coingecko_api_key_header", current.get("coingecko_api_key_header", "x-cg-demo-api-key"))).strip() or "x-cg-demo-api-key"
     current["include_crypto_fundamentals"] = bool(payload.get("include_crypto_fundamentals", current.get("include_crypto_fundamentals", True)))
     current["agent_policy"] = _normalize_agent_policy(payload.get("agent_policy", current.get("agent_policy", {})))
     current["llm_settings"] = _normalize_llm_settings(payload.get("llm_settings", current.get("llm_settings", {})))
-    current["llm_api_key"] = str(payload.get("llm_api_key", current.get("llm_api_key", ""))).strip()
+    current["openbb_settings"] = _normalize_openbb_settings(payload.get("openbb_settings", current.get("openbb_settings", {})))
     current = _normalize_strategy_storage_settings(current)
     current = _normalize_db_paths(current)
     current = _normalize_dir_paths(current)

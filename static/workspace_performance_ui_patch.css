@@ -1,0 +1,218 @@
+/**
+ * 策略工作台性能优化UI样式
+ * @version 20260709_performance_ui_patch
+ */
+
+/* 批量清空按钮样式 */
+#batchClearMetrics {
+  font-size: 12px;
+  padding: 4px 10px !important;
+  height: auto !important;
+  vertical-align: middle;
+}
+
+/* Series控制面板优化 */
+.series-control-more-notice {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 120px;
+  background: rgba(148, 163, 184, 0.06);
+  border: 1px dashed rgba(148, 163, 184, 0.3);
+}
+
+.series-control-notice {
+  text-align: center;
+  color: rgba(255, 255, 255, 0.7);
+  line-height: 1.5;
+}
+
+.series-control-notice small {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 11px;
+  display: block;
+  margin-top: 6px;
+}
+
+/* Legend row更多提示 */
+.series-legend-more {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  font-size: 11px;
+  color: rgba(255, 255, 255, 0.6);
+  background: rgba(148, 163, 184, 0.08);
+  border-radius: 4px;
+  margin-left: 6px;
+}
+
+/* 优化系列控制卡片间距 */
+.series-control-row {
+  gap: 10px;
+}
+
+.series-control-chip {
+  /* 添加will-change以启用GPU加速 */
+  will-change: transform;
+  transform: translateZ(0);
+  backface-visibility: hidden;
+}
+
+/* 减少动画和过渡以提升性能 */
+.series-legend-chip {
+  transition: opacity 0.15s ease, background-color 0.15s ease;
+}
+
+.series-legend-chip:hover {
+  transition-duration: 0.1s;
+}
+
+/* 虚拟滚动容器 */
+.series-controls-viewport {
+  max-height: 800px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* Metrics面板批量操作工具栏 */
+.metric-picker-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 0;
+  margin-bottom: 8px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.metric-picker-toolbar button {
+  font-size: 12px;
+  padding: 4px 10px;
+}
+
+/* 性能监控badge (如果启用) */
+.ws-perf-badge {
+  position: fixed;
+  bottom: 12px;
+  right: 12px;
+  background: rgba(0, 0, 0, 0.85);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 10px;
+  font-family: 'SF Mono', 'Monaco', 'Courier New', monospace;
+  color: #22d3ee;
+  z-index: 9999;
+  pointer-events: none;
+  backdrop-filter: blur(8px);
+}
+
+.ws-perf-metric {
+  display: flex;
+  gap: 6px;
+  margin: 2px 0;
+}
+
+.ws-perf-label {
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.ws-perf-value {
+  color: #22d3ee;
+  font-weight: 600;
+}
+
+.ws-perf-value.warning {
+  color: #f59e0b;
+}
+
+.ws-perf-value.error {
+  color: #ef4444;
+}
+
+/* 加载状态优化 */
+.chart-loading-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(15, 23, 42, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  backdrop-filter: blur(2px);
+}
+
+.chart-loading-spinner {
+  width: 32px;
+  height: 32px;
+  border: 3px solid rgba(148, 163, 184, 0.2);
+  border-top-color: #22d3ee;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* 滚动条优化 */
+.series-controls-viewport::-webkit-scrollbar {
+  width: 8px;
+}
+
+.series-controls-viewport::-webkit-scrollbar-track {
+  background: rgba(148, 163, 184, 0.06);
+  border-radius: 4px;
+}
+
+.series-controls-viewport::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.3);
+  border-radius: 4px;
+}
+
+.series-controls-viewport::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.5);
+}
+
+/* 响应式优化 - 移动端 */
+@media (max-width: 768px) {
+  .series-control-row {
+    grid-template-columns: 1fr;
+  }
+
+  .series-legend-row {
+    flex-wrap: wrap;
+    max-height: 150px;
+    overflow-y: auto;
+  }
+
+  #batchClearMetrics {
+    display: block;
+    width: 100%;
+    margin-top: 8px;
+    margin-left: 0 !important;
+  }
+}
+
+/* 高对比度模式支持 */
+@media (prefers-contrast: high) {
+  .series-control-chip {
+    border: 2px solid rgba(148, 163, 184, 0.5);
+  }
+
+  .series-legend-chip {
+    border: 1px solid rgba(148, 163, 184, 0.4);
+  }
+}
+
+/* 减少动画模式 */
+@media (prefers-reduced-motion: reduce) {
+  .series-legend-chip,
+  .series-control-chip,
+  .chart-loading-spinner {
+    transition: none !important;
+    animation: none !important;
+  }
+}

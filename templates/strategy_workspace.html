@@ -4,8 +4,11 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>策略工作台</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260705_metric_empty_notice">
-    <link rel="stylesheet" href="{{ url_for('static', filename='workspace_v3.css') }}?v=20260704_chart_state_docs">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=20260710_leg_metrics_perf">
+    <link rel="stylesheet" href="{{ url_for('static', filename='workspace_v3.css') }}?v=20260720_native_only_hover_v7">
+    <link rel="stylesheet" href="{{ url_for('static', filename='workspace_professional_ui.css') }}?v=20260709_performance_ui">
+    <link rel="stylesheet" href="{{ url_for('static', filename='workspace_performance_ui_patch.css') }}?v=20260709_performance_ui_patch">
+    <link rel="stylesheet" href="{{ url_for('static', filename='workspace_binance_chart.css') }}?v=20260725_event_inspect_metric_coverage_v7">
   </head>
   <body data-row-id="{{ row_id }}">
     <div class="ws3-shell">
@@ -28,6 +31,7 @@
         <div class="ws3-header-right">
           <span class="ws3-live-dot good" id="workspaceAutoRefreshBadge"></span>
           <span class="ws3-live-text" id="workspaceAutoRefreshText">自动刷新中</span>
+          <button id="workspaceAddBacktestCaseBtn" class="ws3-btn" type="button" title="将当前策略 legs、参数和当前自定义时间窗保存为回测样例">添加回测</button>
           <button id="workspaceRefreshBtn" class="ws3-btn ws3-btn-ghost" type="button">刷新</button>
           <button id="workspaceDrawerToggle" class="ws3-btn ws3-btn-ghost" type="button">面板</button>
         </div>
@@ -38,28 +42,27 @@
           <section class="ws3-legs-bar" id="workspaceLegsBar"></section>
 
           <div class="ws3-chart-toolbar">
+            <span class="timeline-control-label">范围</span>
             <div class="ws3-range-group" id="chartQuickRanges">
-              <button type="button" class="range-chip" data-range-value="15m">15m</button>
               <button type="button" class="range-chip" data-range-value="1h">1H</button>
-              <button type="button" class="range-chip active" data-range-value="6h">6H</button>
-              <button type="button" class="range-chip" data-range-value="1d">1D</button>
-              <button type="button" class="range-chip" data-range-value="3d">3D</button>
+              <button type="button" class="range-chip" data-range-value="6h">6H</button>
+              <button type="button" class="range-chip active" data-range-value="1d">1D</button>
               <button type="button" class="range-chip" data-range-value="1w">1W</button>
+              <button type="button" class="range-chip" data-range-value="1mo">1M</button>
+              <button type="button" class="range-chip" data-range-value="3mo">3M</button>
+              <button type="button" class="range-chip" data-range-value="ytd">YTD</button>
+              <button type="button" class="range-chip" data-range-value="all">ALL</button>
               <button id="chartCustomToggle" type="button" class="range-chip" data-custom-range="1">Custom</button>
             </div>
-            <span class="timeline-pill" id="chartToSummary">To: Latest</span>
-            <button id="chartReturnLatestBtn" class="ws3-btn ws3-btn-ghost timeline-return" type="button" hidden>回到最新</button>
             <label class="timeline-resolution-label">粒度
               <select id="chartResolutionMode" class="ws3-select" title="Auto 会按当前窗口自动选择实际粒度">
                 <option value="auto">Auto</option>
-                <option value="5s">5s</option>
-                <option value="30s">30s</option>
                 <option value="1m">1m</option>
                 <option value="5m">5m</option>
                 <option value="15m">15m</option>
-                <option value="1h">1H</option>
-                <option value="4h">4H</option>
-                <option value="1d">1D</option>
+                <option value="1h">1h</option>
+                <option value="4h">4h</option>
+                <option value="1d">1d</option>
               </select>
             </label>
             <input id="chartInterval" type="hidden" value="5s">
@@ -70,7 +73,20 @@
                 <option value="no">No</option>
               </select>
             </label>
+            <div class="ws3-chart-tools" aria-label="图表数据选择">
+              <button id="chartMetricsToggle" class="ws3-btn ws3-btn-ghost chart-tool-toggle" type="button" data-chart-picker-open="metrics">
+                Metrics <span id="chartMetricsCount" class="chart-tool-count">0/0</span>
+              </button>
+              <button id="chartStatusToggle" class="ws3-btn ws3-btn-ghost chart-tool-toggle" type="button" data-chart-picker-open="status">
+                Status <span id="chartStatusCount" class="chart-tool-count">0/0</span>
+              </button>
+              <button id="chartOverlayToggle" class="ws3-btn ws3-btn-ghost chart-tool-toggle" type="button" data-chart-picker-open="overlay">
+                Overlay <span id="chartOverlayCount" class="chart-tool-count">0</span>
+              </button>
+            </div>
             <button id="chartReloadBtn" class="ws3-btn ws3-btn-ghost chart-sync-action" type="button">同步</button>
+            <button id="chartFitHeightBtn" class="ws3-btn ws3-btn-ghost chart-height-action" type="button">适配副图</button>
+            <button id="chartFullscreenBtn" class="ws3-btn ws3-btn-ghost chart-height-action" type="button">全屏</button>
             <div id="chartCustomPanel" class="timeline-custom-panel" hidden>
               <div class="timeline-custom-title">Custom Range</div>
               <label>From <input id="chartFrom" type="datetime-local"></label>
@@ -83,16 +99,38 @@
               <label id="chartToFixedWrap" hidden>Specific time <input id="chartTo" type="datetime-local"></label>
             </div>
           </div>
+          <div class="ws3-timeline-state" id="chartTimelineState" aria-live="polite">
+            <button id="chartLiveModeBtn" class="timeline-mode-badge is-live" type="button" title="点击回到最新">● LIVE</button>
+            <span id="chartInspectStatus" class="timeline-inspect-status" hidden>历史查看</span>
+            <button id="chartReturnLatestBtn" class="ws3-btn ws3-btn-ghost timeline-return" type="button" hidden>回到最新</button>
+            <span class="timeline-pill" id="chartToSummary">终点 最新</span>
+            <span class="timeline-focus-time" id="chartFocusTime">焦点 —</span>
+          </div>
 
+          <section class="ws3-subchart-picker" id="chartSubchartPicker" aria-label="副图选择">
+            <div class="ws3-subchart-picker-header">
+              <strong>副图选择</strong>
+              <span>仓位、Strategy Metrics 与 Status 直接勾选</span>
+            </div>
+            <div id="chartMetricPicker" class="metric-picker"></div>
+          </section>
           <p id="workspaceChartMeta" class="ws3-chart-meta"></p>
           <div id="workspaceChartInsights" class="workspace-chart-insights" hidden></div>
-          <div id="chartMetricPicker" class="metric-picker"></div>
-          <div id="chartOverlayPicker" class="metric-picker"></div>
+          <div id="chartTradeStatus" class="chart-trade-status" hidden></div>
+          <div id="chartSeriesLegend" class="chart-inline-series-legend" aria-label="图表线段显示控制">
+            <div class="chart-inline-legend-toolbar">
+              <button type="button" class="chart-inline-legend-summary" disabled><span>线段管理</span><strong>加载中</strong></button>
+            </div>
+          </div>
           <div class="ws3-chart-area" id="workspaceCharts"></div>
 
-          <section class="ws3-events-section">
-            <div class="ws3-events-header">
-              <h2>事件流</h2>
+          <details class="ws3-events-section ws3-events-on-demand" id="workspaceEventsPanel" open>
+            <summary class="ws3-events-summary">
+              <span>Events</span>
+              <span id="workspaceEventsLoadState" class="ws3-events-load-state is-loading">加载中</span>
+            </summary>
+            <div class="ws3-events-content">
+              <div class="ws3-events-header">
               <div class="ws3-event-filters" id="eventFilterTabs">
                 <button type="button" class="ws3-filter-chip active" data-event-filter="all">All</button>
                 <button type="button" class="ws3-filter-chip" data-event-filter="print">Print</button>
@@ -101,9 +139,13 @@
                 <button type="button" class="ws3-filter-chip" data-event-filter="error">Errors</button>
                 <button type="button" class="ws3-filter-chip" data-event-filter="settings">Settings</button>
               </div>
+              </div>
+              <div id="workspaceEvents" class="ws3-events-list">
+                <div class="ws3-status">展开后加载，不占用首屏请求。</div>
+              </div>
             </div>
-            <div id="workspaceEvents" class="ws3-events-list"></div>
-          </section>
+          </details>
+          <aside id="workspaceEventDetails" class="ws3-event-details" hidden aria-live="polite" aria-label="Event details"></aside>
 
           <details class="ws3-collapsible">
             <summary>市场选择器 &amp; 预设</summary>
@@ -159,7 +201,7 @@
         <aside class="ws3-drawer" id="workspaceDrawer">
           <div class="ws3-drawer-tabs">
             <button class="ws3-drawer-tab active" data-drawer-tab="settings" type="button">设置</button>
-            <button class="ws3-drawer-tab" data-drawer-tab="chart-style" type="button">图表</button>
+            <button class="ws3-drawer-tab" data-drawer-tab="chart-style" type="button">高级图表</button>
           </div>
           <div class="ws3-drawer-content">
             <div class="ws3-drawer-pane active" data-drawer-pane="settings">
@@ -168,7 +210,15 @@
               <div id="workspaceSettingsMessage" class="ws3-status">加载中...</div>
             </div>
             <div class="ws3-drawer-pane" data-drawer-pane="chart-style">
-              <div id="workspaceSeriesControls"></div>
+              <div class="ws3-drawer-section-label">这里仅保留高级 Overlay 与单条线样式；副图勾选始终显示在主图上方。</div>
+              <div class="chart-picker-tabs" role="tablist" aria-label="图表选择器分类">
+                <button type="button" class="chart-picker-tab active" data-chart-picker-filter="overlay">Overlay</button>
+                <button type="button" class="chart-picker-tab" data-chart-picker-filter="series">线条</button>
+              </div>
+              <div id="chartOverlayPicker" class="metric-picker" data-chart-picker-section="overlay"></div>
+              <div data-chart-picker-section="series">
+                <div id="workspaceSeriesControls"></div>
+              </div>
             </div>
           </div>
         </aside>
@@ -180,7 +230,8 @@
     <script src="{{ url_for('static', filename='echarts.min.js') }}" onerror="this.src='https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js'"></script>
     <script src="{{ url_for('static', filename='polymarket_links.js') }}"></script>
     <script src="{{ url_for('static', filename='strategy_params_bulk.js') }}?v=20260523_param_bulk"></script>
-    <script src="{{ url_for('static', filename='strategy_workspace_v2.js') }}?v=20260705_chart_perf_state_lane_compress"></script>
-    <script src="{{ url_for('static', filename='workspace_v3_patch.js') }}?v=20260704_chart_state_docs"></script>
+    <script src="{{ url_for('static', filename='strategy_workspace_v2.js') }}?v=20260725_event_inspect_metric_coverage_v7"></script>
+    <script src="{{ url_for('static', filename='workspace_v3_patch.js') }}?v=20260725_timeline_controller_v6"></script>
+
   </body>
 </html>

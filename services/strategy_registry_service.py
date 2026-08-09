@@ -14,6 +14,12 @@ from typing import Any, Dict, List, Optional
 
 from services.config_loader import load_web_settings
 from services.strategy_data_source import connect as _ds_connect, derive_instrument_id, derive_leg_kind
+from services.strategy_signal_source_service import (
+    LEGACY_STRATEGY_CODE,
+    LIBRARY_ALPHA,
+    effective_strategy_signal_source,
+    resolve_strategy_signal_source,
+)
 
 _BASE_DIR = Path(__file__).resolve().parent.parent
 _STRATEGY_CODE_DIR = _BASE_DIR / "StrategyCode"
@@ -340,6 +346,11 @@ def _fmt_strategy(row: Dict[str, Any], legs: List[Dict[str, Any]]) -> Dict[str, 
     r["mode"] = mode
     r["state"] = mode
     r["input_json"] = _parse_json(r.get("input_json"))
+    r["signal_source"] = effective_strategy_signal_source(
+        _parse_json(r.get("signal_source_json")),
+        strategy_code=r.get("strategy_code"),
+    )
+    r.pop("signal_source_json", None)
     r["legs"] = [_fmt_leg(lg) for lg in legs]
     return r
 
@@ -393,9 +404,15 @@ def create_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not name:
         raise ValueError("strategy_name is required")
     code = str(payload.get("strategy_code") or "").strip()
+    signal_source = resolve_strategy_signal_source(
+        payload.get("signal_source"),
+        strategy_code=code,
+    )
     mode = str(payload.get("mode") or payload.get("state") or "Stop").strip()
     if mode not in _VALID_MODES:
         raise ValueError(f"mode must be one of {_VALID_MODES}")
+    if signal_source["type"] == LIBRARY_ALPHA and mode != "Stop":
+        raise ValueError("Library Alpha execution is not connected yet; save the Strategy in Stop mode")
 
     input_raw = payload.get("input_json")
     if isinstance(input_raw, str):
@@ -428,15 +445,15 @@ def create_strategy(payload: Dict[str, Any]) -> Dict[str, Any]:
             """INSERT INTO strategy_registry(
                 strategy_uid, strategy_name, strategy_code, mode,
                 initial_capital, strategy_bankroll, profit_roll_ratio, realized_profit,
-                input_json, created_at_utc, updated_at_utc
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                input_json, signal_source_json, created_at_utc, updated_at_utc
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 uid, name, code, mode,
                 _safe_float(payload.get("initial_capital")),
                 _safe_float(payload.get("strategy_bankroll")),
                 _safe_float(payload.get("profit_roll_ratio")),
                 _safe_float(payload.get("realized_profit")),
-                input_json_str, ts, ts,
+                input_json_str, json.dumps(signal_source, ensure_ascii=False), ts, ts,
             ),
         )
         sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -496,6 +513,27 @@ def update_strategy(strategy_id: int, payload: Dict[str, Any]) -> Dict[str, Any]
         if not existing:
             raise ValueError(f"strategy {strategy_id} not found")
 
+        existing_row = _row_dict(existing)
+        next_code = str(payload.get("strategy_code", existing_row.get("strategy_code") or "")).strip()
+        existing_source = effective_strategy_signal_source(
+            _parse_json(existing_row.get("signal_source_json")),
+            strategy_code=existing_row.get("strategy_code"),
+        )
+        should_refresh_source = "signal_source" in payload or (
+            "strategy_code" in payload and existing_source.get("type") == LEGACY_STRATEGY_CODE
+        )
+        next_source = (
+            resolve_strategy_signal_source(
+                payload.get("signal_source") if "signal_source" in payload else existing_source,
+                strategy_code=next_code,
+            )
+            if should_refresh_source
+            else existing_source
+        )
+        next_mode = str(payload.get("mode", existing_row.get("mode") or existing_row.get("state") or "Stop")).strip()
+        if next_source.get("type") == LIBRARY_ALPHA and next_mode != "Stop":
+            raise ValueError("Library Alpha execution is not connected yet; save the Strategy in Stop mode")
+
         if "legs" in payload:
             derived_bankroll = _derive_strategy_bankroll(payload, payload.get("legs") or [])
             if derived_bankroll > 0 and _safe_float(payload.get("strategy_bankroll"), 0.0) <= 0:
@@ -531,6 +569,10 @@ def update_strategy(strategy_id: int, payload: Dict[str, Any]) -> Dict[str, Any]
                 raw = json.loads(raw) if raw.strip() else {}
             sets.append("input_json = ?")
             vals.append(json.dumps(raw or {}, ensure_ascii=False))
+
+        if should_refresh_source:
+            sets.append("signal_source_json = ?")
+            vals.append(json.dumps(next_source, ensure_ascii=False))
 
         if sets:
             ts = _now()

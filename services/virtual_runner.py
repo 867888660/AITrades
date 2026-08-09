@@ -240,11 +240,38 @@ def _price_snapshot_from_use_data(use_data: Dict[str, Any]) -> Dict[str, Any]:
                 return value
         return None
 
+    def leg_snapshot(leg_index: int) -> Dict[str, Any]:
+        suffix = f"_L{leg_index}"
+        primary_suffix = ("Yes_now_bid", "Yes_now_ask", "No_now_bid", "No_now_ask") if leg_index == 0 else (None,) * 4
+        return {
+            "leg_index": leg_index,
+            "yes_bid": pick(f"Yes_now_bid{suffix}", f"L{leg_index}_Yes_BidPrice", primary_suffix[0]),
+            "yes_ask": pick(f"Yes_now_ask{suffix}", f"L{leg_index}_Yes_AskPrice", primary_suffix[1]),
+            "no_bid": pick(f"No_now_bid{suffix}", f"L{leg_index}_No_BidPrice", primary_suffix[2]),
+            "no_ask": pick(f"No_now_ask{suffix}", f"L{leg_index}_No_AskPrice", primary_suffix[3]),
+            "yes_bid_levels": pick(f"Yes_BidLevels{suffix}", f"L{leg_index}_Yes_BidLevels", "Yes_BidLevels" if leg_index == 0 else "") or [],
+            "yes_ask_levels": pick(f"Yes_AskLevels{suffix}", f"L{leg_index}_Yes_AskLevels", "Yes_AskLevels" if leg_index == 0 else "") or [],
+            "no_bid_levels": pick(f"No_BidLevels{suffix}", f"L{leg_index}_No_BidLevels", "No_BidLevels" if leg_index == 0 else "") or [],
+            "no_ask_levels": pick(f"No_AskLevels{suffix}", f"L{leg_index}_No_AskLevels", "No_AskLevels" if leg_index == 0 else "") or [],
+        }
+
+    try:
+        leg_count = max(1, int(use_data.get("LegCount") or 1))
+    except (TypeError, ValueError):
+        leg_count = 1
+    legs = [leg_snapshot(index) for index in range(leg_count)]
+    primary = legs[0]
     return {
         "yes_bid": pick("L0_Yes_BidPrice", "Yes_BidPrice", "Yes_now_bid"),
         "yes_ask": pick("L0_Yes_AskPrice", "Yes_AskPrice", "Yes_now_ask"),
         "no_bid": pick("L0_No_BidPrice", "No_BidPrice", "No_now_bid"),
         "no_ask": pick("L0_No_AskPrice", "No_AskPrice", "No_now_ask"),
+        "yes_bid_levels": pick("Yes_BidLevels_L0", "L0_Yes_BidLevels", "Yes_BidLevels") or primary["yes_bid_levels"],
+        "yes_ask_levels": pick("Yes_AskLevels_L0", "L0_Yes_AskLevels", "Yes_AskLevels") or primary["yes_ask_levels"],
+        "no_bid_levels": pick("No_BidLevels_L0", "L0_No_BidLevels", "No_BidLevels") or primary["no_bid_levels"],
+        "no_ask_levels": pick("No_AskLevels_L0", "L0_No_AskLevels", "No_AskLevels") or primary["no_ask_levels"],
+        "captured_at_utc": use_data.get("NowTime"),
+        "legs": legs,
     }
 
 

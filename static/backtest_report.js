@@ -402,8 +402,13 @@ function scheduleReportPolling(run) {
 function renderReport(run) {
   currentRun = run;
   const snapshot = run.case_snapshot || {};
+  const runtime = snapshot.run_strategy_runtime || {};
+  const sourceType = run.metrics?.signal_source_type || runtime.signal_source_type || "LEGACY_STRATEGY_CODE";
+  const strategyLabel = sourceType === "LIBRARY_ALPHA"
+    ? `Library Alpha / Strategy ${snapshot.run_strategy_id || run.strategy_id || "-"}`
+    : (snapshot.run_strategy_code || run.strategy_id || "-");
   els.title.textContent = snapshot.case_name || `Backtest Run ${run.run_id}`;
-  els.meta.textContent = `run_id=${run.run_id} | case_id=${run.case_id} | strategy=${snapshot.run_strategy_code || run.strategy_id || "-"} | created=${run.created_at_utc || "-"}`;
+  els.meta.textContent = `run_id=${run.run_id} | case_id=${run.case_id} | strategy=${strategyLabel} | engine=${run.metrics?.engine || run.metrics?.backtest_engine || runtime.engine || "-"} | created=${run.created_at_utc || "-"}`;
   const strategyId = snapshot.run_strategy_id || run.strategy_id || snapshot.strategy_id;
   if (els.workspaceLink) {
     els.workspaceLink.hidden = false;

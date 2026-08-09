@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>DataTube · Research</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='research_workspace_simple.css') }}?v=20260731-factor-alpha-runs-1">
+</head>
+<body data-surface="{{ initial_surface|default('research') }}" data-project-id="{{ initial_project_id|default('') }}">
+<div class="research-app">
+  <aside class="research-sidebar">
+    <a class="research-brand" href="/" aria-label="DataTube home">
+      <span class="research-brand-mark">DT</span>
+      <span><strong>DataTube</strong><small>Quant Research</small></span>
+    </a>
+    <nav class="research-primary-nav" aria-label="Primary navigation">
+      <a href="/" data-nav="strategy-monitor">Strategy Monitor</a>
+      <a href="/research" data-nav="research">Research</a>
+      <a href="/library" data-nav="library">Library</a>
+      <a href="/runs" data-nav="runs">Runs</a>
+      <a href="/data-catalog" data-nav="data-catalog">Data Catalog</a>
+      <a href="/history" data-nav="backtests">Backtests</a>
+      <a href="/agent-monitor" data-nav="agent-monitor">Agent Monitor</a>
+      <a href="/approvals" data-nav="approvals">Approvals</a>
+      <a href="/settings" data-nav="settings">Settings</a>
+    </nav>
+    <p class="research-sidebar-note">Research and testing only.<br>No trading from this workspace.</p>
+  </aside>
+
+  <div class="research-main">
+    <header class="research-toolbar">
+      <span>Research Workspace</span>
+      <button id="refreshButton" class="icon-button" type="button" title="Refresh" aria-label="Refresh">&#8635;</button>
+    </header>
+    <main id="appMain" class="workspace">
+      <div id="notice" class="notice" hidden></div>
+      <div id="appView" aria-live="polite"></div>
+    </main>
+  </div>
+</div>
+
+<dialog id="editorDialog" class="editor-dialog">
+  <div class="dialog-frame">
+    <header>
+      <div><span id="dialogEyebrow">RESEARCH</span><h2 id="dialogTitle">Edit</h2></div>
+      <button id="closeEditorDialog" type="button" class="dialog-close" aria-label="Close">&times;</button>
+    </header>
+    <div id="dialogBody" class="dialog-body"></div>
+  </div>
+</dialog>
+
+<aside id="detailDrawer" class="detail-drawer" aria-hidden="true">
+  <header>
+    <div><span id="drawerEyebrow">DETAILS</span><h2 id="drawerTitle">Details</h2></div>
+    <button id="closeDrawer" type="button" aria-label="Close">&times;</button>
+  </header>
+  <div id="drawerBody"></div>
+</aside>
+<div id="drawerScrim" class="drawer-scrim" hidden></div>
+
+<script src="{{ url_for('static', filename='research_workspace_simple.js') }}?v=20260807-library-archive-1"></script>
+</body>
+</html>

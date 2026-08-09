@@ -273,14 +273,33 @@ def _parse_input_json(raw_input: Any) -> Dict[str, Any]:
     return {}
 
 
-def _market_status(state_snap: Dict[str, Any]) -> str:
+def _market_status(
+    state_snap: Dict[str, Any],
+    end_date_iso: str | None = None,
+    *,
+    now_utc: datetime | None = None,
+) -> str:
     for key in ("market_status", "status", "state"):
         value = str(state_snap.get(key) or "").strip().lower()
         if value:
-            if value in ("open", "active", "live", "trading"):
-                return "open"
             if value in ("closed", "resolved", "settled", "finalized"):
                 return "resolved" if value in ("resolved", "settled", "finalized") else "closed"
+    normalized_end = _normalize_end_date_iso(end_date_iso)
+    if normalized_end:
+        try:
+            end_at = datetime.fromisoformat(normalized_end.replace("Z", "+00:00"))
+            if end_at.tzinfo is None:
+                end_at = end_at.replace(tzinfo=timezone.utc)
+            current = now_utc or datetime.now(timezone.utc)
+            if current.astimezone(timezone.utc) >= end_at.astimezone(timezone.utc):
+                return "expired"
+        except (TypeError, ValueError):
+            pass
+    for key in ("market_status", "status", "state"):
+        value = str(state_snap.get(key) or "").strip().lower()
+        if value:
+            if value in ("open", "active", "live", "trading", "monitoring", "watching"):
+                return "open"
             return value
     if state_snap:
         return "open"
@@ -786,9 +805,24 @@ def build_use_data(
         # In multi-leg strategies, non-primary budget_cap=0 means no budget.
         if budget_cap <= 0:
             budget_cap = dynamic_budget_cap if len(legs) <= 1 or leg_index_num == 0 else 0.0
-        market_status = _market_status(state_snap)
+        if not symbol:
+            symbol = str(
+                instrument_params.get("symbol")
+                or instrument_params.get("ticker")
+                or instrument_params.get("Ticker")
+                or instrument_meta.get("symbol")
+                or ""
+            ).strip().upper()
+        instrument_question = str(
+            instrument_meta.get("question")
+            or instrument_meta.get("title")
+            or instrument_meta.get("name")
+            or ""
+        ).strip()
+        market_status = _market_status(state_snap, end_date_iso)
         market_title = (
-            state_snap.get("market_title")
+            instrument_question
+            or state_snap.get("market_title")
             or state_snap.get("question")
             or state_snap.get("title")
             or dictionary_meta.get("question")
@@ -842,6 +876,30 @@ def build_use_data(
         use_data[f"L{n}_Venue"] = venue
         use_data[f"L{n}_Symbol"] = symbol
         use_data[f"L{n}_InstrumentId"] = instrument_id
+        use_data[f"L{n}_Params"] = instrument_params
+        use_data[f"L{n}_ParamsJson"] = instrument_params
+        use_data[f"L{n}_InputJson"] = instrument_params
+        use_data[f"L{n}_InstrumentJson"] = instrument_meta
+        use_data[f"L{n}_Question"] = instrument_question or market_title
+        use_data[f"L{n}_Title"] = market_title
+        use_data[f"L{n}_Outcome"] = instrument_params.get("outcome") or instrument_meta.get("outcome") or ""
+        use_data[f"L{n}_Action"] = instrument_params.get("action") or ""
+        for src_key, dst_key in (
+            ("AnchorCompany", "AnchorCompany"),
+            ("anchor_company", "AnchorCompany"),
+            ("Company", "Company"),
+            ("company", "Company"),
+            ("Ticker", "Ticker"),
+            ("ticker", "Ticker"),
+            ("RankPosition", "RankPosition"),
+            ("rank_position", "RankPosition"),
+            ("TargetRank", "TargetRank"),
+            ("target_rank", "TargetRank"),
+            ("Rank", "Rank"),
+            ("rank", "Rank"),
+        ):
+            if src_key in instrument_params and instrument_params.get(src_key) not in (None, ""):
+                use_data[f"L{n}_{dst_key}"] = instrument_params.get(src_key)
         use_data[f"L{n}_MarketTitle"] = market_title
         use_data[f"L{n}_MarketStatus"] = market_status
         use_data[f"L{n}_MarketCategory"] = str(state_snap.get("category") or "").strip()

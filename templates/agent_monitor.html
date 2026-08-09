@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>AgentMonitor</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=agent-monitor-graph-review-20260704b">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=agent-inspection-20260809a">
   </head>
   <body>
     <div class="app-shell">
@@ -16,14 +16,7 @@
             <div class="brand-subtitle">Agent Monitor</div>
           </div>
         </div>
-        <nav class="nav">
-          <a class="nav-link" href="/" target="_blank" rel="noopener noreferrer">Dashboard</a>
-          <a class="nav-link" href="/event-graph" target="_blank" rel="noopener noreferrer">EventGraph</a>
-          <a class="nav-link" href="/ledger" target="_blank" rel="noopener noreferrer">Ledger</a>
-          <a class="nav-link active" href="/agent-monitor" target="_blank" rel="noopener noreferrer">AgentMonitor</a>
-          <a class="nav-link" href="/watchlist" target="_blank" rel="noopener noreferrer">Watchlist</a>
-          <a class="nav-link" href="/settings" target="_blank" rel="noopener noreferrer">Settings</a>
-        </nav>
+        {% include '_primary_navigation.html' %}
         <div class="sidebar-note">
           单独查看 agent 当前动作、待人工确认策略、草案、风控与模拟结果。
         </div>
@@ -51,8 +44,10 @@
           </div>
           <div class="agent-monitor-tabs" role="tablist" aria-label="AgentMonitor views">
             <button class="agent-monitor-tab active" type="button" data-agent-monitor-tab="overview">总览</button>
+            <button class="agent-monitor-tab" type="button" data-agent-monitor-tab="research">Research Sessions</button>
             <button class="agent-monitor-tab" type="button" data-agent-monitor-tab="internal">EventGraph 变更</button>
             <button class="agent-monitor-tab" type="button" data-agent-monitor-tab="external">外接 Agent</button>
+            <button class="agent-monitor-tab" type="button" data-agent-monitor-tab="inspection">Inspection</button>
             <button class="agent-monitor-tab" type="button" data-agent-monitor-tab="audit">审计日志</button>
           </div>
 
@@ -72,6 +67,32 @@
                   <span id="agentOverviewInternalCount" class="badge">0</span>
                 </div>
                 <div id="agentOverviewInternal" class="agent-list compact"></div>
+              </article>
+            </div>
+          </div>
+
+          <div class="agent-monitor-pane" data-agent-monitor-pane="research">
+            <div class="agent-grid">
+              <article class="panel agent-panel agent-panel-wide">
+                <div class="agent-panel-head">
+                  <div>
+                    <h3>研究任务</h3>
+                    <p class="muted">查看当前阶段、研究假设、回测额度和少量需要你判断的问题。</p>
+                  </div>
+                  <span id="agentResearchSessionCount" class="badge">0</span>
+                </div>
+                <div id="agentResearchSessionList" class="agent-list"></div>
+              </article>
+              <article class="panel agent-panel agent-panel-wide">
+                <div class="agent-panel-head">
+                  <div>
+                    <h3>研究上下文</h3>
+                    <p class="muted">原始基线与当前分支头始终分开显示，便于理解每轮试验从哪里开始。</p>
+                  </div>
+                </div>
+                <div id="agentResearchSessionDetail" class="agent-list compact">
+                  <div class="empty-state">选择一个 Research Session 查看详情。</div>
+                </div>
               </article>
             </div>
           </div>
@@ -187,6 +208,57 @@
             </div>
           </div>
 
+          <div class="agent-monitor-pane" data-agent-monitor-pane="inspection">
+            <div class="inspection-workspace">
+              <article class="panel agent-panel inspection-trace-panel">
+                <div class="agent-panel-head">
+                  <div>
+                    <h3>Execution Traces</h3>
+                    <p class="muted">先选择摘要，再按需展开事件。</p>
+                  </div>
+                  <span id="agentInspectionTraceCount" class="badge">0</span>
+                </div>
+                <div class="agent-activity-toolbar inspection-toolbar">
+                  <input id="agentInspectionTraceSearch" type="search" placeholder="搜索 trace / subject / title">
+                  <select id="agentInspectionTraceStatus">
+                    <option value="">全部状态</option>
+                    <option value="running">Running</option>
+                    <option value="succeeded">Succeeded</option>
+                    <option value="failed">Failed</option>
+                    <option value="partial">Partial</option>
+                  </select>
+                  <button id="agentInspectionTraceSearchBtn" class="mini ghost" type="button">搜索</button>
+                </div>
+                <div id="agentInspectionTraceList" class="agent-list inspection-trace-list"></div>
+              </article>
+              <article class="panel agent-panel inspection-event-panel">
+                <div id="agentInspectionSummary" class="inspection-summary">
+                  <div class="empty-state">选择一个 Trace 查看 Summary 与 Event Index。</div>
+                </div>
+                <div class="agent-activity-toolbar inspection-toolbar">
+                  <input id="agentInspectionEventSearch" type="search" placeholder="搜索当前 Trace 的事件">
+                  <select id="agentInspectionEventKind">
+                    <option value="">全部类型</option>
+                    <option value="agent_step">Agent Step</option>
+                    <option value="skill_call">Skill</option>
+                    <option value="tool_call">Tool</option>
+                    <option value="state_change">State</option>
+                    <option value="artifact">Artifact</option>
+                    <option value="validation">Validation</option>
+                    <option value="system">System</option>
+                  </select>
+                  <select id="agentInspectionSeverity">
+                    <option value="">全部级别</option>
+                    <option value="warning">Warning</option>
+                    <option value="error">Error</option>
+                    <option value="critical">Critical</option>
+                  </select>
+                </div>
+                <div id="agentInspectionEventList" class="agent-list compact inspection-event-list"></div>
+              </article>
+            </div>
+          </div>
+
           <div class="agent-monitor-pane" data-agent-monitor-pane="audit">
             <div class="agent-grid">
             <article class="panel agent-panel agent-panel-wide">
@@ -197,7 +269,7 @@
                 </div>
                 <div class="agent-activity-head-actions">
                   <span id="agentActivityCount" class="badge">0</span>
-                  <button id="agentActivityClearBtn" class="mini ghost" type="button">清除当前</button>
+                  <button id="agentActivityClearBtn" class="mini ghost" type="button">从视图隐藏</button>
                 </div>
               </div>
               <div class="agent-activity-toolbar">
@@ -251,6 +323,6 @@
         </div>
       </main>
     </div>
-    <script src="{{ url_for('static', filename='agent_monitor.js') }}?v=agent-monitor-graph-review-20260704b"></script>
+    <script src="{{ url_for('static', filename='agent_monitor.js') }}?v=agent-inspection-20260809a"></script>
   </body>
 </html>

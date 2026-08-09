@@ -4,13 +4,19 @@ Use this reference when the user wants AI to batch backtest a strategy, analyze
 results, and propose revised parameters. This workflow is research-only: do not
 apply parameters to live trading without explicit human confirmation.
 
+## Contents
+
+- Strategy/source selection and input spec
+- Sweep execution and scoring
+- Controlled iteration and reporting
+
 ## Human/AI Parity
 
 Map the human workflow to agent operations:
 
 ```text
 Human selects case/legs      -> agent uses case_id/case_ids
-Human selects strategy code  -> agent uses strategy_id/strategy_code
+Human selects Strategy       -> agent uses strategy_id and its signal source
 Human edits parameters       -> agent writes base_params/search_space
 Human starts batch backtest  -> agent creates runs under one batch_id
 Human checks history         -> agent reads runs/batch summaries
@@ -22,6 +28,11 @@ The current DataTube batch API batches cases with one parameter set. For a
 single case with many parameter combinations, use
 `scripts/backtest_optimizer.py`; it creates multiple runs under one generated
 `batch_id`.
+
+Resolve the registered Strategy first. For `LEGACY_STRATEGY_CODE`, a raw
+`strategy_code` remains optional compatibility input. For `LIBRARY_ALPHA`, use
+`strategy_id` only; the optimizer preserves its pinned Alpha/Factor closure and
+may forward fixed `execution_spec` and `portfolio_spec` objects to every run.
 
 ## Input Spec
 
@@ -51,11 +62,31 @@ Create a JSON spec. Keep the first sweep small, usually 10-30 runs.
 }
 ```
 
+For a Library Alpha sweep, omit `strategy_code` and freeze the cost/portfolio
+controls outside the searched hypothesis:
+
+```json
+{
+  "case_ids": [47],
+  "strategy_id": 96,
+  "objective": "risk_adjusted",
+  "max_runs": 12,
+  "base_params": {"initial_cash": 10000},
+  "search_space": {"signal_threshold": [0.0, 0.1, 0.2]},
+  "execution_spec": {"fee_bps": 2, "slippage_bps": 10},
+  "portfolio_spec": {
+    "top_n": 2,
+    "rebalance_frequency": "DAILY",
+    "max_position_weight": 0.5
+  }
+}
+```
+
 Required:
 
 ```text
 case_id or case_ids
-strategy_id and/or strategy_code
+strategy_id, or strategy_code only for legacy compatibility
 base_params
 search_space for a real sweep
 ```
@@ -70,7 +101,14 @@ drawdown_weight, sharpe_weight
 timeout, interval
 detail_equity_limit, detail_orders_limit, detail_events_limit
 batch_id, batch_name
+execution_spec, portfolio_spec (fixed across generated runs)
 ```
+
+Test one major hypothesis per round. An intervention may change multiple linked
+fields, but keep unrelated variables, data window, runtime source, execution
+costs, and portfolio construction controlled. Do not compare Library Alpha runs
+when their `runtime_hash` or `data_identity_mode` changed unless that change is
+the explicit hypothesis.
 
 ## Run
 
@@ -111,6 +149,8 @@ orders
 equity_points
 strategy_metric_fields
 state_lane_fields
+signal_source_type, backtest_engine, strategy_runtime_hash
+lineage.data_identity_mode
 ```
 
 The helper returns:
@@ -134,6 +174,7 @@ Return a concise report:
 ```text
 Batch ID and run count
 Dataset/cases/strategy used
+Signal source, engine, runtime hash, and data identity
 Best risk-adjusted parameter set
 Best raw return parameter set
 Lowest drawdown parameter set
@@ -141,7 +182,7 @@ Rejected/failed runs
 Whether Strategy Metrics and State Lanes were present
 Main risk: overtrading, drawdown, unstable state transitions, missing data
 Next-round parameter suggestion
-Human confirmation required before applying parameters
+No live parameters were changed or executed
 ```
 
 If Strategy Metrics or State Lanes are missing, do not guess. Say the run did

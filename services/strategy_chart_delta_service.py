@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from typing import Any, Dict, List
@@ -8,14 +9,18 @@ from services.polymarket_service import get_strategy_chart_capabilities, get_str
 from services.strategy_chart_service import (
     _allowed_overlay_symbols,
     _bucket_ts,
+    _can_overlay_detail_pnl,
+    _chart_event_item,
     _detail_sample,
     _derive_stats_from_price_samples,
     _load_crypto_overlay_samples,
     _load_finance_overlay_samples,
     _load_metric_numeric_samples,
+    _metric_state_lanes,
     _load_price_samples,
     _load_stats_samples,
     _load_strategy_tick_price_samples,
+    _load_virtual_tick_metric_samples,
     _merge_samples,
     _overlay_sample_maps,
     _parse_iso,
@@ -61,7 +66,9 @@ _detail_cache_lock = threading.Lock()
 
 def _cached_resolve_chart_detail(row_id: int, args: Dict[str, Any]):
     """Thin wrapper around _resolve_chart_detail with a short TTL cache."""
-    cache_key = str(row_id)
+    market_signature = str(args.get("market_targets_json") or "")
+    signature = hashlib.sha1(market_signature.encode("utf-8")).hexdigest()
+    cache_key = f"{row_id}|{args.get('backtest_run_id') or ''}|{signature}"
     now = time.monotonic()
     with _detail_cache_lock:
         entry = _detail_cache.get(cache_key)
@@ -142,20 +149,34 @@ def _build_price_delta(detail: Dict[str, Any], from_ts: str, to_ts: str, interva
     )
 
 
-def _build_stats_delta(detail: Dict[str, Any], from_ts: str, to_ts: str, interval_seconds: int) -> List[Dict[str, Any]]:
+def _build_stats_delta(
+    detail: Dict[str, Any],
+    market_targets: List[Dict[str, Any]],
+    from_ts: str,
+    to_ts: str,
+    interval_seconds: int,
+) -> List[Dict[str, Any]]:
     stats_samples = _load_stats_samples(detail, from_ts, to_ts, interval_seconds)
     raw_price_samples = _overlay_sample_maps(
         _load_strategy_tick_price_samples(detail, from_ts, to_ts, interval_seconds),
         _load_price_samples(detail, from_ts, to_ts, interval_seconds),
     )
-    price_samples = _prefix_sample_map(
-        _select_sample_keys(raw_price_samples, _PRICE_KEYS),
-        "market_0_",
-    )
+    price_samples = _prefix_sample_map(_select_sample_keys(raw_price_samples, _PRICE_KEYS), "market_0_")
+    market_samples = [price_samples]
+    for index, target in enumerate(market_targets):
+        target_detail = target.get("detail") or {}
+        target_prices = _overlay_sample_maps(
+            _load_strategy_tick_price_samples(target_detail, from_ts, to_ts, interval_seconds),
+            _load_price_samples(target_detail, from_ts, to_ts, interval_seconds),
+            _detail_sample(target_detail, interval_seconds, from_ts, to_ts),
+        )
+        market_samples.append(
+            _prefix_sample_map(_select_sample_keys(target_prices, _PRICE_KEYS), f"market_{index}_")
+        )
     if not stats_samples:
         stats_samples = _derive_stats_from_price_samples(detail, price_samples)
     rows = _merge_samples(
-        price_samples,
+        *market_samples,
         stats_samples,
         _prefix_sample_map(
             _select_sample_keys(_detail_sample(detail, interval_seconds, from_ts, to_ts), _PRICE_KEYS),
@@ -165,6 +186,9 @@ def _build_stats_delta(detail: Dict[str, Any], from_ts: str, to_ts: str, interva
     )
     _sync_row_pnl_to_visible_prices(rows)
     _apply_virtual_account_pnl_to_rows(detail, rows)
+    if rows and detail.get("strategy_pnl") is not None and _can_overlay_detail_pnl(detail):
+        rows[-1]["strategy_pnl"] = detail.get("strategy_pnl")
+        rows[-1]["pnl_source"] = detail.get("pnl_source") or "multi_leg_liquidation_sum"
     aligned_price_keys = {f"market_0_{key}" for key in _PRICE_KEYS}
     aligned_output_keys = _STAT_KEYS | aligned_price_keys
     return [
@@ -182,10 +206,30 @@ def _build_metrics_delta(
     from_ts: str,
     to_ts: str,
     interval_seconds: int,
+    *,
+    include_prior: bool,
 ) -> List[Dict[str, Any]]:
     selected_series = _requested_sub_series(args, defaults, capabilities)
     metric_keys, _state_keys = _selected_metric_keys(selected_series)
-    return _merge_samples(_load_metric_numeric_samples(detail, metric_keys, from_ts, to_ts, interval_seconds))
+    return _merge_samples(
+        _overlay_sample_maps(
+            _load_metric_numeric_samples(
+                detail,
+                metric_keys,
+                from_ts,
+                to_ts,
+                interval_seconds,
+                include_prior=include_prior,
+            ),
+            _load_virtual_tick_metric_samples(
+                detail,
+                metric_keys,
+                from_ts,
+                to_ts,
+                interval_seconds,
+            ),
+        )
+    )
 
 
 def _build_watch_delta(
@@ -259,19 +303,33 @@ def get_strategy_chart_delta(row_id: int, args: Dict[str, Any]) -> Dict[str, Any
     if "stats" in requested_streams:
         cursor = str(args.get(_cursor_key("stats")) or "").strip()
         query_from = _query_from_ts(from_ts, cursor, interval_seconds)
-        rows = _build_stats_delta(detail, query_from, to_ts, interval_seconds)
+        rows = _build_stats_delta(detail, market_targets, query_from, to_ts, interval_seconds)
         response["stats"] = _build_stream_payload(rows, cursor)
 
     if "metrics" in requested_streams:
         _metric_keys, state_metric_keys = _selected_metric_keys(_requested_sub_series(args, defaults, capabilities))
-        if state_metric_keys:
-            response["reload_required"] = True
-            response["reload_reason"] = "state-metrics-require-full-render"
-            return response
         cursor = str(args.get(_cursor_key("metrics")) or "").strip()
         query_from = _query_from_ts(from_ts, cursor, interval_seconds)
-        rows = _build_metrics_delta(detail, args, defaults, capabilities, query_from, to_ts, interval_seconds)
+        rows = _build_metrics_delta(
+            detail,
+            args,
+            defaults,
+            capabilities,
+            query_from,
+            to_ts,
+            interval_seconds,
+            include_prior=not bool(cursor),
+        )
         response["metrics"] = _build_stream_payload(rows, cursor)
+        include_metric_states = str(args.get("include_metric_states") or "").strip().lower() in {"1", "true", "yes", "on"}
+        if state_metric_keys and include_metric_states:
+            response["metric_state_lanes"] = _metric_state_lanes(
+                detail,
+                state_metric_keys,
+                from_ts,
+                to_ts,
+                capabilities,
+            )
 
     if "watch_markets" in requested_streams:
         cursor = str(args.get(_cursor_key("watch_markets")) or "").strip()
@@ -289,7 +347,7 @@ def get_strategy_chart_delta(row_id: int, args: Dict[str, Any]) -> Dict[str, Any
         cursor = str(args.get(_cursor_key("events")) or "").strip()
         query_from = _query_from_ts(from_ts, cursor, interval_seconds)
         events_payload = list_strategy_events(row_id, {"limit": 30, "from": query_from, "to": to_ts}, detail=detail)
-        event_rows = events_payload.get("data") or []
+        event_rows = [_chart_event_item(item) for item in events_payload.get("data") or []]
         next_cursor = cursor
         if event_rows:
             sorted_ts = sorted(

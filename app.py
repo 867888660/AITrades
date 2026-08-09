@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
 from functools import wraps
 from pathlib import Path
 
@@ -11,6 +14,7 @@ from flask import Flask, Response, jsonify, render_template, request, stream_wit
 
 from services.config_loader import load_public_web_settings, load_web_settings, load_web_settings_for_ui, save_web_settings
 from services import agent_interface_service as agent_service
+from services import inspection_service
 from services.binance_market_service import search_binance_markets
 from services.crypto_service import fetch_crypto_quotes
 from services.event_graph_service import build_event_graph, get_event_graph_categories
@@ -23,6 +27,7 @@ from services.event_news_service import (
     refresh_news,
 )
 from services.finance_service import fetch_finance_quotes
+from services.openbb_provider_service import OpenBBProviderService, normalize_equity_adjustment
 from services.history_data_service import (
     add_watchlist_item as add_history_watchlist_item,
     create_backtest_batch as create_history_backtest_batch,
@@ -54,10 +59,85 @@ from services.history_data_service import (
     rerun_backtest_run as rerun_history_backtest_run,
 )
 from services.http_client import SESSION
+from services.data_platform.factor_run_result_service import (
+    FACTOR_RUN_RESULT_SCHEMA_VERSION,
+    FACTOR_RUN_STRUCTURED_SECTIONS,
+    FactorRunResultService,
+)
+from services.data_platform.alpha_run_result_service import (
+    ALPHA_RUN_RESULT_SCHEMA_VERSION,
+    ALPHA_RUN_STRUCTURED_SECTIONS,
+    AlphaRunResultService,
+)
+from services.data_platform.research_backtest_result_service import (
+    RESEARCH_BACKTEST_RESULT_SCHEMA_VERSION,
+    RESEARCH_BACKTEST_STRUCTURED_SECTIONS,
+    ResearchBacktestResultService,
+)
 from services.backtest_service import (
     create_strategy_backtest,
     get_strategy_backtest,
     get_strategy_backtest_results,
+)
+from services.data_platform import (
+    ArtifactService,
+    CURRENT_HISTORY_BACKTEST_CAPABILITIES,
+    DataRequirementService,
+    ResearchDataCapabilityService,
+    PolymarketResearchTaskExecutor,
+    PolymarketResearchWorker,
+    RequirementCompiler,
+    RequirementWorkspaceService,
+    RequirementMaintenanceService,
+    default_requirement_spec,
+    ResearchInputBundleService,
+    ResolvedDataPlanService,
+    DatasetCatalogService,
+    ExistingBacktestAdapter,
+    ManifestProvenanceService,
+    OpenBBResearchTaskExecutor,
+    OpenBBResearchWorker,
+    FrozenManifestData,
+    InstrumentRegistry,
+    RESEARCH_BACKTEST_CAPABILITIES,
+    ResearchBacktestProvider,
+    ResearchControlPlane,
+    ResearchLibraryService,
+    LibraryGroupService,
+    SourcePolicy,
+    SourcePolicyService,
+    SharedUniverseService,
+    UniverseService,
+    UniverseConflictError,
+    UniverseResolutionError,
+    UniverseSharedImpactError,
+    BinanceBackfillJobService,
+    BinanceBackfillTaskExecutor,
+    BinanceBackfillWorker,
+    DefinitionRegistry,
+    FactorDraftService,
+    FactorDraftValidationError,
+    FactorInputCandidateResolver,
+    FactorPreviewError,
+    FactorPreviewService,
+    AlphaFactorCandidateResolver,
+    AlphaDraftService,
+    AlphaDraftValidationError,
+    AlphaPreviewError,
+    AlphaPreviewService,
+    DeterministicManifestResolver,
+    IdempotencyConflictError,
+    PreviewStaleError,
+    ReadinessBlockedError,
+    ResearchRunPreviewService,
+    ResearchRunService,
+    ResearchRunWorker,
+    DEFAULT_RESEARCH_OPERATIONS,
+    ResearchAgentAuthorization,
+    ResearchAgentSessionService,
+    ResearchContextResolver,
+    ResearchAuthorizationError,
+    get_default_store,
 )
 from services.polymarket_dictionary_service import get_dictionary_status, start_dictionary_refresh
 from services.ledger_service import get_ledger_snapshot
@@ -94,6 +174,7 @@ from services.strategy_registry_service import (
     update_strategy_state,
 )
 from services.strategy_settings_service import update_strategy_settings
+from services.strategy_signal_source_service import list_library_alpha_sources
 from services.strategy_workspace_service import get_strategy_usedata_draft, get_strategy_usedata_snapshot, get_strategy_workspace
 from services.ws_market_sync_service import ws_market_sync
 from services.workspace_preset_service import (
@@ -105,6 +186,169 @@ from services.workspace_preset_service import (
 
 
 app = Flask(__name__)
+
+_binance_backfill_worker_lock = threading.Lock()
+_binance_backfill_worker_thread: threading.Thread | None = None
+_openbb_export_worker_lock = threading.Lock()
+_openbb_export_worker_thread: threading.Thread | None = None
+_polymarket_export_worker_lock = threading.Lock()
+_polymarket_export_worker_thread: threading.Thread | None = None
+_requirement_maintenance_thread: threading.Thread | None = None
+_requirement_maintenance_lock = threading.Lock()
+
+
+def _start_binance_backfill_worker() -> bool:
+    """Start the local worker without holding an HTTP request open."""
+    global _binance_backfill_worker_thread
+    with _binance_backfill_worker_lock:
+        if _binance_backfill_worker_thread and _binance_backfill_worker_thread.is_alive():
+            return False
+
+        def run() -> None:
+            worker = BinanceBackfillWorker(
+                BinanceBackfillTaskExecutor(get_default_store()),
+                f"research-ui-backfill-{int(time.time())}",
+            )
+            while True:
+                try:
+                    result = worker.run_once(lease_seconds=300)
+                except Exception as exc:
+                    print(f"[BACKFILL][ERR] {exc}")
+                    continue
+                if result.get("status") == "IDLE":
+                    return
+
+        _binance_backfill_worker_thread = threading.Thread(
+            target=run, name="research-ui-binance-backfill", daemon=True,
+        )
+        _binance_backfill_worker_thread.start()
+        return True
+
+
+def _start_openbb_export_worker() -> bool:
+    """Run queued OpenBB exports in the same controlled task plane as Binance."""
+    global _openbb_export_worker_thread
+    _ensure_openbb_gateway()
+    with _openbb_export_worker_lock:
+        if _openbb_export_worker_thread and _openbb_export_worker_thread.is_alive():
+            return False
+
+        def run() -> None:
+            worker = OpenBBResearchWorker(
+                OpenBBResearchTaskExecutor(get_default_store(), load_web_settings()),
+                f"research-ui-openbb-{int(time.time())}",
+            )
+            while True:
+                try:
+                    result = worker.run_once(lease_seconds=300)
+                except Exception as exc:
+                    print(f"[OPENBB][ERR] {exc}")
+                    continue
+                if result.get("status") == "IDLE":
+                    return
+
+        _openbb_export_worker_thread = threading.Thread(
+            target=run, name="research-ui-openbb-export", daemon=True,
+        )
+        _openbb_export_worker_thread.start()
+        return True
+
+
+def _ensure_openbb_gateway(wait_seconds: int = 15) -> None:
+    settings = load_web_settings()
+    provider = OpenBBProviderService(settings)
+    if not provider.config.enabled or provider.health().get("ok"):
+        return
+    python = BASE_DIR / ".openbb-venv" / "Scripts" / "python.exe"
+    if not python.is_file():
+        raise RuntimeError("OpenBB gateway runtime is not installed")
+    log_path = BASE_DIR / ".datatube" / "openbb.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    with log_path.open("ab", buffering=0) as log:
+        process = subprocess.Popen(
+            [str(python), "scripts/openbb_service.py", "run"],
+            cwd=str(BASE_DIR),
+            stdout=log,
+            stderr=log,
+            stdin=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+    pid_path = BASE_DIR / ".datatube" / "openbb.pid"
+    pid_path.write_text(str(process.pid), encoding="utf-8")
+    deadline = time.time() + max(5, wait_seconds)
+    while time.time() < deadline:
+        if provider.health().get("ok"):
+            return
+        if process.poll() is not None:
+            break
+        time.sleep(0.5)
+    raise RuntimeError(f"OpenBB gateway did not become ready; see {log_path}")
+
+
+def _start_polymarket_export_worker() -> bool:
+    """Run queued Polymarket exports in the controlled Research task plane."""
+    global _polymarket_export_worker_thread
+    with _polymarket_export_worker_lock:
+        if _polymarket_export_worker_thread and _polymarket_export_worker_thread.is_alive():
+            return False
+
+        def run() -> None:
+            worker = PolymarketResearchWorker(
+                PolymarketResearchTaskExecutor(get_default_store()),
+                f"research-ui-polymarket-{int(time.time())}",
+            )
+            while True:
+                try:
+                    result = worker.run_once(lease_seconds=300)
+                except Exception as exc:
+                    print(f"[POLYMARKET][ERR] {exc}")
+                    continue
+                if result.get("status") == "IDLE":
+                    return
+
+        _polymarket_export_worker_thread = threading.Thread(
+            target=run, name="research-ui-polymarket-export", daemon=True,
+        )
+        _polymarket_export_worker_thread.start()
+        return True
+
+
+def _start_requirement_maintenance() -> bool:
+    """Continuously maintain Library and Research data without UI actions."""
+    global _requirement_maintenance_thread
+    with _requirement_maintenance_lock:
+        if _requirement_maintenance_thread and _requirement_maintenance_thread.is_alive():
+            return False
+
+        def run() -> None:
+            maintenance = RequirementMaintenanceService(get_default_store())
+            while True:
+                try:
+                    result = maintenance.run_once()
+                    task_types = set(result.get("task_types") or [])
+                    if "BINANCE_BARS_BACKFILL" in task_types:
+                        _start_binance_backfill_worker()
+                    if "OPENBB_EQUITY_DAILY_EXPORT" in task_types:
+                        _start_openbb_export_worker()
+                    if "POLYMARKET_PRICE_HISTORY_EXPORT" in task_types:
+                        _start_polymarket_export_worker()
+                    for error in result.get("errors") or []:
+                        print(
+                            f"[REQUIREMENT-MAINTENANCE][ERR] "
+                            f"owner={error.get('owner_id')} {error.get('error')}"
+                        )
+                except Exception as exc:
+                    print(f"[REQUIREMENT-MAINTENANCE][ERR] {exc}")
+                time.sleep(30)
+
+        _requirement_maintenance_thread = threading.Thread(
+            target=run,
+            name="requirement-data-maintenance",
+            daemon=True,
+        )
+        _requirement_maintenance_thread.start()
+        return True
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -252,10 +496,14 @@ def _check_sqlite_latency(key: str, label: str, path: Path) -> dict:
 
 
 def _group_latency_status(items: list[dict]) -> dict:
-    usable = [item for item in items if item.get("ok") and item.get("latency_ms") is not None]
-    failed = [item for item in items if not item.get("ok")]
+    active = [item for item in items if item.get("status") != "disabled"]
+    disabled = len(items) - len(active)
+    usable = [item for item in active if item.get("ok") and item.get("latency_ms") is not None]
+    failed = [item for item in active if not item.get("ok")]
+    if not active:
+        return {"ok": True, "status": "disabled", "latency_ms": None, "failed": 0, "count": 0, "disabled": disabled}
     if not usable:
-        return {"ok": False, "status": "error", "latency_ms": None, "failed": len(failed), "count": len(items)}
+        return {"ok": False, "status": "error", "latency_ms": None, "failed": len(failed), "count": len(active), "disabled": disabled}
     max_latency = max(int(item.get("latency_ms") or 0) for item in usable)
     status = "warning" if failed else _latency_tone(max_latency, True)
     return {
@@ -263,7 +511,8 @@ def _group_latency_status(items: list[dict]) -> dict:
         "status": status,
         "latency_ms": max_latency,
         "failed": len(failed),
-        "count": len(items),
+        "count": len(active),
+        "disabled": disabled,
     }
 
 
@@ -276,6 +525,40 @@ def index():
 @require_local_request
 def settings_page():
     return render_template("settings.html")
+
+
+@app.get("/research")
+def research_workspace_page():
+    return render_template("research_workspace.html", initial_surface="research", initial_project_id="")
+
+
+@app.get("/research/<project_id>")
+def research_detail_page(project_id: str):
+    return render_template(
+        "research_workspace.html",
+        initial_surface="research-detail",
+        initial_project_id=project_id,
+    )
+
+
+@app.get("/library")
+def research_library_page():
+    return render_template("research_workspace.html", initial_surface="library", initial_project_id="")
+
+
+@app.get("/runs")
+def research_runs_page():
+    return render_template("research_workspace.html", initial_surface="runs", initial_project_id="")
+
+
+@app.get("/data-catalog")
+def research_data_catalog_page():
+    return render_template("research_workspace.html", initial_surface="data-catalog", initial_project_id="")
+
+
+@app.get("/approvals")
+def approvals_page():
+    return render_template("research_workspace.html", initial_surface="approvals", initial_project_id="")
 
 
 @app.get("/watchlist")
@@ -329,6 +612,3054 @@ def health():
     )
 
 
+@app.get("/api/research/data/catalog")
+@debug_timing("research_data_catalog")
+def research_data_catalog():
+    try:
+        service = DatasetCatalogService(get_default_store())
+        data = service.list_catalog(
+            instrument_id=request.args.get("instrument_id", ""),
+            data_type=request.args.get("data_type", ""),
+            status=request.args.get("status", ""),
+        )
+        return jsonify({"ok": True, "data": [asdict(item) for item in data]})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/data/capabilities")
+@debug_timing("research_data_capabilities")
+def research_data_capabilities():
+    try:
+        return jsonify({
+            "ok": True,
+            "data": ResearchDataCapabilityService(load_web_settings(), base_dir=BASE_DIR).describe(),
+        })
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/projects/<project_id>/factor-input-candidates")
+@debug_timing("research_factor_input_candidates")
+def research_factor_input_candidates(project_id: str):
+    try:
+        data = FactorInputCandidateResolver(
+            get_default_store(),
+            settings=load_web_settings(),
+            base_dir=BASE_DIR,
+        ).resolve_project(project_id)
+        return jsonify({"ok": True, "data": data})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/instruments/search")
+@debug_timing("research_instrument_search")
+def research_instrument_search():
+    try:
+        provider = str(request.args.get("provider") or "AUTO").strip().upper()
+        market = str(request.args.get("market") or "SPOT").strip().upper()
+        category = str(request.args.get("category") or "").strip()
+        if not category:
+            if market == "TOKENIZED_EQUITY":
+                category = "rwa_stock_token"
+            elif market in {"USDM_FUTURES", "COINM_FUTURES", "OPTIONS"}:
+                category = "crypto_derivatives"
+            elif provider in {"YFINANCE", "FINNHUB"} or market in {"EQUITY", "XNAS", "XNYS"}:
+                category = "equity"
+            else:
+                category = "crypto_spot"
+        if category == "fred":
+            series_id = str(request.args.get("q") or "").strip().upper()
+            rows = []
+            if series_id and all(character.isalnum() or character in "._-" for character in series_id):
+                rows.append({
+                    "instrument_id": f"macro:FRED:{series_id}",
+                    "asset_class": "macro",
+                    "venue": "FRED",
+                    "symbol": series_id,
+                    "display_symbol": series_id,
+                    "display_name": f"FRED series {series_id}",
+                    "market_kind": "macro",
+                    "status": "DEFINITION_ONLY",
+                })
+            return jsonify({
+                "ok": True,
+                "data": rows,
+                "meta": {"message": "" if rows else "Enter an exact FRED series ID; catalog search is not connected."},
+            })
+        if category == "polymarket" or provider == "POLYMARKET":
+            limit = max(1, min(int(request.args.get("limit") or 20), 50))
+            markets = search_markets(
+                query=str(request.args.get("q") or "").strip(),
+                category=str(request.args.get("market_category") or "").strip(),
+                limit=limit,
+                force_refresh=request.args.get("refresh", "0") == "1",
+                sort_by="volume24h",
+                sort_dir="desc",
+            )
+            rows = []
+            for market_row in markets:
+                condition_id = str(market_row.get("condition_id") or "").strip()
+                question = str(market_row.get("question") or market_row.get("title") or condition_id).strip()
+                for side, token_key in (("YES", "yes_token"), ("NO", "no_token")):
+                    token_id = str(market_row.get(token_key) or "").strip()
+                    if not token_id:
+                        continue
+                    rows.append({
+                        "instrument_id": f"polymarket_binary:POLYMARKET:{token_id}",
+                        "symbol": token_id,
+                        "display_symbol": f"{question} · {side.title()}",
+                        "venue": "POLYMARKET",
+                        "status": "ACTIVE" if market_row.get("active") and not market_row.get("closed") else "CLOSED",
+                        "outcome": side,
+                        "condition_id": condition_id,
+                        "token_id": token_id,
+                        "category": market_row.get("category"),
+                        "end_date": market_row.get("end_date"),
+                    })
+            return jsonify({
+                "ok": True,
+                "data": rows,
+                "meta": {"requested_provider": provider, "requested_market": market, "market_count": len(markets)},
+            })
+        if category == "coingecko":
+            return jsonify({"ok": True, "data": [], "meta": {"message": "CoinGecko is available for context data, not historical Research contracts."}})
+        args = dict(request.args)
+        args["category"] = category
+        if category == "crypto_spot":
+            args.setdefault("status", "TRADING")
+            args.setdefault("quote", "USDT")
+        elif category == "crypto_derivatives":
+            args.setdefault("status", "TRADING")
+            args.setdefault("settlement", "USDT")
+            if market == "USDM_FUTURES":
+                args.setdefault("subtype", "usdm_futures")
+        elif category == "rwa_stock_token":
+            args.setdefault("status", "ACTIVE")
+        result = search_binance_markets(args)
+        if provider not in {"AUTO", "BINANCE", "BINANCE_WEB3", "FINNHUB"} and market in {"XNAS", "XNYS"}:
+            for item in result.get("data") or []:
+                symbol = str(item.get("symbol") or "").strip().upper()
+                if symbol:
+                    item["instrument_id"] = f"equity:{market}:{symbol}"
+                    item["venue"] = market
+        result.setdefault("meta", {})["requested_provider"] = provider
+        result["meta"]["requested_market"] = market
+        return jsonify(result)
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/instruments/register")
+@require_local_request
+@debug_timing("research_instrument_register")
+def research_instrument_register():
+    try:
+        payload = request.get_json(silent=True) or {}
+        provider = str(payload.get("provider") or "").strip().upper()
+        market = str(payload.get("market") or "").strip().upper()
+        instrument_payload = payload.get("instrument")
+        if not isinstance(instrument_payload, dict):
+            raise ValueError("instrument discovery result is required")
+
+        capabilities = ResearchDataCapabilityService(load_web_settings(), base_dir=BASE_DIR).describe()
+        provider_spec = next((item for item in capabilities["providers"] if item["id"] == provider), None)
+        if provider_spec is None:
+            raise ValueError(f"Unsupported discovery source: {provider}")
+        market_spec = next((item for item in provider_spec.get("markets", []) if item["id"] == market), None)
+        if market_spec is None:
+            raise ValueError(f"Unsupported market {market} for {provider}")
+        if market_spec.get("search_category") == "coingecko":
+            raise ValueError("CoinGecko is context-only and cannot define a Universe Instrument")
+
+        instrument_payload = {
+            **instrument_payload,
+            "asset_class": instrument_payload.get("asset_class") or market_spec.get("search_category"),
+        }
+        instrument = InstrumentRegistry(get_default_store()).register_discovered(
+            instrument_payload,
+            source=provider,
+            market=market,
+        )
+        return jsonify({"ok": True, "data": asdict(instrument)}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/data/prepare/polymarket")
+@require_local_request
+@debug_timing("research_polymarket_prepare")
+def research_polymarket_prepare():
+    return jsonify({
+        "ok": False,
+        "code": "CONTROLLED_TASK_REQUIRED",
+        "error": "Refresh Research and use Prepare Data; Polymarket writes require a scoped Research task.",
+    }), 410
+
+
+@app.get("/api/research/data/providers/polymarket/worker-status")
+def polymarket_worker_status():
+    try:
+        worker = PolymarketResearchWorker(
+            PolymarketResearchTaskExecutor(get_default_store()), "status-reader"
+        )
+        return jsonify({"ok": True, "data": {"worker": worker.status()}})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/data/providers/polymarket/worker/start")
+@require_local_request
+@debug_timing("research_polymarket_worker_start")
+def polymarket_worker_start():
+    try:
+        started = _start_polymarket_export_worker()
+        return jsonify({"ok": True, "data": {"started": started, "running": True}}), 202
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/data/requirements")
+@debug_timing("research_data_requirements")
+def research_data_requirements():
+    try:
+        service = DataRequirementService(get_default_store())
+        data = service.list(
+            owner_type=request.args.get("owner_type", ""),
+            owner_id=request.args.get("owner_id", ""),
+            status=request.args.get("status", ""),
+        )
+        return jsonify({"ok": True, "data": [asdict(item) for item in data]})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/data/requirement-sets")
+@debug_timing("research_data_requirement_sets")
+def research_data_requirement_sets():
+    try:
+        service = RequirementCompiler(get_default_store())
+        data = service.list(project_id=request.args.get("project_id", ""))
+        return jsonify({"ok": True, "data": [asdict(item) for item in data]})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/data/requirement-sets/<requirement_set_id>")
+@debug_timing("research_data_requirement_set")
+def research_data_requirement_set(requirement_set_id: str):
+    try:
+        service = RequirementCompiler(get_default_store())
+        result = service.get(requirement_set_id)
+        if result is None:
+            return jsonify({"ok": False, "error": "requirement set not found"}), 404
+        return jsonify({"ok": True, "data": asdict(result)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/data/requirement-sets/<requirement_set_id>/coverage")
+@debug_timing("research_data_requirement_set_coverage")
+def research_data_requirement_set_coverage(requirement_set_id: str):
+    try:
+        return jsonify({"ok": True, "data": RequirementCompiler(get_default_store()).coverage(requirement_set_id)})
+    except KeyError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 404
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/resolved-plans")
+@debug_timing("research_resolved_plans")
+def research_resolved_plans():
+    service = ArtifactService(get_default_store())
+    return jsonify({"ok": True, "data": [asdict(item) for item in service.list(artifact_type="RESOLVED_DATA_PLAN")]})
+
+
+@app.get("/api/research/input-bundles")
+@debug_timing("research_input_bundles")
+def research_input_bundles():
+    service = ArtifactService(get_default_store())
+    return jsonify({"ok": True, "data": [asdict(item) for item in service.list(artifact_type="RESEARCH_INPUT_BUNDLE")]})
+
+
+@app.get("/api/research/input-bundles/<artifact_id>/verify")
+@debug_timing("research_input_bundle_verify")
+def research_input_bundle_verify(artifact_id: str):
+    try:
+        return jsonify({"ok": True, "data": ResearchInputBundleService(get_default_store()).verify(artifact_id)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/data/manifests/<manifest_id>")
+@debug_timing("research_data_manifest")
+def research_data_manifest(manifest_id: str):
+    try:
+        service = DatasetCatalogService(get_default_store())
+        manifest = service.get_manifest(manifest_id)
+        if manifest is None:
+            return jsonify({"ok": False, "error": "dataset manifest not found"}), 404
+        data = asdict(manifest)
+        data["provenance"] = ManifestProvenanceService(get_default_store()).get(manifest_id)
+        if request.args.get("verify", "0") == "1":
+            data["physical_validation"] = FrozenManifestData(get_default_store(), manifest_id).verify()
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/data/backfill/binance/jobs")
+@debug_timing("research_binance_backfill_jobs")
+def research_binance_backfill_jobs():
+    try:
+        service = BinanceBackfillJobService(get_default_store())
+        return jsonify({
+            "ok": True,
+            "data": service.list(
+                status=request.args.get("status", ""),
+                task_id=request.args.get("task_id", ""),
+                limit=int(request.args.get("limit") or 200),
+            ),
+        })
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/data/backfill/binance/jobs/<job_id>")
+@debug_timing("research_binance_backfill_job")
+def research_binance_backfill_job(job_id: str):
+    try:
+        job = BinanceBackfillJobService(get_default_store()).get(job_id)
+        if job is None:
+            return jsonify({"ok": False, "error": "Binance backfill job not found"}), 404
+        return jsonify({"ok": True, "data": job})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/data/backfill/binance/worker-status")
+@debug_timing("research_binance_backfill_worker_status")
+def research_binance_backfill_worker_status():
+    try:
+        worker_id = request.args.get("worker_id", "binance-backfill-readonly-status")
+        worker = BinanceBackfillWorker(BinanceBackfillTaskExecutor(get_default_store()), worker_id)
+        return jsonify({"ok": True, "data": worker.status()})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/data/backfill/binance/worker/start")
+@require_local_request
+@debug_timing("research_binance_backfill_worker_start")
+def research_binance_backfill_worker_start():
+    try:
+        started = _start_binance_backfill_worker()
+        return jsonify({"ok": True, "data": {"started": started, "running": True}}), 202
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/artifacts")
+@debug_timing("research_artifacts")
+def research_artifacts():
+    try:
+        service = ArtifactService(get_default_store())
+        artifacts = service.list(
+            artifact_type=request.args.get("artifact_type", ""),
+            logical_name=request.args.get("logical_name", ""),
+            limit=int(request.args.get("limit") or 200),
+        )
+        dependencies = service.dependencies_many(artifact.artifact_id for artifact in artifacts)
+        data = []
+        for artifact in artifacts:
+            item = asdict(artifact)
+            item["dependencies"] = dependencies.get(artifact.artifact_id, [])
+            data.append(item)
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/backtest/capabilities")
+@debug_timing("research_backtest_capabilities")
+def research_backtest_capabilities():
+    return jsonify({
+        "ok": True,
+        "data": {
+            "legacy_provider": CURRENT_HISTORY_BACKTEST_CAPABILITIES.to_dict(),
+            "research_provider": RESEARCH_BACKTEST_CAPABILITIES.to_dict(),
+        },
+    })
+
+
+@app.post("/api/research/backtest/validate")
+@debug_timing("research_backtest_validate")
+def research_backtest_validate():
+    try:
+        payload = request.get_json(silent=True) or {}
+        provider = str(payload.get("provider") or "legacy").strip().lower()
+        if provider in {"research", "research_backtest_v2"}:
+            result = ResearchBacktestProvider().validate(payload.get("execution_spec"))
+        else:
+            result = ExistingBacktestAdapter().validate(payload)
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _json_error(exc, 400)
+
+
+@app.get("/api/research/universes")
+@debug_timing("research_universes")
+def research_universes():
+    try:
+        service = UniverseService(get_default_store())
+        data = service.list_definitions(
+            status=request.args.get("status", "ACTIVE"),
+            limit=int(request.args.get("limit") or 200),
+        )
+        return jsonify({"ok": True, "data": [asdict(item) for item in data]})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/universes")
+@require_local_request
+@debug_timing("research_universe_create")
+def research_universe_create():
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = UniverseService(get_default_store()).create_definition(
+            name=str(payload.get("name") or ""),
+            version=str(payload.get("version") or ""),
+            universe_type=str(payload.get("universe_type") or "STATIC_LIST"),
+            parameters=payload.get("parameters") or {},
+            selection_rule_version=str(payload.get("selection_rule_version") or "universe-engine.v1"),
+            owner_project_id=str(payload.get("owner_project_id") or ""),
+            library_scope=str(payload.get("library_scope") or "GLOBAL"),
+        )
+        return jsonify({"ok": True, "data": asdict(result)}), 201
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/universes/<universe_definition_id>/snapshots")
+@require_local_request
+@debug_timing("research_universe_snapshot_create")
+def research_universe_snapshot_create(universe_definition_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        catalog = DatasetCatalogService(get_default_store())
+        manifests = []
+        for manifest_id in payload.get("manifest_ids") or []:
+            manifest = catalog.get_manifest(str(manifest_id))
+            if manifest is None:
+                raise ValueError(f"dataset Manifest not found: {manifest_id}")
+            manifests.append(manifest)
+        result = UniverseService(get_default_store()).resolve_snapshot(
+            universe_definition_id=universe_definition_id,
+            as_of_time=str(payload.get("as_of_time") or ""),
+            manifests=manifests,
+        )
+        return jsonify({"ok": True, "data": asdict(result)}), 201
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/universes/<universe_definition_id>/publish")
+@require_local_request
+@debug_timing("research_universe_publish")
+def research_universe_publish(universe_definition_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = ResearchLibraryService(get_default_store()).publish_universe(
+            universe_definition_id=universe_definition_id,
+            project_id=str(payload.get("project_id") or ""),
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/universes/<universe_definition_id>/snapshots")
+@debug_timing("research_universe_snapshots")
+def research_universe_snapshots(universe_definition_id: str):
+    try:
+        service = UniverseService(get_default_store())
+        if service.get_definition(universe_definition_id) is None:
+            return jsonify({"ok": False, "error": "universe definition not found"}), 404
+        return jsonify({
+            "ok": True,
+            "data": [asdict(item) for item in service.list_snapshots(universe_definition_id)],
+        })
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/universe-snapshots/<universe_snapshot_id>")
+@debug_timing("research_universe_snapshot")
+def research_universe_snapshot(universe_snapshot_id: str):
+    try:
+        snapshot = UniverseService(get_default_store()).get_snapshot(universe_snapshot_id)
+        if snapshot is None:
+            return jsonify({"ok": False, "error": "universe snapshot not found"}), 404
+        return jsonify({"ok": True, "data": asdict(snapshot)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+def _shared_universe_error(exc: Exception):
+    if isinstance(exc, UniverseConflictError):
+        return jsonify({
+            "ok": False, "code": exc.code, "error": str(exc),
+            "data": {"current_revision_id": exc.current_revision_id},
+        }), 409
+    if isinstance(exc, UniverseSharedImpactError):
+        return jsonify({
+            "ok": False, "code": exc.code, "error": str(exc),
+            "data": {"affected_research": exc.research},
+        }), 409
+    if isinstance(exc, UniverseResolutionError):
+        return jsonify({
+            "ok": False, "code": exc.code, "error": str(exc), "data": exc.details,
+        }), 422
+    if isinstance(exc, (TypeError, ValueError)):
+        return _json_error(exc, 400)
+    return _json_error(exc)
+
+
+@app.get("/api/library/universes")
+@debug_timing("shared_universe_list")
+def shared_universe_list():
+    try:
+        data = SharedUniverseService(get_default_store()).list(
+            include_archived=str(request.args.get("include_archived") or "").lower() in {"1", "true", "yes"}
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.post("/api/library/universes")
+@require_local_request
+@debug_timing("shared_universe_create")
+def shared_universe_create():
+    try:
+        result = SharedUniverseService(get_default_store()).create(
+            request.get_json(silent=True) or {}, created_by="local_ui_user"
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.post("/api/library/universes/preview")
+@debug_timing("shared_universe_preview")
+def shared_universe_preview():
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = SharedUniverseService(get_default_store()).preview(
+            payload, universe_id=str(payload.get("universe_id") or "")
+        )
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.post("/api/library/universes/script/render")
+@debug_timing("shared_universe_script_render")
+def shared_universe_script_render():
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = SharedUniverseService(get_default_store()).render_script(payload)
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.post("/api/library/universes/script/parse")
+@debug_timing("shared_universe_script_parse")
+def shared_universe_script_parse():
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = SharedUniverseService(get_default_store()).parse_script(str(payload.get("script") or ""))
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.get("/api/library/universes/<universe_id>")
+@debug_timing("shared_universe_detail")
+def shared_universe_detail(universe_id: str):
+    try:
+        result = SharedUniverseService(get_default_store()).get(universe_id)
+        if result is None:
+            return jsonify({"ok": False, "error": "Universe not found"}), 404
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.patch("/api/library/universes/<universe_id>")
+@require_local_request
+@debug_timing("shared_universe_update")
+def shared_universe_update(universe_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = SharedUniverseService(get_default_store()).update(
+            universe_id,
+            payload,
+            expected_current_revision_id=str(payload.get("expected_current_revision_id") or ""),
+            confirm_shared=bool(payload.get("confirm_shared", False)),
+            current_project_id=str(payload.get("current_project_id") or ""),
+            created_by="local_ui_user",
+            change_summary=str(payload.get("change_summary") or ""),
+        )
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.post("/api/library/universes/<universe_id>/copy")
+@require_local_request
+@debug_timing("shared_universe_copy")
+def shared_universe_copy(universe_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = SharedUniverseService(get_default_store()).copy(
+            universe_id,
+            name=str(payload.get("name") or ""),
+            project_id=str(payload.get("project_id") or ""),
+            replace_primary=bool(payload.get("replace_primary", False)),
+            definition_override=payload.get("definition"),
+            created_by="local_ui_user",
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.get("/api/library/universes/<universe_id>/usage")
+@debug_timing("shared_universe_usage")
+def shared_universe_usage(universe_id: str):
+    try:
+        return jsonify({"ok": True, "data": SharedUniverseService(get_default_store()).usage(universe_id)})
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.get("/api/library/universes/<universe_id>/history")
+@debug_timing("shared_universe_history")
+def shared_universe_history(universe_id: str):
+    try:
+        return jsonify({"ok": True, "data": SharedUniverseService(get_default_store()).history(universe_id)})
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.post("/api/library/universes/<universe_id>/restore")
+@require_local_request
+@debug_timing("shared_universe_restore")
+def shared_universe_restore(universe_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = SharedUniverseService(get_default_store()).restore(
+            universe_id,
+            str(payload.get("revision_id") or ""),
+            expected_current_revision_id=str(payload.get("expected_current_revision_id") or ""),
+            confirm_shared=bool(payload.get("confirm_shared", False)),
+            current_project_id=str(payload.get("current_project_id") or ""),
+            created_by="local_ui_user",
+        )
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.post("/api/library/universes/<universe_id>/archive")
+@require_local_request
+@debug_timing("shared_universe_archive")
+def shared_universe_archive(universe_id: str):
+    try:
+        return jsonify({"ok": True, "data": SharedUniverseService(get_default_store()).archive(universe_id)})
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.get("/api/research/projects/<project_id>/universes")
+@debug_timing("research_shared_universe_list")
+def research_shared_universe_list(project_id: str):
+    try:
+        data = SharedUniverseService(get_default_store()).list_project(
+            project_id,
+            include_removed=str(request.args.get("include_removed") or "").lower() in {"1", "true", "yes"},
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.post("/api/research/projects/<project_id>/universes")
+@require_local_request
+@debug_timing("research_shared_universe_create")
+def research_shared_universe_create(project_id: str):
+    try:
+        result = SharedUniverseService(get_default_store()).create(
+            request.get_json(silent=True) or {}, created_by="local_ui_user", project_id=project_id
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.post("/api/research/projects/<project_id>/universes/add")
+@require_local_request
+@debug_timing("research_shared_universe_add")
+def research_shared_universe_add(project_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = SharedUniverseService(get_default_store()).bind(
+            project_id=project_id,
+            universe_id=str(payload.get("universe_id") or ""),
+            role=str(payload.get("role") or "REFERENCE"),
+            replace_primary=bool(payload.get("replace_primary", False)),
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.post("/api/research/projects/<project_id>/universes/<universe_id>/copy")
+@require_local_request
+@debug_timing("research_shared_universe_copy")
+def research_shared_universe_copy(project_id: str, universe_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = SharedUniverseService(get_default_store()).copy(
+            universe_id,
+            name=str(payload.get("name") or ""),
+            project_id=project_id,
+            replace_primary=bool(payload.get("replace_primary", False)),
+            definition_override=payload.get("definition"),
+            created_by="local_ui_user",
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.delete("/api/research/projects/<project_id>/universes/<universe_id>")
+@require_local_request
+@debug_timing("research_shared_universe_remove")
+def research_shared_universe_remove(project_id: str, universe_id: str):
+    try:
+        result = SharedUniverseService(get_default_store()).remove_binding(
+            project_id=project_id, universe_id=universe_id
+        )
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.put("/api/research/projects/<project_id>/universe-bindings")
+@require_local_request
+@debug_timing("research_shared_universe_primary")
+def research_shared_universe_primary(project_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = SharedUniverseService(get_default_store()).set_primary(
+            project_id=project_id, universe_id=str(payload.get("universe_id") or "")
+        )
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _shared_universe_error(exc)
+
+
+@app.get("/api/research/projects")
+@debug_timing("research_projects")
+def research_projects():
+    try:
+        service = ResearchControlPlane(get_default_store())
+        data = service.list_projects(
+            summary_state=request.args.get("summary_state", ""),
+            limit=int(request.args.get("limit") or 100),
+            include_archived=str(request.args.get("include_archived") or "").lower() in {"1", "true", "yes"},
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/projects")
+@require_local_request
+@debug_timing("research_project_create")
+def research_project_create():
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = ResearchControlPlane(get_default_store()).create_project(
+            title=str(payload.get("title") or "").strip(),
+            objective=str(payload.get("objective") or "").strip(),
+            created_by="local_ui_user",
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/projects/<project_id>/archive")
+@require_local_request
+@debug_timing("research_project_archive")
+def research_project_archive(project_id: str):
+    try:
+        return jsonify({"ok": True, "data": RequirementWorkspaceService(get_default_store()).archive_project(project_id)})
+    except ValueError as exc:
+        return _json_error(exc, 404)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/projects/<project_id>/requirement-sets")
+@require_local_request
+@debug_timing("research_requirement_set_compile")
+def research_requirement_set_compile(project_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        if ResearchControlPlane(get_default_store()).get_project(project_id) is None:
+            return jsonify({"ok": False, "error": "research project not found"}), 404
+        context = dict(payload.get("context") or {})
+        alias_source = str(payload.get("instrument_source") or "").strip().lower()
+        if alias_source:
+            registry = InstrumentRegistry(get_default_store())
+            resolved_instruments = []
+            unresolved_instruments = []
+            for value in context.get("instrument_ids") or []:
+                instrument_id = str(value or "").strip()
+                if not instrument_id:
+                    continue
+                if ":" in instrument_id:
+                    resolved_instruments.append(instrument_id)
+                    continue
+                resolved = registry.resolve_alias(alias_source, instrument_id.upper())
+                if resolved:
+                    resolved_instruments.append(resolved)
+                else:
+                    unresolved_instruments.append(instrument_id)
+            if unresolved_instruments:
+                raise ValueError(
+                    f"instrument aliases not found for {alias_source}: {', '.join(unresolved_instruments)}"
+                )
+            context["instrument_ids"] = resolved_instruments
+        store = get_default_store()
+        result = RequirementCompiler(store).compile(
+            project_id=project_id,
+            factor_specs=payload.get("factor_specs") or [],
+            universe_requirements=payload.get("universe_requirements") or [],
+            evaluation_requirements=payload.get("evaluation_requirements") or [],
+            backtest_requirements=payload.get("backtest_requirements") or [],
+            manual_requirements=payload.get("manual_requirements") or [],
+            context=context,
+        )
+        ResearchLibraryService(store).set_local_requirements(
+            project_id=project_id,
+            requirement_set_id=result.requirement_set_id,
+        )
+        return jsonify({"ok": True, "data": asdict(result)}), 201
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/projects/<project_id>/resolved-plans")
+@require_local_request
+@debug_timing("research_resolved_plan_create")
+def research_resolved_plan_create(project_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = ResolvedDataPlanService(get_default_store()).create(
+            project_id=project_id,
+            logical_name=str(payload.get("logical_name") or "research_data_plan").strip(),
+            requirement_set_id=str(payload.get("requirement_set_id") or "").strip(),
+            route=payload.get("route") or {},
+            source_policy=payload.get("source_policy") or {},
+            canonical=payload.get("canonical") or {},
+            estimates=payload.get("estimates") or {},
+        )
+        return jsonify({"ok": True, "data": asdict(result)}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/projects/<project_id>/input-bundles")
+@require_local_request
+@debug_timing("research_input_bundle_create")
+def research_input_bundle_create(project_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        if ResearchControlPlane(get_default_store()).get_project(project_id) is None:
+            return jsonify({"ok": False, "error": "research project not found"}), 404
+        result = ResearchInputBundleService(get_default_store()).create(
+            project_id=project_id,
+            logical_name=str(payload.get("logical_name") or "research_input_bundle").strip(),
+            manifest_ids=payload.get("manifest_ids") or [],
+            universe_snapshot_id=str(payload.get("universe_snapshot_id") or "").strip(),
+            requirement_set_id=str(payload.get("requirement_set_id") or "").strip(),
+            resolved_plan_id=str(payload.get("resolved_plan_id") or "").strip(),
+            policy_versions=payload.get("policy_versions") or {},
+            compiler_version=str(payload.get("compiler_version") or "").strip(),
+            canonicalizer_version=str(payload.get("canonicalizer_version") or "canonicalizer_v1").strip(),
+        )
+        verification = ResearchInputBundleService(get_default_store()).verify(result.artifact_id)
+        data = asdict(result)
+        data["verification"] = verification
+        return jsonify({"ok": True, "data": data}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/projects/<project_id>")
+@debug_timing("research_project")
+def research_project(project_id: str):
+    try:
+        service = ResearchControlPlane(get_default_store())
+        project = service.get_project(project_id)
+        if project is None:
+            return jsonify({"ok": False, "error": "research project not found"}), 404
+        return jsonify({
+            "ok": True,
+            "data": {
+                "project": project,
+                "plans": service.list_plans(project_id),
+                "grants": service.list_grants(project_id=project_id),
+                "tasks": service.list_tasks(project_id=project_id),
+            },
+        })
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/projects/<project_id>/plans")
+@debug_timing("research_project_plans")
+def research_project_plans(project_id: str):
+    try:
+        service = ResearchControlPlane(get_default_store())
+        return jsonify({"ok": True, "data": service.list_plans(project_id)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/projects/<project_id>/tasks")
+@debug_timing("research_project_tasks")
+def research_project_tasks(project_id: str):
+    try:
+        service = ResearchControlPlane(get_default_store())
+        return jsonify({
+            "ok": True,
+            "data": service.list_tasks(
+                project_id=project_id,
+                limit=int(request.args.get("limit") or 500),
+            ),
+        })
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/projects/<project_id>/grants")
+@debug_timing("research_project_grants")
+def research_project_grants(project_id: str):
+    try:
+        service = ResearchControlPlane(get_default_store())
+        return jsonify({"ok": True, "data": service.list_grants(project_id=project_id)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/projects/<project_id>/universe-ref")
+@debug_timing("research_universe_ref_get")
+def research_universe_ref_get(project_id: str):
+    try:
+        if ResearchControlPlane(get_default_store()).get_project(project_id) is None:
+            return jsonify({"ok": False, "error": "Research not found"}), 404
+        result = UniverseService(get_default_store()).get_research_ref(project_id)
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.put("/api/research/projects/<project_id>/universe-ref")
+@require_local_request
+@debug_timing("research_universe_ref_set")
+def research_universe_ref_set(project_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = UniverseService(get_default_store()).set_research_ref(
+            project_id=project_id,
+            universe_snapshot_id=str(payload.get("universe_snapshot_id") or ""),
+            library_asset_id=str(payload.get("library_asset_id") or ""),
+        )
+        return jsonify({"ok": True, "data": result})
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.delete("/api/research/projects/<project_id>/universe-ref")
+@require_local_request
+@debug_timing("research_universe_ref_remove")
+def research_universe_ref_remove(project_id: str):
+    try:
+        result = UniverseService(get_default_store()).remove_research_ref(project_id=project_id)
+        return jsonify({"ok": True, "data": result})
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/projects/<project_id>/run-grants")
+@require_local_request
+@debug_timing("research_project_run_grant")
+def research_project_run_grant(project_id: str):
+    """Local human approval boundary for formal Research Runs."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        control = ResearchControlPlane(get_default_store())
+        allowed_providers = [
+            str(item).strip().upper() for item in payload.get("allowed_providers") or [] if str(item).strip()
+        ]
+        allowed_instruments = [
+            str(item).strip() for item in payload.get("allowed_instrument_ids") or [] if str(item).strip()
+        ]
+        allowed_universe_definitions = [
+            str(item).strip() for item in payload.get("allowed_universe_definition_ids") or [] if str(item).strip()
+        ]
+        requested_snapshot = str(payload.get("universe_snapshot_id") or "").strip()
+        allowed_universe_snapshots = [
+            str(item).strip() for item in payload.get("allowed_universe_snapshot_ids") or [] if str(item).strip()
+        ] or ([requested_snapshot] if requested_snapshot else [])
+        allowed_intervals = [
+            str(item).strip().lower() for item in payload.get("allowed_intervals") or [] if str(item).strip()
+        ]
+        if not allowed_providers:
+            raise ValueError("Project Research Grant requires at least one allowed Provider")
+        if not (allowed_instruments or allowed_universe_definitions or allowed_universe_snapshots):
+            raise ValueError("Project Research Grant requires an explicit Instrument or Universe scope")
+        instrument_parts = [item.split(":", 2) for item in allowed_instruments]
+        asset_classes = sorted({parts[0].strip().lower() for parts in instrument_parts if parts and parts[0].strip()})
+        venues = sorted({parts[1].strip().upper() for parts in instrument_parts if len(parts) > 1 and parts[1].strip()})
+        endpoints = []
+        if "BINANCE" in allowed_providers:
+            endpoints.append("binance.klines")
+        if "POLYMARKET" in allowed_providers:
+            endpoints.append("polymarket.price_history")
+        if "equity" in asset_classes and any(provider not in {"BINANCE", "POLYMARKET"} for provider in allowed_providers):
+            endpoints.append("equity.price.historical")
+        intent_payload = {
+            "objective": str(payload.get("objective") or "formal research execution"),
+            "requested_run_types": payload.get("allowed_run_types") or [],
+            "requested_at": time.time(),
+        }
+        intent = control.create_plan(
+            project_id=project_id, stage="INTENT", payload=intent_payload, created_by="local_ui_user"
+        )
+        plan_version = int(intent["plan_version"])
+        resolved_payload = {
+            **intent_payload,
+            "requirement_set_id": str(payload.get("requirement_set_id") or ""),
+            "universe_snapshot_id": str(payload.get("universe_snapshot_id") or ""),
+            "source_policy": payload.get("source_policy") or {"mode": "FIXED"},
+        }
+        control.create_plan(
+            project_id=project_id, stage="RESOLVED", payload=resolved_payload,
+            created_by="local_ui_user", plan_version=plan_version,
+        )
+        result = control.approve_plan(
+            project_id=project_id,
+            plan_version=plan_version,
+            scope={
+                "grant_kind": "PROJECT_RESEARCH",
+                "scope_version": "project_research_scope.v1",
+                "autonomy_level": str(payload.get("autonomy_level") or "AUTONOMOUS").upper(),
+                "allowed_operations": payload.get("allowed_operations") or list(DEFAULT_RESEARCH_OPERATIONS),
+                "allowed_providers": allowed_providers,
+                "allowed_instrument_ids": allowed_instruments,
+                "allowed_universe_definition_ids": allowed_universe_definitions,
+                "allowed_universe_snapshot_ids": allowed_universe_snapshots,
+                "allowed_intervals": allowed_intervals,
+                "asset_classes": asset_classes,
+                "venues": venues,
+                "symbols": sorted({
+                    item.rsplit(":", 1)[-1].upper() for item in allowed_instruments if ":" in item
+                }),
+                "intervals": allowed_intervals,
+                "endpoints": endpoints,
+                "time_start": str(payload.get("time_start") or ""),
+                "time_end": str(payload.get("time_end") or ""),
+                "allow_project_pin": bool(payload.get("allow_project_pin", True)),
+                "allow_global_library_publish": False,
+                "allowed_run_types": payload.get("allowed_run_types") or [
+                    "FACTOR_EVALUATION", "ALPHA_EVALUATION", "RESEARCH_BACKTEST"
+                ],
+                "providers": [item.lower() for item in allowed_providers],
+                "requirement_set_id": resolved_payload["requirement_set_id"],
+                "universe_snapshot_id": resolved_payload["universe_snapshot_id"],
+            },
+            budgets=payload.get("budgets") or {
+                "max_backtest_runs": 10,
+                "max_download_bytes": 0,
+                "max_runtime_seconds": 3600,
+            },
+            approved_by="local_ui_user",
+            actor_type="human",
+            expires_at=payload.get("expires_at"),
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except PermissionError as exc:
+        return _json_error(exc, 403)
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/projects/<project_id>/run-grants/<grant_id>/agent-state")
+@require_local_request
+@debug_timing("research_project_agent_state")
+def research_project_agent_state(project_id: str, grant_id: str):
+    """Human-only emergency pause/resume; Agents cannot mutate their Grant."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        control = ResearchControlPlane(get_default_store())
+        grant = control.get_grant(grant_id)
+        if grant is None or str(grant.get("project_id")) != project_id:
+            return jsonify({"ok": False, "code": "RESEARCH_GRANT_NOT_FOUND", "error": "Grant not found"}), 404
+        result = control.set_grant_agent_state(
+            grant_id,
+            paused=bool(payload.get("paused", True)),
+            actor_type="human",
+        )
+        return jsonify({"ok": True, "data": result})
+    except PermissionError as exc:
+        return _json_error(exc, 403)
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/engine-capabilities")
+@debug_timing("research_engine_capabilities")
+def research_engine_capabilities():
+    return jsonify({"ok": True, "data": DefinitionRegistry.engine_capabilities()})
+
+
+@app.get("/api/research/definitions")
+@debug_timing("research_definitions")
+def research_definitions():
+    try:
+        service = DefinitionRegistry(get_default_store())
+        data = service.list(
+            definition_type=request.args.get("definition_type", ""),
+            state=request.args.get("state", ""),
+            limit=int(request.args.get("limit") or 200),
+        )
+        return jsonify({"ok": True, "data": [item.to_dict() for item in data]})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/library")
+@debug_timing("research_library_list")
+def research_library_list():
+    try:
+        component_type = str(request.args.get("component_type") or "").upper()
+        store = get_default_store()
+        legacy = ResearchLibraryService(store).list(component_type=component_type)
+        if component_type == "REQUIREMENTS":
+            data = RequirementWorkspaceService(store).list_library_assets()
+        elif component_type:
+            data = legacy
+        else:
+            data = [item for item in legacy if item.get("component_type") != "REQUIREMENTS"]
+            data.extend(RequirementWorkspaceService(store).list_library_assets())
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/library/<library_asset_id>")
+@debug_timing("research_library_detail")
+def research_library_detail(library_asset_id: str):
+    try:
+        store = get_default_store()
+        result = RequirementWorkspaceService(store).get_library_asset(library_asset_id)
+        if result is None:
+            result = ResearchLibraryService(store).get(library_asset_id)
+        if result is None:
+            return jsonify({"ok": False, "error": "Library asset not found"}), 404
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/library/<library_asset_id>/usage")
+@debug_timing("research_library_usage")
+def research_library_usage(library_asset_id: str):
+    try:
+        store = get_default_store()
+        workspace = RequirementWorkspaceService(store)
+        data = workspace.library_usage(library_asset_id) if workspace.get_library_asset(library_asset_id) else ResearchLibraryService(store).usage(library_asset_id)
+        return jsonify({"ok": True, "data": data})
+    except ValueError as exc:
+        return _json_error(exc, 404)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.delete("/api/research/library/<library_asset_id>/archive")
+@require_local_request
+@debug_timing("research_library_archive")
+def research_library_archive(library_asset_id: str):
+    try:
+        result = ResearchLibraryService(get_default_store()).archive(library_asset_id)
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/library/groups")
+@debug_timing("library_group_list")
+def library_group_list():
+    try:
+        asset_type = str(request.args.get("asset_type") or "").upper()
+        result = LibraryGroupService(get_default_store()).list_groups(asset_type)
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/library/groups")
+@require_local_request
+@debug_timing("library_group_create")
+def library_group_create():
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = LibraryGroupService(get_default_store()).create_group(
+            asset_type=str(payload.get("asset_type") or ""),
+            name=str(payload.get("name") or ""),
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.patch("/api/library/groups/<group_id>")
+@require_local_request
+@debug_timing("library_group_rename")
+def library_group_rename(group_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = LibraryGroupService(get_default_store()).rename_group(group_id, str(payload.get("name") or ""))
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.delete("/api/library/groups/<group_id>")
+@require_local_request
+@debug_timing("library_group_delete")
+def library_group_delete(group_id: str):
+    try:
+        result = LibraryGroupService(get_default_store()).delete_group(group_id)
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/library/groups/reorder")
+@require_local_request
+@debug_timing("library_group_reorder")
+def library_group_reorder():
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = LibraryGroupService(get_default_store()).reorder_groups(
+            asset_type=str(payload.get("asset_type") or ""),
+            ordered_group_ids=list(payload.get("group_ids") or []),
+        )
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/library/groups/move-assets")
+@require_local_request
+@debug_timing("library_group_move_assets")
+def library_group_move_assets():
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = LibraryGroupService(get_default_store()).move_assets(
+            asset_type=str(payload.get("asset_type") or ""),
+            asset_ids=list(payload.get("asset_ids") or []),
+            group_id=payload.get("group_id"),
+        )
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/library/groups/membership")
+@debug_timing("library_group_membership")
+def library_group_membership():
+    try:
+        asset_type = str(request.args.get("asset_type") or "").upper()
+        asset_ids = [item for item in str(request.args.get("asset_ids") or "").split(",") if item]
+        result = LibraryGroupService(get_default_store()).membership(asset_type, asset_ids or None)
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/requirements/default")
+def research_requirement_default():
+    return jsonify({"ok": True, "data": default_requirement_spec(request.args.get("name") or "New Requirement")})
+
+
+@app.get("/api/research/projects/<project_id>/requirements/suggestion")
+@debug_timing("research_requirement_suggestion")
+def research_requirement_suggestion(project_id: str):
+    try:
+        result = RequirementWorkspaceService(get_default_store()).suggest_for_universe(
+            project_id, str(request.args.get("universe_id") or "")
+        )
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/projects/<project_id>/requirements/reconcile")
+@require_local_request
+@debug_timing("research_requirement_reconcile")
+def research_requirement_reconcile(project_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = RequirementWorkspaceService(get_default_store()).reconcile_project(
+            project_id, universe_id=str(payload.get("universe_id") or "")
+        )
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/requirements/script/parse")
+@require_local_request
+def research_requirement_script_parse():
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify({"ok": True, "data": RequirementWorkspaceService.from_script(str(payload.get("script") or ""))})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.post("/api/research/requirements/script/render")
+@require_local_request
+def research_requirement_script_render():
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify({"ok": True, "data": RequirementWorkspaceService.to_script(dict(payload.get("spec") or payload))})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.post("/api/research/library/requirements")
+@require_local_request
+def research_library_requirement_create():
+    try:
+        result = RequirementWorkspaceService(get_default_store()).create_library_requirement(
+            request.get_json(silent=True) or {}
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.patch("/api/research/library/requirements/<library_asset_id>")
+@require_local_request
+def research_library_requirement_update(library_asset_id: str):
+    try:
+        result = RequirementWorkspaceService(get_default_store()).update_library_requirement(
+            library_asset_id, request.get_json(silent=True) or {}
+        )
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.post("/api/research/library/requirements/<library_asset_id>/save-as")
+@require_local_request
+def research_library_requirement_save_as(library_asset_id: str):
+    try:
+        result = RequirementWorkspaceService(get_default_store()).save_as_library_requirement(
+            library_asset_id, request.get_json(silent=True) or {}
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.delete("/api/research/library/requirements/<library_asset_id>")
+@require_local_request
+def research_library_requirement_archive(library_asset_id: str):
+    try:
+        result = RequirementWorkspaceService(get_default_store()).archive_library_requirement(library_asset_id)
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.get("/api/research/library/requirements/drafts")
+def research_library_requirement_drafts():
+    return jsonify({"ok": True, "data": RequirementWorkspaceService(get_default_store()).list_library_drafts()})
+
+
+@app.post("/api/research/library/requirements/drafts")
+@require_local_request
+def research_library_requirement_draft_create():
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = RequirementWorkspaceService(get_default_store()).create_library_draft(
+            payload, base_asset_id=str(payload.get("base_library_asset_id") or ""),
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.patch("/api/research/library/requirements/drafts/<draft_id>")
+@require_local_request
+def research_library_requirement_draft_update(draft_id: str):
+    try:
+        result = RequirementWorkspaceService(get_default_store()).update_library_draft(draft_id, request.get_json(silent=True) or {})
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.post("/api/research/library/requirements/drafts/<draft_id>/publish")
+@require_local_request
+def research_library_requirement_draft_publish(draft_id: str):
+    try:
+        result = RequirementWorkspaceService(get_default_store()).publish_library_draft(draft_id)
+        return jsonify({"ok": True, "data": result}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.get("/api/research/projects/<project_id>/requirements/items")
+def research_requirement_items(project_id: str):
+    try:
+        return jsonify({"ok": True, "data": RequirementWorkspaceService(get_default_store()).list_project_items(project_id, include_derived=False)})
+    except ValueError as exc:
+        return _json_error(exc, 404)
+
+
+@app.post("/api/research/projects/<project_id>/requirements/items")
+@require_local_request
+def research_requirement_item_create(project_id: str):
+    try:
+        result = RequirementWorkspaceService(get_default_store()).create_research_requirement(project_id, request.get_json(silent=True) or {})
+        return jsonify({"ok": True, "data": result}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.patch("/api/research/projects/<project_id>/requirements/items/<ref_id>")
+@require_local_request
+def research_requirement_item_update(project_id: str, ref_id: str):
+    try:
+        result = RequirementWorkspaceService(get_default_store()).update_research_requirement(project_id, ref_id, request.get_json(silent=True) or {})
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.delete("/api/research/projects/<project_id>/requirements/items/<ref_id>")
+@require_local_request
+def research_requirement_item_remove(project_id: str, ref_id: str):
+    try:
+        RequirementWorkspaceService(get_default_store()).remove_project_item(project_id, ref_id)
+        return jsonify({"ok": True, "data": {"removed": True}})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.post("/api/research/projects/<project_id>/requirements/items/<ref_id>/duplicate")
+@require_local_request
+def research_requirement_item_duplicate(project_id: str, ref_id: str):
+    try:
+        result = RequirementWorkspaceService(get_default_store()).duplicate_project_item(project_id, ref_id)
+        return jsonify({"ok": True, "data": result}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.post("/api/research/projects/<project_id>/requirements/items/<ref_id>/save-as")
+@require_local_request
+def research_requirement_item_save_as(project_id: str, ref_id: str):
+    try:
+        result = RequirementWorkspaceService(get_default_store()).save_as_for_project(
+            project_id, ref_id, request.get_json(silent=True) or {}
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.post("/api/research/projects/<project_id>/requirements/items/<ref_id>/replace")
+@require_local_request
+def research_requirement_item_replace(project_id: str, ref_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = RequirementWorkspaceService(get_default_store()).replace_project_item(
+            project_id, ref_id, str(payload.get("library_asset_id") or "")
+        )
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.post("/api/research/projects/<project_id>/requirements/items/<ref_id>/publish")
+@require_local_request
+def research_requirement_item_publish(project_id: str, ref_id: str):
+    try:
+        result = RequirementWorkspaceService(get_default_store()).publish_research_item(project_id, ref_id)
+        return jsonify({"ok": True, "data": result}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.post("/api/research/projects/<project_id>/requirements/library-items")
+@require_local_request
+def research_requirement_library_item_add(project_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = RequirementWorkspaceService(get_default_store()).add_library_to_research(project_id, str(payload.get("library_asset_id") or ""))
+        return jsonify({"ok": True, "data": result}), 201
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.get("/api/research/projects/<project_id>/data-status")
+def research_project_data_status(project_id: str):
+    try:
+        return jsonify({
+            "ok": True,
+            "data": RequirementWorkspaceService(get_default_store()).data_status(
+                project_id,
+                str(request.args.get("requirement_set_id") or ""),
+            ),
+        })
+    except ValueError as exc:
+        return _json_error(exc, 400)
+
+
+@app.post("/api/research/projects/<project_id>/requirements/refresh")
+@require_local_request
+@debug_timing("research_effective_requirements_refresh")
+def research_effective_requirements_refresh(project_id: str):
+    try:
+        result = RequirementWorkspaceService(
+            get_default_store()
+        ).refresh_effective_requirements(project_id)
+        return jsonify({"ok": True, "data": result})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/projects/<project_id>/requirements/publish")
+@require_local_request
+@debug_timing("research_requirements_publish")
+def research_requirements_publish(project_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = ResearchLibraryService(get_default_store()).publish_requirements(
+            requirement_set_id=str(payload.get("requirement_set_id") or ""),
+            project_id=project_id,
+            name=str(payload.get("name") or "Research Requirements"),
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.put("/api/research/projects/<project_id>/requirements/library-ref")
+@require_local_request
+@debug_timing("research_requirements_library_ref")
+def research_requirements_library_ref(project_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = ResearchLibraryService(get_default_store()).use_requirements(
+            library_asset_id=str(payload.get("library_asset_id") or ""),
+            project_id=project_id,
+        )
+        return jsonify({"ok": True, "data": result})
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/projects/<project_id>/requirements/ref")
+@debug_timing("research_requirements_ref_get")
+def research_requirements_ref_get(project_id: str):
+    try:
+        if ResearchControlPlane(get_default_store()).get_project(project_id) is None:
+            return jsonify({"ok": False, "error": "Research not found"}), 404
+        result = ResearchLibraryService(get_default_store()).get_requirement_ref(project_id)
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/factor-drafts")
+@debug_timing("research_factor_drafts")
+def research_factor_drafts():
+    try:
+        data = FactorDraftService(get_default_store()).list(
+            owner_project_id=request.args.get("owner_project_id", ""),
+            state=request.args.get("state", ""),
+            limit=int(request.args.get("limit") or 200),
+        )
+        return jsonify({"ok": True, "data": [item.to_dict() for item in data]})
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/factor-drafts")
+@require_local_request
+@debug_timing("research_factor_draft_create")
+def research_factor_draft_create():
+    try:
+        payload = request.get_json(silent=True) or {}
+        service = FactorDraftService(get_default_store())
+        draft = service.create(
+            dict(payload.get("document") or {}),
+            created_by="local_ui_user",
+            owner_project_id=str(payload.get("owner_project_id") or ""),
+            library_scope=str(payload.get("library_scope") or "GLOBAL"),
+        )
+        return jsonify({
+            "ok": True,
+            "data": {
+                **draft.to_dict(),
+                "validation": service.inspect(draft.draft_id),
+            },
+        }), 201
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/factor-drafts/validation")
+@require_local_request
+@debug_timing("research_factor_draft_validation_preview")
+def research_factor_draft_validation_preview():
+    try:
+        payload = request.get_json(silent=True) or {}
+        service = FactorDraftService(get_default_store())
+        return jsonify({
+            "ok": True,
+            "data": service.inspect_project_document(
+                dict(payload.get("document") or {}),
+                str(payload.get("owner_project_id") or ""),
+            ),
+        })
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.put("/api/research/factor-drafts/<draft_id>")
+@require_local_request
+@debug_timing("research_factor_draft_update")
+def research_factor_draft_update(draft_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        service = FactorDraftService(get_default_store())
+        draft = service.update(
+            draft_id,
+            dict(payload.get("document") or {}),
+            expected_fingerprint=str(payload.get("expected_fingerprint") or ""),
+        )
+        return jsonify({
+            "ok": True,
+            "data": {
+                **draft.to_dict(),
+                "validation": service.inspect(draft.draft_id),
+            },
+        })
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.delete("/api/research/factor-drafts/<draft_id>")
+@require_local_request
+@debug_timing("research_factor_draft_discard")
+def research_factor_draft_discard(draft_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        discarded = FactorDraftService(get_default_store()).discard(
+            draft_id,
+            expected_fingerprint=str(payload.get("expected_fingerprint") or ""),
+        )
+        return jsonify({
+            "ok": True,
+            "data": {
+                "draft_id": discarded.draft_id,
+                "state": discarded.state,
+                "discarded": True,
+            },
+        })
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/factor-drafts/<draft_id>/validation")
+@debug_timing("research_factor_draft_validation")
+def research_factor_draft_validation(draft_id: str):
+    try:
+        return jsonify({
+            "ok": True,
+            "data": FactorDraftService(get_default_store()).inspect(draft_id),
+        })
+    except ValueError as exc:
+        return _json_error(exc, 404)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/factor-drafts/<draft_id>/preview-context")
+@debug_timing("research_factor_preview_context")
+def research_factor_preview_context(draft_id: str):
+    try:
+        return jsonify({
+            "ok": True,
+            "data": FactorPreviewService(get_default_store()).context(draft_id),
+        })
+    except FactorPreviewError as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "diagnostics": exc.diagnostics,
+        }), 400
+    except ValueError as exc:
+        return _json_error(exc, 404 if "not found" in str(exc).lower() else 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/factor-drafts/<draft_id>/requirements")
+@require_local_request
+@debug_timing("research_factor_preview_requirements")
+def research_factor_preview_requirements(draft_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        store = get_default_store()
+        result = FactorPreviewService(store).compile_requirements(
+            draft_id,
+            payload,
+        )
+        project_id = str(result["reference"]["project_id"])
+        result["data_status"] = RequirementWorkspaceService(store).data_status(
+            project_id,
+            str(result["reference"]["requirement_set_id"]),
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except FactorPreviewError as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "diagnostics": exc.diagnostics,
+        }), 400
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/factor-drafts/<draft_id>/previews")
+@require_local_request
+@debug_timing("research_factor_preview_create")
+def research_factor_preview_create(draft_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = FactorPreviewService(get_default_store()).create(
+            draft_id,
+            dict(payload),
+            created_by="local_ui_user",
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except FactorPreviewError as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "diagnostics": exc.diagnostics,
+        }), 400
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/factor-drafts/<draft_id>/previews/latest")
+@debug_timing("research_factor_preview_latest")
+def research_factor_preview_latest(draft_id: str):
+    try:
+        return jsonify({
+            "ok": True,
+            "data": FactorPreviewService(get_default_store()).latest(draft_id),
+        })
+    except ValueError as exc:
+        return _json_error(exc, 404)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/factor-previews/<preview_id>")
+@debug_timing("research_factor_preview_get")
+def research_factor_preview_get(preview_id: str):
+    try:
+        result = FactorPreviewService(get_default_store()).get(preview_id)
+        if result is None:
+            return jsonify({"ok": False, "error": "factor preview not found"}), 404
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/factor-drafts/<draft_id>/validate")
+@require_local_request
+@debug_timing("research_factor_draft_validate")
+def research_factor_draft_validate(draft_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        store = get_default_store()
+        draft, definition = FactorDraftService(store).validate(
+            draft_id,
+            expected_fingerprint=str(payload.get("expected_fingerprint") or ""),
+            preview_id=str(payload.get("preview_id") or ""),
+            preview_fingerprint=str(payload.get("preview_fingerprint") or ""),
+        )
+        library_asset = None
+        project_reference = None
+        if draft.owner_project_id and definition.library_scope == "PROJECT":
+            library_asset = ResearchLibraryService(store).publish_definition(
+                definition_id=definition.definition_id,
+                project_id=draft.owner_project_id,
+            )
+            project_reference = DefinitionRegistry(store).set_project_ref(
+                project_id=draft.owner_project_id,
+                slot_key=f"factor:{definition.name}",
+                definition_id=definition.definition_id,
+                definition_version=definition.version,
+                reference_mode="PINNED",
+            )
+            effective_requirements = RequirementWorkspaceService(
+                store
+            ).refresh_effective_requirements(draft.owner_project_id)
+        else:
+            effective_requirements = None
+        return jsonify({
+            "ok": True,
+            "data": {
+                "draft": draft.to_dict(),
+                "definition": definition.to_dict(),
+                "library_asset": library_asset,
+                "project_reference": project_reference,
+                "effective_requirements": effective_requirements,
+            },
+        })
+    except FactorDraftValidationError as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "diagnostics": exc.diagnostics,
+        }), 400
+    except FactorPreviewError as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "diagnostics": exc.diagnostics,
+        }), 400
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/projects/<project_id>/alpha-factor-candidates")
+@debug_timing("research_alpha_factor_candidates")
+def research_alpha_factor_candidates(project_id: str):
+    try:
+        return jsonify({
+            "ok": True,
+            "data": AlphaFactorCandidateResolver(
+                get_default_store()
+            ).resolve(project_id),
+        })
+    except ValueError as exc:
+        return _json_error(
+            exc,
+            404 if "not found" in str(exc).lower() else 400,
+        )
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/alpha-drafts")
+@debug_timing("research_alpha_drafts")
+def research_alpha_drafts():
+    try:
+        data = AlphaDraftService(get_default_store()).list(
+            owner_project_id=request.args.get("owner_project_id", ""),
+            state=request.args.get("state", ""),
+            limit=int(request.args.get("limit") or 200),
+        )
+        return jsonify({
+            "ok": True,
+            "data": [item.to_dict() for item in data],
+        })
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/alpha-drafts")
+@require_local_request
+@debug_timing("research_alpha_draft_create")
+def research_alpha_draft_create():
+    try:
+        payload = request.get_json(silent=True) or {}
+        service = AlphaDraftService(get_default_store())
+        draft = service.create(
+            dict(payload.get("document") or {}),
+            owner_project_id=str(payload.get("owner_project_id") or ""),
+            library_scope=str(payload.get("library_scope") or "PROJECT"),
+            client_draft_key=str(payload.get("client_draft_key") or ""),
+            created_by="local_ui_user",
+        )
+        return jsonify({
+            "ok": True,
+            "data": {
+                **draft.to_dict(),
+                "validation": service.inspect(draft.draft_id),
+            },
+        }), 201
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/alpha-drafts/validation")
+@require_local_request
+@debug_timing("research_alpha_draft_validation_preview")
+def research_alpha_draft_validation_preview():
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify({
+            "ok": True,
+            "data": AlphaDraftService(
+                get_default_store()
+            ).inspect_project_document(
+                dict(payload.get("document") or {}),
+                str(payload.get("owner_project_id") or ""),
+            ),
+        })
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.put("/api/research/alpha-drafts/<draft_id>")
+@require_local_request
+@debug_timing("research_alpha_draft_update")
+def research_alpha_draft_update(draft_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        service = AlphaDraftService(get_default_store())
+        draft = service.update(
+            draft_id,
+            dict(payload.get("document") or {}),
+            expected_fingerprint=str(
+                payload.get("expected_fingerprint") or ""
+            ),
+        )
+        return jsonify({
+            "ok": True,
+            "data": {
+                **draft.to_dict(),
+                "validation": service.inspect(draft.draft_id),
+            },
+        })
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.delete("/api/research/alpha-drafts/<draft_id>")
+@require_local_request
+@debug_timing("research_alpha_draft_discard")
+def research_alpha_draft_discard(draft_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        draft = AlphaDraftService(get_default_store()).discard(
+            draft_id,
+            expected_fingerprint=str(
+                payload.get("expected_fingerprint") or ""
+            ),
+        )
+        return jsonify({
+            "ok": True,
+            "data": {
+                "draft_id": draft.draft_id,
+                "state": draft.state,
+                "discarded": True,
+            },
+        })
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/alpha-drafts/<draft_id>/validation")
+@debug_timing("research_alpha_draft_validation")
+def research_alpha_draft_validation(draft_id: str):
+    try:
+        return jsonify({
+            "ok": True,
+            "data": AlphaDraftService(
+                get_default_store()
+            ).inspect(draft_id),
+        })
+    except ValueError as exc:
+        return _json_error(
+            exc,
+            404 if "not found" in str(exc).lower() else 400,
+        )
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/alpha-drafts/<draft_id>/preview-context")
+@debug_timing("research_alpha_preview_context")
+def research_alpha_preview_context(draft_id: str):
+    try:
+        return jsonify({
+            "ok": True,
+            "data": AlphaPreviewService(
+                get_default_store()
+            ).context(draft_id),
+        })
+    except AlphaPreviewError as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "diagnostics": exc.diagnostics,
+        }), 400
+    except ValueError as exc:
+        return _json_error(
+            exc,
+            404 if "not found" in str(exc).lower() else 400,
+        )
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/alpha-drafts/<draft_id>/requirements")
+@require_local_request
+@debug_timing("research_alpha_preview_requirements")
+def research_alpha_preview_requirements(draft_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        store = get_default_store()
+        result = AlphaPreviewService(store).compile_requirements(
+            draft_id,
+            payload,
+        )
+        result["data_status"] = RequirementWorkspaceService(
+            store
+        ).data_status(
+            str(result["reference"]["project_id"]),
+            str(result["reference"]["requirement_set_id"]),
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except AlphaPreviewError as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "diagnostics": exc.diagnostics,
+        }), 400
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/alpha-drafts/<draft_id>/previews")
+@require_local_request
+@debug_timing("research_alpha_preview_create")
+def research_alpha_preview_create(draft_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = AlphaPreviewService(get_default_store()).create(
+            draft_id,
+            dict(payload),
+            created_by="local_ui_user",
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except AlphaPreviewError as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "diagnostics": exc.diagnostics,
+        }), 400
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/alpha-drafts/<draft_id>/previews/latest")
+@debug_timing("research_alpha_preview_latest")
+def research_alpha_preview_latest(draft_id: str):
+    try:
+        return jsonify({
+            "ok": True,
+            "data": AlphaPreviewService(
+                get_default_store()
+            ).latest(draft_id),
+        })
+    except ValueError as exc:
+        return _json_error(exc, 404)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/alpha-previews/<preview_id>")
+@debug_timing("research_alpha_preview_get")
+def research_alpha_preview_get(preview_id: str):
+    try:
+        result = AlphaPreviewService(
+            get_default_store()
+        ).get(preview_id)
+        if result is None:
+            return jsonify({
+                "ok": False,
+                "error": "alpha preview not found",
+            }), 404
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/alpha-drafts/<draft_id>/validate")
+@require_local_request
+@debug_timing("research_alpha_draft_validate")
+def research_alpha_draft_validate(draft_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        store = get_default_store()
+        draft, definition = AlphaDraftService(store).validate(
+            draft_id,
+            expected_fingerprint=str(
+                payload.get("expected_fingerprint") or ""
+            ),
+            preview_id=str(payload.get("preview_id") or ""),
+            preview_fingerprint=str(
+                payload.get("preview_fingerprint") or ""
+            ),
+        )
+        library_asset = ResearchLibraryService(
+            store
+        ).publish_definition(
+            definition_id=definition.definition_id,
+            project_id=draft.owner_project_id,
+        )
+        project_reference = DefinitionRegistry(
+            store
+        ).set_project_ref(
+            project_id=draft.owner_project_id,
+            slot_key=f"alpha:{definition.name}",
+            definition_id=definition.definition_id,
+            definition_version=definition.version,
+            reference_mode="PINNED",
+            library_asset_id=library_asset["library_asset_id"],
+        )
+        effective_requirements = RequirementWorkspaceService(
+            store
+        ).refresh_effective_requirements(draft.owner_project_id)
+        return jsonify({
+            "ok": True,
+            "data": {
+                "draft": draft.to_dict(),
+                "definition": definition.to_dict(),
+                "library_asset": library_asset,
+                "project_reference": project_reference,
+                "effective_requirements": effective_requirements,
+            },
+        })
+    except AlphaDraftValidationError as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "diagnostics": exc.diagnostics,
+        }), 400
+    except AlphaPreviewError as exc:
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+            "diagnostics": exc.diagnostics,
+        }), 400
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/definitions")
+@require_local_request
+@debug_timing("research_definition_create")
+def research_definition_create():
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = DefinitionRegistry(get_default_store()).create(
+            str(payload.get("definition_type") or ""),
+            dict(payload.get("spec") or {}),
+            state=str(payload.get("state") or "DRAFT"),
+            created_by="local_ui_user",
+            owner_project_id=str(payload.get("owner_project_id") or ""),
+            library_scope=str(payload.get("library_scope") or "GLOBAL"),
+        )
+        return jsonify({"ok": True, "data": result.to_dict()}), 201
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/definitions/<definition_id>/validate")
+@require_local_request
+@debug_timing("research_definition_validate")
+def research_definition_validate(definition_id: str):
+    try:
+        result = DefinitionRegistry(get_default_store()).validate(definition_id)
+        return jsonify({"ok": True, "data": result.to_dict()})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/definitions/<definition_id>/publish")
+@require_local_request
+@debug_timing("research_definition_publish")
+def research_definition_publish(definition_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = ResearchLibraryService(get_default_store()).publish_definition(
+            definition_id=definition_id,
+            project_id=str(payload.get("project_id") or ""),
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/projects/<project_id>/factors/sync-library")
+@require_local_request
+@debug_timing("research_project_factors_sync_library")
+def research_project_factors_sync_library(project_id: str):
+    try:
+        assets = ResearchLibraryService(get_default_store()).ensure_project_factors(
+            project_id=project_id,
+        )
+        return jsonify({"ok": True, "data": assets})
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/definitions/<definition_id>/impact")
+@debug_timing("research_definition_impact")
+def research_definition_impact(definition_id: str):
+    try:
+        return jsonify({"ok": True, "data": DefinitionRegistry(get_default_store()).impact(definition_id)})
+    except ValueError as exc:
+        return _json_error(exc, 404)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/projects/<project_id>/definition-refs")
+@debug_timing("research_project_definition_refs")
+def research_project_definition_refs(project_id: str):
+    try:
+        return jsonify({
+            "ok": True,
+            "data": DefinitionRegistry(get_default_store()).list_project_refs(project_id),
+        })
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.put("/api/research/projects/<project_id>/definition-refs/<slot_key>")
+@require_local_request
+@debug_timing("research_project_definition_ref_set")
+def research_project_definition_ref_set(project_id: str, slot_key: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        store = get_default_store()
+        result = DefinitionRegistry(store).set_project_ref(
+            project_id=project_id,
+            slot_key=slot_key,
+            definition_id=str(payload.get("definition_id") or ""),
+            definition_version=str(payload.get("definition_version") or ""),
+            reference_mode=str(payload.get("reference_mode") or "PINNED"),
+            library_asset_id=str(payload.get("library_asset_id") or ""),
+        )
+        effective = RequirementWorkspaceService(
+            store
+        ).refresh_effective_requirements(project_id)
+        return jsonify({
+            "ok": True,
+            "data": result,
+            "effective_requirements": effective,
+        })
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.delete("/api/research/projects/<project_id>/definition-refs/<slot_key>")
+@require_local_request
+@debug_timing("research_project_definition_ref_remove")
+def research_project_definition_ref_remove(project_id: str, slot_key: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        store = get_default_store()
+        result = DefinitionRegistry(store).remove_project_ref(
+            project_id=project_id,
+            slot_key=slot_key,
+            expected_definition_id=str(payload.get("expected_definition_id") or ""),
+        )
+        effective = RequirementWorkspaceService(
+            store
+        ).refresh_effective_requirements(project_id)
+        return jsonify({
+            "ok": True,
+            "data": result,
+            "effective_requirements": effective,
+        })
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/manifest-resolver/resolve")
+@require_local_request
+@debug_timing("research_manifest_resolve")
+def research_manifest_resolve():
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = DeterministicManifestResolver(get_default_store()).resolve(
+            str(payload.get("requirement_set_id") or ""),
+            source_selection_policy=payload.get("source_selection_policy") or {},
+            verify_physical=bool(payload.get("verify_physical", True)),
+        )
+        return jsonify({"ok": True, "data": result.to_dict()})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/run-input-previews")
+@debug_timing("research_run_previews")
+def research_run_previews():
+    try:
+        data = ResearchRunPreviewService(get_default_store()).list(
+            project_id=request.args.get("project_id", ""),
+            limit=int(request.args.get("limit") or 100),
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/projects/<project_id>/run-input-previews")
+@require_local_request
+@debug_timing("research_run_preview_create")
+def research_run_preview_create(project_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = ResearchRunPreviewService(get_default_store()).create(
+            project_id, payload, created_by="local_ui_user"
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/run-input-previews/<preview_id>")
+@debug_timing("research_run_preview")
+def research_run_preview(preview_id: str):
+    try:
+        result = ResearchRunPreviewService(get_default_store()).get(preview_id)
+        if result is None:
+            return jsonify({"ok": False, "code": "PREVIEW_NOT_FOUND", "error": "Preview not found"}), 404
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/runs")
+@debug_timing("research_runs_v2")
+def research_runs_v2():
+    try:
+        data = ResearchRunService(get_default_store()).list(
+            project_id=request.args.get("project_id", ""),
+            run_type=request.args.get("run_type", ""),
+            status=request.args.get("status", ""),
+            limit=int(request.args.get("limit") or 200),
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/runs")
+@require_local_request
+@debug_timing("research_run_create_v2")
+def research_run_create_v2():
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = ResearchRunService(get_default_store()).create(
+            preview_id=str(payload.get("preview_id") or ""),
+            preview_fingerprint=str(payload.get("preview_fingerprint") or ""),
+            idempotency_key=str(payload.get("idempotency_key") or ""),
+            actor_id="local_ui_user",
+            actor_type="HUMAN",
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except IdempotencyConflictError as exc:
+        return jsonify({"ok": False, "code": exc.code, "error": str(exc)}), 409
+    except PreviewStaleError as exc:
+        return jsonify({"ok": False, "code": exc.code, "error": str(exc)}), 409
+    except ReadinessBlockedError as exc:
+        return jsonify({"ok": False, "code": exc.code, "error": str(exc)}), 422
+    except PermissionError as exc:
+        code = str(exc).split(":", 1)[0]
+        return jsonify({"ok": False, "code": code, "error": str(exc)}), 403
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/runs/<run_id>")
+@debug_timing("research_run_v2")
+def research_run_v2(run_id: str):
+    try:
+        result = ResearchRunService(get_default_store()).get(run_id)
+        if result is None:
+            return jsonify({"ok": False, "error": "Research Run not found"}), 404
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/runs/<run_id>/result-summary")
+@debug_timing("research_run_result_summary")
+def research_run_result_summary(run_id: str):
+    """Return a readable result summary without mutating immutable Run output."""
+    try:
+        store = get_default_store()
+        result = ResearchRunService(store).get(run_id)
+        if result is None:
+            return jsonify({"ok": False, "error": "Research Run not found"}), 404
+
+        produced_artifact_ids = {
+            str(artifact_id)
+            for key, values in (result.get("output") or {}).items()
+            if key.startswith("produced_") and key.endswith("_artifact_ids")
+            for artifact_id in (values or [])
+            if str(artifact_id or "")
+        }
+        artifacts = [
+            artifact
+            for artifact in ArtifactService(store).list(limit=1000)
+            if artifact.created_by_run_id == run_id
+            or artifact.artifact_id in produced_artifact_ids
+        ]
+        artifact_items = [
+            {
+                "artifact_id": artifact.artifact_id,
+                "artifact_type": artifact.artifact_type,
+                "logical_name": artifact.logical_name,
+                "version": artifact.version,
+                "status": artifact.status,
+                "schema_version": artifact.schema_version,
+                "engine_version": artifact.engine_version,
+                "row_count": int(artifact.metadata.get("row_count") or 0),
+                "metadata": artifact.metadata,
+            }
+            for artifact in artifacts
+        ]
+        factor_signals = []
+        base_dir = BASE_DIR.resolve()
+        for artifact in artifacts:
+            if artifact.artifact_type != "FACTOR_VALUES":
+                continue
+            path = Path(artifact.content_uri)
+            if not path.is_absolute():
+                path = BASE_DIR / path
+            path = path.resolve()
+            try:
+                path.relative_to(base_dir)
+            except ValueError:
+                factor_signals.append({
+                    "artifact_id": artifact.artifact_id,
+                    "factor_name": artifact.logical_name,
+                    "error": "Artifact content is outside the DataTube runtime root",
+                })
+                continue
+            try:
+                import pyarrow.parquet as pq
+
+                parquet = pq.ParquetFile(path)
+                available = set(parquet.schema.names)
+                columns = [
+                    name for name in ("event_time", "available_time", "value")
+                    if name in available
+                ]
+                rows = parquet.read(columns=columns).to_pylist()
+                positive = negative = zero = missing = 0
+                events = []
+                for row in rows:
+                    value = row.get("value")
+                    if value is None:
+                        missing += 1
+                        continue
+                    number = float(value)
+                    if number > 0:
+                        positive += 1
+                    elif number < 0:
+                        negative += 1
+                    else:
+                        zero += 1
+                    if number:
+                        events.append({
+                            "event_time": row.get("event_time"),
+                            "available_time": row.get("available_time"),
+                            "signal": "GOLDEN_CROSS" if number > 0 else "DEATH_CROSS",
+                            "value": number,
+                        })
+                factor_signals.append({
+                    "artifact_id": artifact.artifact_id,
+                    "factor_name": artifact.logical_name,
+                    "operator": str(artifact.metadata.get("operator") or ""),
+                    "total_rows": len(rows),
+                    "positive_count": positive,
+                    "negative_count": negative,
+                    "zero_count": zero,
+                    "missing_count": missing,
+                    "event_count": positive + negative,
+                    "latest_events": events[-12:],
+                })
+            except Exception as exc:
+                factor_signals.append({
+                    "artifact_id": artifact.artifact_id,
+                    "factor_name": artifact.logical_name,
+                    "error": str(exc),
+                })
+
+        output = dict(result.get("output") or {})
+        bundle = ResearchRunService(store).get_bundle(str(result.get("bundle_id") or ""))
+        frozen = dict((bundle or {}).get("canonical_payload") or {})
+        closure = dict(frozen.get("input_closure") or {})
+        execution_specs = dict(frozen.get("execution_specs") or {})
+        registry = DefinitionRegistry(store)
+        factor_definitions = []
+        for ref in closure.get("factor_definitions") or []:
+            definition = registry.get(
+                str(ref.get("factor_definition_id") or ""),
+                version=str(ref.get("version") or ""),
+            )
+            factor_definitions.append(definition.to_dict() if definition else dict(ref))
+        alpha_definitions = []
+        for ref in closure.get("alpha_definitions") or []:
+            definition = registry.get(
+                str(ref.get("alpha_definition_id") or ""),
+                version=str(ref.get("version") or ""),
+            )
+            alpha_definitions.append(definition.to_dict() if definition else dict(ref))
+        snapshot = UniverseService(store).get_snapshot(str(closure.get("universe_snapshot_id") or ""))
+        universe = asdict(snapshot) if snapshot else {
+            "universe_snapshot_id": closure.get("universe_snapshot_id"),
+            "instrument_ids": closure.get("resolved_instrument_ids") or [],
+        }
+        product_run_type = {
+            "FACTOR_EVALUATION": "FACTOR_RUN",
+            "ALPHA_EVALUATION": "ALPHA_RUN",
+            "RESEARCH_BACKTEST": "RESEARCH_BACKTEST",
+        }.get(str(result.get("run_type") or ""), str(result.get("run_type") or ""))
+        artifact_ids_by_type: dict[str, list[str]] = {}
+        for item in artifact_items:
+            artifact_ids_by_type.setdefault(item["artifact_type"], []).append(item["artifact_id"])
+        factor_run = (
+            FactorRunResultService(store).build(result)
+            if product_run_type == "FACTOR_RUN"
+            else None
+        )
+        alpha_run = (
+            AlphaRunResultService(store).build(result)
+            if product_run_type == "ALPHA_RUN"
+            else None
+        )
+        research_backtest = (
+            ResearchBacktestResultService(store).build(result)
+            if product_run_type == "RESEARCH_BACKTEST"
+            else None
+        )
+        legacy_hybrid = bool((alpha_run or {}).get("legacy_hybrid"))
+        if product_run_type == "FACTOR_RUN":
+            section_specs = (
+                ("overview", "Overview", []),
+                ("factor_definition", "Factor Definition", []),
+                ("universe", "Universe", []),
+                ("data_inputs", "Data Inputs", []),
+                ("factor_output", "Factor Output", ["FACTOR_VALUES"]),
+                ("coverage", "Coverage", ["FACTOR_EVALUATION"]),
+                ("distribution", "Distribution", ["FACTOR_EVALUATION"]),
+                ("ic_rank_ic", "IC / Rank IC", ["FACTOR_EVALUATION"]),
+                ("quantile_return", "Quantile Return", ["FACTOR_EVALUATION"]),
+                ("diagnostics", "Diagnostics", ["FACTOR_EVALUATION"]),
+                ("logs", "Logs", []),
+            )
+        elif product_run_type == "ALPHA_RUN" and not legacy_hybrid:
+            section_specs = (
+                ("overview", "Overview", []),
+                ("alpha_definition", "Alpha Definition", []),
+                ("factor_inputs", "Factor Inputs", []),
+                ("universe", "Universe", []),
+                ("signal_rules", "Signal Rules", []),
+                ("signals", "Signals", ["ALPHA_VALUES"]),
+                ("ic_accuracy", "IC & Accuracy", ["ALPHA_EVALUATION"]),
+                ("decay", "Decay", ["ALPHA_EVALUATION"]),
+                ("turnover", "Turnover", ["ALPHA_EVALUATION"]),
+                ("regime_analysis", "Regime Analysis", ["ALPHA_EVALUATION"]),
+                ("diagnostics", "Diagnostics", ["ALPHA_EVALUATION"]),
+                ("logs", "Logs", []),
+            )
+        elif product_run_type == "ALPHA_RUN" and legacy_hybrid:
+            section_specs = (
+                ("overview", "Overview", []),
+                ("alpha_definition", "Alpha Definition", []),
+                ("factor_inputs", "Factor Inputs", []),
+                ("universe", "Universe", []),
+                ("signal_rules", "Signal Rules", []),
+                ("portfolio_rules", "Portfolio Rules", []),
+                ("execution_assumptions", "Execution Assumptions", []),
+                ("signals", "Signals", ["ALPHA_VALUES"]),
+                ("positions", "Positions", ["POSITION_SERIES"]),
+                ("trades", "Trades", ["BACKTEST_ORDERS"]),
+                ("equity_curve", "Equity Curve", ["EQUITY_SERIES"]),
+                ("performance_metrics", "Performance Metrics", ["BACKTEST_RESULT"]),
+                ("drawdown", "Drawdown", ["DRAWDOWN_SERIES"]),
+                ("diagnostics", "Diagnostics", ["ALPHA_EVALUATION"]),
+                ("logs", "Logs", []),
+            )
+        elif product_run_type == "RESEARCH_BACKTEST":
+            section_specs = (
+                ("overview", "Overview", []),
+                ("alpha_definition", "Alpha Lineage", []),
+                ("factor_inputs", "Factor Inputs", []),
+                ("universe", "Universe", []),
+                ("portfolio_rules", "Portfolio Rules", []),
+                ("execution_assumptions", "Execution Assumptions", []),
+                ("benchmark", "Benchmark", []),
+                ("signals", "Signals", ["ALPHA_VALUES"]),
+                ("portfolio_targets", "Portfolio Targets", ["PORTFOLIO_TARGETS"]),
+                ("positions", "Positions", ["POSITION_SERIES"]),
+                ("trades", "Trades", ["BACKTEST_ORDERS"]),
+                ("equity_curve", "Equity Curve", ["EQUITY_SERIES"]),
+                ("performance_metrics", "Performance Metrics", ["BACKTEST_RESULT"]),
+                ("drawdown", "Drawdown", ["DRAWDOWN_SERIES"]),
+                ("diagnostics", "Diagnostics", []),
+                ("logs", "Logs", []),
+            )
+        else:
+            section_specs = (("overview", "Overview", []), ("logs", "Logs", []))
+        sections = [
+            {
+                "key": key,
+                "label": label,
+                "artifact_ids": [
+                    artifact_id
+                    for artifact_type in artifact_types
+                    for artifact_id in artifact_ids_by_type.get(artifact_type, [])
+                ],
+            }
+            for key, label, artifact_types in section_specs
+        ]
+        effective_product_run_type = (
+            "LEGACY_HYBRID_RUN" if legacy_hybrid else product_run_type
+        )
+        result_contract = factor_run or alpha_run or research_backtest or {}
+        default_schema_versions = {
+            "FACTOR_RUN": FACTOR_RUN_RESULT_SCHEMA_VERSION,
+            "ALPHA_RUN": ALPHA_RUN_RESULT_SCHEMA_VERSION,
+            "RESEARCH_BACKTEST": RESEARCH_BACKTEST_RESULT_SCHEMA_VERSION,
+        }
+        result_schema_version = str(
+            result_contract.get("schema_version")
+            or default_schema_versions.get(product_run_type, "research-run-result.v1")
+        )
+        return jsonify({
+            "ok": True,
+            "data": {
+                "run_id": result["run_id"],
+                "project_id": result["project_id"],
+                "run_type": result["run_type"],
+                "product_run_type": effective_product_run_type,
+                "result_schema_version": result_schema_version,
+                "status": result["status"],
+                "bundle_id": result.get("bundle_id"),
+                "started_at": result.get("started_at"),
+                "finished_at": result.get("finished_at"),
+                "metrics": output.get("metrics") or {},
+                "run_contract": {
+                    "factor_definitions": factor_definitions,
+                    "alpha_definitions": alpha_definitions,
+                    "factor_inputs": factor_definitions,
+                    "universe": universe,
+                    "data_inputs": frozen.get("manifest_descriptors") or [],
+                    "evaluation_spec": execution_specs.get("evaluation_spec") or {},
+                    "signal_rules": (alpha_definitions[0].get("spec") if alpha_definitions else {}) or {},
+                    "portfolio_rules": execution_specs.get("portfolio_spec") or {},
+                    "execution_assumptions": execution_specs.get("execution_spec") or {},
+                },
+                "sections": sections,
+                "logs": {
+                    "created_at": result.get("created_at"),
+                    "queued_at": result.get("queued_at"),
+                    "started_at": result.get("started_at"),
+                    "finished_at": result.get("finished_at"),
+                    "attempt_count": result.get("attempt_count"),
+                    "error": result.get("error") or {},
+                },
+                "factor_signals": factor_signals,
+                "factor_run": factor_run,
+                "alpha_run": alpha_run,
+                "research_backtest": research_backtest,
+                "artifacts": artifact_items,
+            },
+        })
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/runs/<run_id>/sections/<section_key>")
+@debug_timing("research_run_result_section")
+def research_run_result_section(run_id: str, section_key: str):
+    """Read one bounded, immutable Factor, Alpha, or Research Backtest section."""
+    try:
+        store = get_default_store()
+        run = ResearchRunService(store).get(run_id)
+        if run is None:
+            return jsonify({"ok": False, "error": "Research Run not found"}), 404
+        key = str(section_key or "").strip().lower()
+        if run["run_type"] == "FACTOR_EVALUATION" and key in FACTOR_RUN_STRUCTURED_SECTIONS:
+            data = FactorRunResultService(store).section(run, key)
+            offset = max(0, int(request.args.get("offset", 0)))
+            limit = max(1, min(int(request.args.get("limit", 200)), 500))
+            rows = list(data.get("rows") or [])
+            data["rows"] = rows[offset:offset + limit]
+            data["offset"] = offset
+            data["limit"] = limit
+            return jsonify({"ok": True, "data": data})
+        alpha_section = (
+            AlphaRunResultService(store).section(run, key)
+            if run["run_type"] == "ALPHA_EVALUATION" and key in ALPHA_RUN_STRUCTURED_SECTIONS
+            else None
+        )
+        research_backtest_section = (
+            ResearchBacktestResultService(store).section(run, key)
+            if run["run_type"] == "RESEARCH_BACKTEST" and key in RESEARCH_BACKTEST_STRUCTURED_SECTIONS
+            else None
+        )
+        artifact_type_by_section = {
+            "factor_output": "FACTOR_VALUES",
+            "factor_inputs": "FACTOR_VALUES",
+            "coverage": "FACTOR_EVALUATION",
+            "distribution": "FACTOR_EVALUATION",
+            "ic_rank_ic": "FACTOR_EVALUATION",
+            "quantile_return": "FACTOR_EVALUATION",
+            "signals": "ALPHA_VALUES",
+            "ic_accuracy": "ALPHA_EVALUATION",
+            "decay": "ALPHA_EVALUATION",
+            "turnover": "ALPHA_EVALUATION",
+            "regime_analysis": "ALPHA_EVALUATION",
+            "portfolio_targets": "PORTFOLIO_TARGETS",
+            "positions": "POSITION_SERIES",
+            "portfolio_rules": "PORTFOLIO_TARGETS",
+            "trades": "BACKTEST_ORDERS",
+            "equity_curve": "EQUITY_SERIES",
+            "performance_metrics": "BACKTEST_RESULT",
+            "drawdown": "DRAWDOWN_SERIES",
+            "diagnostics": (
+                "FACTOR_EVALUATION"
+                if run["run_type"] == "FACTOR_EVALUATION"
+                else "ALPHA_EVALUATION"
+            ),
+        }
+        if key == "logs":
+            return jsonify({"ok": True, "data": {
+                "section": key,
+                "rows": [{
+                    "status": run.get("status"),
+                    "created_at": run.get("created_at"),
+                    "queued_at": run.get("queued_at"),
+                    "started_at": run.get("started_at"),
+                    "finished_at": run.get("finished_at"),
+                    "attempt_count": run.get("attempt_count"),
+                    "error": run.get("error") or {},
+                }],
+                "total_rows": 1,
+            }})
+        artifact_type = artifact_type_by_section.get(key)
+        if not artifact_type:
+            return jsonify({"ok": False, "error": "Run section is inline or unsupported"}), 404
+        offset = max(0, int(request.args.get("offset", 0)))
+        limit = max(1, min(int(request.args.get("limit", 200)), 500))
+        produced_artifact_ids = {
+            str(artifact_id)
+            for key, values in (run.get("output") or {}).items()
+            if key.startswith("produced_") and key.endswith("_artifact_ids")
+            for artifact_id in (values or [])
+            if str(artifact_id or "")
+        }
+        artifacts = [
+            artifact
+            for artifact in ArtifactService(store).list(artifact_type=artifact_type, limit=1000)
+            if artifact.created_by_run_id == run_id
+            or artifact.artifact_id in produced_artifact_ids
+        ]
+        rows: list[dict[str, Any]] = []
+        base_dir = BASE_DIR.resolve()
+        for artifact in artifacts:
+            path = Path(artifact.content_uri)
+            if not path.is_absolute():
+                path = BASE_DIR / path
+            path = path.resolve()
+            try:
+                path.relative_to(base_dir)
+            except ValueError:
+                raise ValueError("Artifact content is outside the DataTube runtime root")
+            import pyarrow.parquet as pq
+
+            for row in pq.read_table(path).to_pylist():
+                item = dict(row)
+                if "payload_json" in item:
+                    item = json.loads(item["payload_json"] or "{}")
+                    record_type = str(row.get("record_type") or "")
+                    if key in {"coverage", "distribution", "diagnostics"} and record_type != "SUMMARY":
+                        continue
+                    if key == "ic_rank_ic" and record_type not in {"SUMMARY", "IC"}:
+                        continue
+                    if key == "quantile_return" and record_type not in {"SUMMARY", "GROUP_RETURN"}:
+                        continue
+                    item = {"record_type": record_type, **item}
+                else:
+                    for field, value in list(item.items()):
+                        if field.endswith("_json") and isinstance(value, str):
+                            try:
+                                item[field.removesuffix("_json")] = json.loads(value)
+                                item.pop(field)
+                            except json.JSONDecodeError:
+                                pass
+                item["_artifact_id"] = artifact.artifact_id
+                rows.append(item)
+        if key in {"coverage", "distribution", "diagnostics"}:
+            selected = []
+            for row in rows:
+                if key == "coverage":
+                    value = {
+                        "coverage": row.get("coverage"),
+                        "coverage_by_instrument": row.get("coverage_by_instrument"),
+                        "valid_rows": row.get("valid_rows"),
+                        "total_rows": row.get("total_rows"),
+                    }
+                elif key == "distribution":
+                    value = {
+                        "mean": row.get("mean"),
+                        "std": row.get("std"),
+                        "quantiles": row.get("quantiles"),
+                        "missing_rate": row.get("missing_rate"),
+                        "outlier_ratio_5sigma": row.get("outlier_ratio_5sigma"),
+                    }
+                else:
+                    value = row.get("diagnostics") or []
+                selected.append({
+                    "_artifact_id": row.get("_artifact_id"),
+                    key: value,
+                })
+            rows = selected
+        total_rows = len(rows)
+        data = {
+            "section": key,
+            "artifact_type": artifact_type,
+            "rows": rows[offset:offset + limit],
+            "total_rows": total_rows,
+            "offset": offset,
+            "limit": limit,
+        }
+        structured_section = alpha_section or research_backtest_section
+        if structured_section is not None:
+            data = {**structured_section, **data}
+            if key in {"equity_curve", "drawdown"}:
+                if len(rows) <= 300:
+                    data["series"] = rows
+                else:
+                    last_index = len(rows) - 1
+                    sample_indexes = sorted({
+                        round(index * last_index / 299)
+                        for index in range(300)
+                    })
+                    data["series"] = [rows[index] for index in sample_indexes]
+        return jsonify({"ok": True, "data": data})
+    except (TypeError, ValueError) as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/frozen-bundles/<bundle_id>")
+@debug_timing("research_frozen_bundle")
+def research_frozen_bundle(bundle_id: str):
+    try:
+        result = ResearchRunService(get_default_store()).get_bundle(
+            bundle_id, check_current_authorization=request.args.get("check_current_authorization", "0") == "1"
+        )
+        if result is None:
+            return jsonify({"ok": False, "error": "Frozen Bundle not found"}), 404
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/frozen-bundles/<bundle_id>/verify")
+@require_local_request
+@debug_timing("research_frozen_bundle_verify")
+def research_frozen_bundle_verify(bundle_id: str):
+    try:
+        return jsonify({"ok": True, "data": ResearchRunService(get_default_store()).verify_bundle(bundle_id)})
+    except ValueError as exc:
+        return _json_error(exc, 422)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/run-worker/claim")
+@require_local_request
+@debug_timing("research_run_worker_claim")
+def research_run_worker_claim():
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = ResearchRunWorker(
+            get_default_store(), worker_id=str(payload.get("worker_id") or "formal-research-worker")
+        ).claim(lease_seconds=int(payload.get("lease_seconds") or 300))
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/run-worker/run-once")
+@require_local_request
+@debug_timing("research_run_worker_once")
+def research_run_worker_once():
+    try:
+        payload = request.get_json(silent=True) or {}
+        result = ResearchRunWorker(
+            get_default_store(), worker_id=str(payload.get("worker_id") or "formal-research-worker")
+        ).run_once(lease_seconds=int(payload.get("lease_seconds") or 300))
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _json_error(exc)
+
+
 @app.get("/api/system/latency")
 @debug_timing("system_latency")
 def system_latency():
@@ -369,6 +3700,21 @@ def system_latency():
                 external.append(future.result())
         external.sort(key=lambda item: item.get("key", ""))
 
+        openbb_health = OpenBBProviderService(settings).health()
+        external.append({
+            "key": "openbb",
+            "label": "OpenBB Data Provider",
+            "url": openbb_health.get("base_url"),
+            "group": "finance",
+            "ok": bool(openbb_health.get("ok")),
+            "status": "good" if openbb_health.get("ok") else ("disabled" if not openbb_health.get("enabled") else "error"),
+            "latency_ms": openbb_health.get("latency_ms"),
+            "http_status": openbb_health.get("http_status"),
+            "error": openbb_health.get("error"),
+            "enabled": openbb_health.get("enabled"),
+        })
+        external.sort(key=lambda item: item.get("key", ""))
+
         sqlite_items = [_check_sqlite_latency(key, label, path) for key, label, path in sqlite_targets]
         groups = {
             "polymarket": _group_latency_status([item for item in external if item.get("group") == "polymarket"]),
@@ -396,7 +3742,7 @@ def system_latency():
 @require_local_request
 def get_settings():
     try:
-        return jsonify({"ok": True, "data": load_web_settings_for_ui()})
+        return jsonify({"ok": True, "data": load_public_web_settings()})
     except Exception as exc:
         return _json_error(exc)
 
@@ -407,7 +3753,7 @@ def update_settings():
     try:
         payload = request.get_json(silent=True) or {}
         save_web_settings(payload)
-        return jsonify({"ok": True, "data": load_web_settings_for_ui()})
+        return jsonify({"ok": True, "data": load_public_web_settings()})
     except Exception as exc:
         return _json_error(exc)
 
@@ -571,6 +3917,81 @@ def event_graph_observations_api():
         return jsonify({"ok": True, "data": list_news_observations(event_id=event_id, q=query, limit=limit)})
     except Exception as exc:
         return _json_error(exc)
+
+
+@app.get("/api/research/data/providers/openbb")
+def openbb_provider_capabilities():
+    try:
+        return jsonify({"ok": True, "data": OpenBBProviderService(load_web_settings()).capabilities()})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/data/providers/openbb/worker-status")
+def openbb_worker_status():
+    try:
+        settings = load_web_settings()
+        executor = OpenBBResearchTaskExecutor(get_default_store(), settings)
+        worker = OpenBBResearchWorker(executor, "status-reader")
+        return jsonify({
+            "ok": True,
+            "data": {
+                "provider": OpenBBProviderService(settings).health(),
+                "worker": worker.status(),
+            },
+        })
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/data/providers/openbb/worker/start")
+@require_local_request
+@debug_timing("research_openbb_worker_start")
+def openbb_worker_start():
+    try:
+        started = _start_openbb_export_worker()
+        return jsonify({"ok": True, "data": {"started": started, "running": True}}), 202
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/data/source-policy/resolve")
+@require_local_request
+def research_source_policy_resolve():
+    try:
+        payload = request.get_json(silent=True) or {}
+        policy = SourcePolicy.from_dict(payload)
+        service = SourcePolicyService(get_default_store())
+        data = service.fixed(policy) if policy.mode == "FIXED" else service.compare(
+            policy, price_tolerance_bps=float(payload.get("price_tolerance_bps") or 1.0)
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _json_error(exc, 400 if isinstance(exc, ValueError) else 500)
+
+
+@app.post("/api/research/data/providers/openbb/equity/historical")
+@require_local_request
+def openbb_equity_historical():
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify({"ok": True, "data": OpenBBProviderService(load_web_settings()).fetch_equity_historical(payload)})
+    except Exception as exc:
+        return _json_error(exc, 400 if isinstance(exc, ValueError) else 502)
+
+
+@app.get("/api/research/data/providers/openbb/fred/series")
+@require_local_request
+def openbb_fred_series():
+    try:
+        return jsonify({
+            "ok": True,
+            "data": OpenBBProviderService(load_web_settings()).fetch_fred_series(dict(request.args)),
+        })
+    except Exception as exc:
+        return _json_error(exc, 400 if isinstance(exc, ValueError) else 502)
+
+
 
 
 @app.post("/api/event-graph/news/deduplicate")
@@ -1075,7 +4496,8 @@ def ledger_snapshot():
 @debug_timing("agent_capabilities")
 def agent_capabilities():
     try:
-        return jsonify({"ok": True, "data": agent_service.get_capabilities()})
+        section = str(request.args.get("section", "")).strip()
+        return jsonify({"ok": True, "data": agent_service.get_capabilities(section=section)})
     except Exception as exc:
         return _json_error(exc)
 
@@ -1099,6 +4521,1014 @@ def _agent_body_payload(default_type: str = "agent", default_id: str = "agent_st
     payload.setdefault("_endpoint", request.path)
     payload.setdefault("_method", request.method)
     return payload
+
+
+def _agent_research_authorize(
+    payload: dict,
+    project_id: str,
+    operation: str,
+    capability: str,
+    **scope: object,
+):
+    actor_type = str(payload.get("actor_type") or "agent").strip().lower()
+    actor_id = str(payload.get("actor_id") or "agent_strategy_assistant").strip()
+    agent_service.require_agent_capability(capability, actor_type)
+    grant_id = str(payload.get("grant_id") or "")
+    session_id = str(payload.get("session_id") or "").strip()
+    if session_id and not grant_id:
+        session = ResearchAgentSessionService(get_default_store()).get(
+            session_id, include_events=False, include_iterations=False
+        )
+        if session is None:
+            raise ResearchAuthorizationError("RESEARCH_SESSION_NOT_FOUND", "Research Session does not exist")
+        if str(session.get("project_id") or "") != str(project_id):
+            raise ResearchAuthorizationError("RESEARCH_SESSION_SCOPE_VIOLATION", "Research Session belongs to another Project")
+        if str(session.get("status") or "").upper() in {"PAUSED", "NEED_HUMAN", "BLOCKED", "COMPLETED", "FAILED", "CANCELLED"}:
+            raise ResearchAuthorizationError(
+                "RESEARCH_SESSION_INACTIVE", f"Research Session status is {session.get('status') or 'UNKNOWN'}"
+            )
+        grant_id = str(session.get("internal_grant_id") or "")
+    decision = ResearchAgentAuthorization(get_default_store()).require(
+        project_id,
+        operation,
+        grant_id=grant_id,
+        **scope,
+    )
+    return actor_type, actor_id, decision
+
+
+def _public_research_session(value: dict | None):
+    if value is None:
+        return None
+    result = dict(value)
+    result.pop("internal_grant_id", None)
+    context = dict(result.get("context") or {})
+    context.pop("grant_id", None)
+    context.pop("grant_status", None)
+    result["context"] = context
+    return result
+
+
+def _audit_agent_research(
+    *,
+    actor_type: str,
+    actor_id: str,
+    capability: str,
+    target_type: str,
+    target_id: str,
+    payload: dict,
+    output: dict,
+) -> None:
+    agent_service.audit_external_action(
+        actor_type=actor_type,
+        actor_id=actor_id,
+        capability=capability,
+        target_type=target_type,
+        target_id=target_id,
+        input_data=payload,
+        output_data=output,
+    )
+
+
+def _agent_research_error(exc: Exception):
+    if isinstance(exc, ResearchAuthorizationError):
+        payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload.setdefault("actor_type", "agent")
+        payload.setdefault("actor_id", "agent_strategy_assistant")
+        payload.setdefault("capability", "research.request.denied")
+        agent_service.record_request_error(
+            path=request.path,
+            method=request.method,
+            status_code=403,
+            error=str(exc),
+            payload=payload,
+        )
+        body: dict = {"ok": False, "code": exc.code, "error": str(exc)}
+        if exc.context:
+            body["context"] = exc.context
+        return jsonify(body), 403
+    if isinstance(exc, PermissionError):
+        return _json_error(exc, 403)
+    if isinstance(exc, (TypeError, ValueError)):
+        return _json_error(exc, 400)
+    return _json_error(exc)
+
+
+@app.get("/api/agent/research/sessions")
+@debug_timing("agent_research_sessions")
+def agent_research_sessions():
+    try:
+        payload = _agent_query_payload()
+        agent_service.require_agent_capability("research.read", str(payload["actor_type"]).lower())
+        rows = ResearchAgentSessionService(get_default_store()).list(
+            project_id=str(payload.get("project_id") or ""),
+            status=str(payload.get("status") or ""),
+            limit=int(payload.get("limit") or 100),
+        )
+        return jsonify({"ok": True, "data": [_public_research_session(item) for item in rows]})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/sessions")
+@require_local_request
+@debug_timing("agent_research_session_create")
+def agent_research_session_create():
+    payload = _agent_body_payload()
+    try:
+        actor_type = str(payload["actor_type"]).lower()
+        actor_id = str(payload["actor_id"])
+        agent_service.require_agent_capability("research.project.create", actor_type)
+        mode = str(payload.get("entry_mode") or payload.get("mode") or "START").strip().upper()
+        service = ResearchAgentSessionService(get_default_store())
+        if mode == "START":
+            result = service.start(payload, created_by="local_user")
+        elif mode == "RESUME":
+            result = service.resume(
+                str(payload.get("anchor_type") or ""),
+                str(payload.get("anchor_id") or ""),
+                payload,
+                created_by="local_user",
+            )
+        else:
+            raise ValueError("entry_mode must be START or RESUME")
+        public = _public_research_session(result)
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.session.create",
+            target_type="research_session", target_id=result["session_id"], payload=payload, output=public,
+        )
+        return jsonify({"ok": True, "data": public}), 201
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.get("/api/agent/research/sessions/<session_id>")
+@debug_timing("agent_research_session_detail")
+def agent_research_session_detail(session_id: str):
+    try:
+        payload = _agent_query_payload()
+        agent_service.require_agent_capability("research.read", str(payload["actor_type"]).lower())
+        result = ResearchAgentSessionService(get_default_store()).get(session_id)
+        if result is None:
+            return jsonify({"ok": False, "code": "RESEARCH_SESSION_NOT_FOUND", "error": "Research Session not found"}), 404
+        return jsonify({"ok": True, "data": _public_research_session(result)})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.get("/api/agent/research/context")
+@debug_timing("agent_research_context_resolve")
+def agent_research_context_resolve():
+    try:
+        payload = _agent_query_payload()
+        agent_service.require_agent_capability("research.read", str(payload["actor_type"]).lower())
+        result = ResearchContextResolver(get_default_store()).resolve(
+            str(payload.get("anchor_type") or ""), str(payload.get("anchor_id") or "")
+        )
+        result.pop("grant_id", None)
+        result.pop("grant_status", None)
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/sessions/<session_id>/status")
+@require_local_request
+@debug_timing("agent_research_session_status")
+def agent_research_session_status(session_id: str):
+    payload = _agent_body_payload()
+    try:
+        result = ResearchAgentSessionService(get_default_store()).set_status(
+            session_id,
+            str(payload.get("status") or ""),
+            message=str(payload.get("message") or ""),
+            payload=dict(payload.get("progress") or {}),
+        )
+        return jsonify({"ok": True, "data": _public_research_session(result)})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/sessions/<session_id>/continue")
+@require_local_request
+@debug_timing("agent_research_session_continue")
+def agent_research_session_continue(session_id: str):
+    try:
+        result = ResearchAgentSessionService(get_default_store()).continue_session(session_id)
+        return jsonify({"ok": True, "data": _public_research_session(result)})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/sessions/<session_id>/need-human")
+@require_local_request
+@debug_timing("agent_research_session_need_human")
+def agent_research_session_need_human(session_id: str):
+    payload = _agent_body_payload()
+    try:
+        result = ResearchAgentSessionService(get_default_store()).need_human(
+            session_id,
+            reason_code=str(payload.get("reason_code") or ""),
+            question=str(payload.get("question") or ""),
+            context=dict(payload.get("context") or {}),
+        )
+        return jsonify({"ok": True, "data": _public_research_session(result)})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/sessions/<session_id>/answer")
+@require_local_request
+@debug_timing("agent_research_session_answer")
+def agent_research_session_answer(session_id: str):
+    payload = _agent_body_payload(default_type="human", default_id="local_user")
+    try:
+        if str(payload.get("actor_type") or "").lower() != "human":
+            raise PermissionError("only a human actor can answer a Research Session question")
+        result = ResearchAgentSessionService(get_default_store()).answer(session_id, payload.get("answer"))
+        return jsonify({"ok": True, "data": _public_research_session(result)})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/sessions/<session_id>/iterations")
+@require_local_request
+@debug_timing("agent_research_iteration_create")
+def agent_research_iteration_create(session_id: str):
+    payload = _agent_body_payload()
+    try:
+        result = ResearchAgentSessionService(get_default_store()).create_iteration(session_id, payload)
+        return jsonify({"ok": True, "data": result}), 201
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/iterations/<iteration_id>/complete")
+@require_local_request
+@debug_timing("agent_research_iteration_complete")
+def agent_research_iteration_complete(iteration_id: str):
+    payload = _agent_body_payload()
+    try:
+        result = ResearchAgentSessionService(get_default_store()).complete_iteration(iteration_id, payload)
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.get("/api/agent/research/projects")
+@debug_timing("agent_research_projects")
+def agent_research_projects():
+    try:
+        payload = _agent_query_payload()
+        agent_service.require_agent_capability("research.read", str(payload["actor_type"]).lower())
+        return jsonify({
+            "ok": True,
+            "data": ResearchControlPlane(get_default_store()).list_projects(
+                summary_state=str(payload.get("summary_state") or ""),
+                limit=int(payload.get("limit") or 100),
+            ),
+        })
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/projects")
+@require_local_request
+@debug_timing("agent_research_project_create")
+def agent_research_project_create():
+    payload = _agent_body_payload()
+    try:
+        actor_type = str(payload["actor_type"]).lower()
+        actor_id = str(payload["actor_id"])
+        agent_service.require_agent_capability("research.project.create", actor_type)
+        result = ResearchControlPlane(get_default_store()).create_project(
+            title=str(payload.get("title") or ""),
+            objective=str(payload.get("objective") or ""),
+            created_by=actor_id,
+        )
+        result["next_required_action"] = "HUMAN_CREATE_PROJECT_RESEARCH_GRANT"
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.project.create",
+            target_type="research_project", target_id=result["project_id"], payload=payload, output=result,
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/projects/<project_id>/universes")
+@require_local_request
+@debug_timing("agent_research_universe_create")
+def agent_research_universe_create(project_id: str):
+    payload = _agent_body_payload()
+    try:
+        shared_definition = payload.get("definition")
+        requested_type = str(payload.get("universe_type") or "").strip().lower()
+        if shared_definition or requested_type in {
+            "instrument_set", "benchmark_set", "composite_set", "multi_leg_set"
+        }:
+            definition = dict(shared_definition or payload)
+            shared_service = SharedUniverseService(get_default_store())
+            preview = shared_service.preview(definition)
+            instruments = list(preview.get("instrument_ids") or [])
+            inferred_providers = set()
+            for instrument_id in instruments:
+                parts = str(instrument_id).split(":")
+                asset_class = parts[0].lower() if parts else ""
+                venue = parts[1].upper() if len(parts) > 1 else ""
+                if asset_class.startswith("crypto"):
+                    inferred_providers.add("BINANCE")
+                elif asset_class == "equity":
+                    inferred_providers.add("YFINANCE")
+                elif asset_class == "macro":
+                    inferred_providers.add("FRED")
+                elif venue == "POLYMARKET":
+                    inferred_providers.add("POLYMARKET")
+            benchmark_provider = str(
+                (definition.get("benchmark") or {}).get("provider") or ""
+            ).strip().upper()
+            if benchmark_provider:
+                inferred_providers.add(benchmark_provider)
+            actor_type, actor_id, decision = _agent_research_authorize(
+                payload,
+                project_id,
+                "UNIVERSE_CREATE",
+                "research.universe.create",
+                providers=payload.get("providers") or sorted(inferred_providers),
+                instrument_ids=instruments,
+            )
+            result = shared_service.create(
+                definition,
+                created_by=actor_id,
+                project_id=project_id,
+            )
+            resolution = result.get("current_resolution") or {}
+            legacy_snapshot_id = str(resolution.get("legacy_snapshot_id") or "")
+            legacy_snapshot = UniverseService(get_default_store()).get_snapshot(
+                legacy_snapshot_id
+            )
+            data = {
+                **result,
+                "universe_definition_id": (
+                    legacy_snapshot.universe_definition_id
+                    if legacy_snapshot else ""
+                ),
+                "universe_snapshot_id": legacy_snapshot_id,
+                "authorization": decision.to_dict(),
+            }
+            _audit_agent_research(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                capability="research.universe.create",
+                target_type="shared_universe",
+                target_id=result["universe_id"],
+                payload=payload,
+                output=data,
+            )
+            return jsonify({"ok": True, "data": data}), 201
+        parameters = dict(payload.get("parameters") or {})
+        instruments = parameters.get("instrument_ids") or parameters.get("candidate_instrument_ids") or []
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload, project_id, "UNIVERSE_CREATE", "research.universe.create",
+            providers=payload.get("providers") or [], instrument_ids=instruments,
+        )
+        result = UniverseService(get_default_store()).create_definition(
+            name=str(payload.get("name") or ""),
+            version=str(payload.get("version") or ""),
+            universe_type=str(payload.get("universe_type") or "STATIC_LIST"),
+            parameters=parameters,
+            selection_rule_version=str(payload.get("selection_rule_version") or "universe-engine.v1"),
+            owner_project_id=project_id,
+            library_scope="PROJECT",
+        )
+        if result.library_scope == "PROJECT" and result.owner_project_id != project_id:
+            raise ResearchAuthorizationError(
+                "RESEARCH_UNIVERSE_OUT_OF_SCOPE",
+                "An identical Project-scoped Universe belongs to another Project",
+            )
+        data = {**asdict(result), "authorization": decision.to_dict()}
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.universe.create",
+            target_type="universe_definition", target_id=result.universe_definition_id, payload=payload, output=data,
+        )
+        return jsonify({"ok": True, "data": data}), 201
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/projects/<project_id>/universes/<universe_definition_id>/snapshots")
+@require_local_request
+@debug_timing("agent_research_universe_snapshot_create")
+def agent_research_universe_snapshot_create(project_id: str, universe_definition_id: str):
+    payload = _agent_body_payload()
+    try:
+        universe = UniverseService(get_default_store()).get_definition(universe_definition_id)
+        if universe is None or universe.owner_project_id not in {"", project_id}:
+            raise ValueError("universe definition is not available to this Project")
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload, project_id, "UNIVERSE_SNAPSHOT_CREATE", "research.universe.snapshot.create",
+            universe_definition_id=universe_definition_id,
+            instrument_ids=universe.parameters.get("instrument_ids") or universe.parameters.get("candidate_instrument_ids") or [],
+        )
+        catalog = DatasetCatalogService(get_default_store())
+        manifests = []
+        for manifest_id in payload.get("manifest_ids") or []:
+            manifest = catalog.get_manifest(str(manifest_id))
+            if manifest is None:
+                raise ValueError(f"dataset Manifest not found: {manifest_id}")
+            manifests.append(manifest)
+        result = UniverseService(get_default_store()).resolve_snapshot(
+            universe_definition_id=universe_definition_id,
+            as_of_time=str(payload.get("as_of_time") or ""),
+            manifests=manifests,
+        )
+        data = {**asdict(result), "authorization": decision.to_dict()}
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.universe.snapshot.create",
+            target_type="universe_snapshot", target_id=result.universe_snapshot_id, payload=payload, output=data,
+        )
+        return jsonify({"ok": True, "data": data}), 201
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/projects/<project_id>/definitions")
+@require_local_request
+@debug_timing("agent_research_definition_create")
+def agent_research_definition_create(project_id: str):
+    payload = _agent_body_payload()
+    try:
+        definition_type = str(payload.get("definition_type") or "").upper()
+        operation = "FACTOR_CREATE" if definition_type == "FACTOR" else "ALPHA_CREATE"
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload, project_id, operation, "research.definition.create"
+        )
+        registry = DefinitionRegistry(get_default_store())
+        definition_spec = dict(payload.get("spec") or {})
+        if definition_type == "ALPHA":
+            for component in definition_spec.get("components") or []:
+                ref_id = str(component.get("factor_definition_id") or "").strip()
+                ref_version = str(
+                    component.get("factor_version") or component.get("version") or ""
+                ).strip()
+                if not ref_id or not ref_version:
+                    raise ValueError("Alpha components require factor_definition_id and factor_version")
+                factor = registry.get(ref_id, version=ref_version)
+                if factor is None:
+                    raise ValueError(f"Factor definition not found: {ref_id}@{ref_version}")
+                if factor.library_scope == "PROJECT" and factor.owner_project_id != project_id:
+                    raise ResearchAuthorizationError(
+                        "RESEARCH_DEFINITION_OUT_OF_SCOPE",
+                        "Alpha may reference only Global Factors or Factors owned by this Project",
+                    )
+        result = registry.create(
+            definition_type,
+            definition_spec,
+            state="DRAFT",
+            created_by=actor_id,
+            owner_project_id=project_id,
+            library_scope="PROJECT",
+        )
+        if result.library_scope == "PROJECT" and result.owner_project_id != project_id:
+            raise ResearchAuthorizationError(
+                "RESEARCH_DEFINITION_OUT_OF_SCOPE",
+                "An identical Project-scoped definition belongs to another Project",
+            )
+        data = {**result.to_dict(), "authorization": decision.to_dict()}
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.definition.create",
+            target_type=f"research_{definition_type.lower()}_definition",
+            target_id=result.definition_id, payload=payload, output=data,
+        )
+        return jsonify({"ok": True, "data": data}), 201
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/projects/<project_id>/definitions/<definition_id>/validate")
+@require_local_request
+@debug_timing("agent_research_definition_validate")
+def agent_research_definition_validate(project_id: str, definition_id: str):
+    payload = _agent_body_payload()
+    try:
+        registry = DefinitionRegistry(get_default_store())
+        current = registry.get(definition_id)
+        if current is None or current.owner_project_id != project_id or current.library_scope != "PROJECT":
+            raise ResearchAuthorizationError(
+                "RESEARCH_DEFINITION_OUT_OF_SCOPE",
+                "Agent may validate only Project-scoped definitions it created inside this Project",
+            )
+        operation = "FACTOR_VALIDATE" if current.definition_type == "FACTOR" else "ALPHA_VALIDATE"
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload, project_id, operation, "research.definition.validate"
+        )
+        result = registry.validate(definition_id)
+        data = {**result.to_dict(), "authorization": decision.to_dict()}
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.definition.validate",
+            target_type=f"research_{current.definition_type.lower()}_definition",
+            target_id=definition_id, payload=payload, output=data,
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.put("/api/agent/research/projects/<project_id>/definition-refs/<slot_key>")
+@require_local_request
+@debug_timing("agent_research_definition_pin")
+def agent_research_definition_pin(project_id: str, slot_key: str):
+    payload = _agent_body_payload()
+    try:
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload, project_id, "PROJECT_PIN", "research.project.pin"
+        )
+        if not bool(decision.grant.get("scope", {}).get("allow_project_pin", True)):
+            raise ResearchAuthorizationError("RESEARCH_PROJECT_PIN_DENIED", "Project Pin is disabled in Grant scope")
+        definition = DefinitionRegistry(get_default_store()).get(str(payload.get("definition_id") or ""))
+        if definition is None or (
+            definition.library_scope == "PROJECT" and definition.owner_project_id != project_id
+        ):
+            raise ResearchAuthorizationError("RESEARCH_DEFINITION_OUT_OF_SCOPE", "Definition is outside Project scope")
+        result = DefinitionRegistry(get_default_store()).set_project_ref(
+            project_id=project_id,
+            slot_key=slot_key,
+            definition_id=definition.definition_id,
+            definition_version=str(payload.get("definition_version") or ""),
+            reference_mode=str(payload.get("reference_mode") or "PINNED"),
+        )
+        data = {**result, "authorization": decision.to_dict()}
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.project.pin",
+            target_type="project_definition_ref", target_id=f"{project_id}:{slot_key}", payload=payload, output=data,
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.delete("/api/agent/research/projects/<project_id>/definition-refs/<slot_key>")
+@require_local_request
+@debug_timing("agent_research_definition_unpin")
+def agent_research_definition_unpin(project_id: str, slot_key: str):
+    payload = _agent_body_payload()
+    try:
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload, project_id, "PROJECT_UNPIN", "research.project.unpin"
+        )
+        result = DefinitionRegistry(get_default_store()).remove_project_ref(
+            project_id=project_id,
+            slot_key=slot_key,
+            expected_definition_id=str(payload.get("expected_definition_id") or ""),
+        )
+        data = {**result, "authorization": decision.to_dict()}
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.project.unpin",
+            target_type="project_definition_ref", target_id=f"{project_id}:{slot_key}", payload=payload, output=data,
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.delete("/api/agent/research/projects/<project_id>/universes/<universe_id>")
+@require_local_request
+@debug_timing("agent_research_universe_unbind")
+def agent_research_universe_unbind(project_id: str, universe_id: str):
+    payload = _agent_body_payload()
+    try:
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload, project_id, "UNIVERSE_UNBIND", "research.universe.unbind",
+            universe_definition_id=universe_id,
+        )
+        result = SharedUniverseService(get_default_store()).remove_binding(
+            project_id=project_id, universe_id=universe_id
+        )
+        data = {**result, "authorization": decision.to_dict()}
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.universe.unbind",
+            target_type="shared_universe_binding", target_id=f"{project_id}:{universe_id}", payload=payload, output=data,
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.delete("/api/agent/research/projects/<project_id>/universe-ref")
+@require_local_request
+@debug_timing("agent_research_universe_ref_remove")
+def agent_research_universe_ref_remove(project_id: str):
+    payload = _agent_body_payload()
+    try:
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload, project_id, "UNIVERSE_UNBIND", "research.universe.unbind"
+        )
+        result = UniverseService(get_default_store()).remove_research_ref(project_id=project_id)
+        data = {**result, "authorization": decision.to_dict()}
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.universe.unbind",
+            target_type="research_universe_ref", target_id=project_id, payload=payload, output=data,
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.delete("/api/agent/research/projects/<project_id>/requirements/items/<ref_id>")
+@require_local_request
+@debug_timing("agent_research_requirement_remove")
+def agent_research_requirement_remove(project_id: str, ref_id: str):
+    payload = _agent_body_payload()
+    try:
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload, project_id, "REQUIREMENT_REMOVE", "research.requirement.remove"
+        )
+        RequirementWorkspaceService(get_default_store()).remove_project_item(project_id, ref_id)
+        data = {"removed": True, "project_id": project_id, "ref_id": ref_id, "authorization": decision.to_dict()}
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.requirement.remove",
+            target_type="project_requirement_item", target_id=f"{project_id}:{ref_id}", payload=payload, output=data,
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.delete("/api/agent/research/projects/<project_id>/library/<library_asset_id>/archive")
+@require_local_request
+@debug_timing("agent_research_library_archive")
+def agent_research_library_archive(project_id: str, library_asset_id: str):
+    """Archive a published Library asset (Universe/Factor/Alpha).
+
+    A Library asset is not owned by a single Project, but every Agent write
+    still requires a Project Research Grant, so the caller must name the
+    Project whose Grant authorizes this action.
+    """
+    payload = _agent_body_payload()
+    try:
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload, project_id, "LIBRARY_ARCHIVE", "research.library.archive"
+        )
+        result = ResearchLibraryService(get_default_store()).archive(library_asset_id)
+        data = {**result, "authorization": decision.to_dict()}
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.library.archive",
+            target_type="research_library_asset", target_id=library_asset_id, payload=payload, output=data,
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/projects/<project_id>/requirement-sets")
+@require_local_request
+@debug_timing("agent_research_requirement_compile")
+def agent_research_requirement_compile(project_id: str):
+    payload = _agent_body_payload()
+    try:
+        context = dict(payload.get("context") or {})
+        project_refs = DefinitionRegistry(get_default_store()).list_project_refs(project_id)
+        pinned_factor_specs = [
+            item["spec"] for item in project_refs.values()
+            if item["definition_type"] == "FACTOR" and item["reference_mode"] == "PINNED"
+        ]
+        requested_factor_specs = payload.get("factor_specs") or pinned_factor_specs
+        pinned_identities = {
+            (str(item.get("name") or ""), str(item.get("version") or ""))
+            for item in pinned_factor_specs
+        }
+        requested_identities = {
+            (str(item.get("name") or ""), str(item.get("version") or ""))
+            for item in requested_factor_specs
+        }
+        if not requested_factor_specs or not requested_identities.issubset(pinned_identities):
+            raise ResearchAuthorizationError(
+                "RESEARCH_DEFINITION_OUT_OF_SCOPE",
+                "Requirements may use only Factors PINNED to this Project",
+            )
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload, project_id, "REQUIREMENT_COMPILE", "research.requirement.compile",
+            providers=payload.get("providers") or (
+                (context.get("source_selection_policy") or {}).get("allowed_sources")
+                or (context.get("source_selection_policy") or {}).get("preferred_sources")
+                or ([context.get("provider")] if context.get("provider") else [])
+            ),
+            instrument_ids=context.get("instrument_ids") or [],
+            universe_snapshot_id=str(payload.get("universe_snapshot_id") or ""),
+            time_start=str(context.get("history_start") or ""),
+            time_end=str(context.get("history_end") or ""),
+        )
+        result = RequirementCompiler(get_default_store()).compile(
+            project_id=project_id,
+            factor_specs=requested_factor_specs,
+            universe_requirements=payload.get("universe_requirements") or [],
+            evaluation_requirements=payload.get("evaluation_requirements") or [],
+            backtest_requirements=payload.get("backtest_requirements") or [],
+            manual_requirements=payload.get("manual_requirements") or [],
+            context=context,
+        )
+        data = {**asdict(result), "authorization": decision.to_dict()}
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.requirement.compile",
+            target_type="requirement_set", target_id=result.requirement_set_id, payload=payload, output=data,
+        )
+        return jsonify({"ok": True, "data": data}), 201
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/projects/<project_id>/run-input-previews")
+@require_local_request
+@debug_timing("agent_research_preview_create")
+def agent_research_preview_create(project_id: str):
+    payload = _agent_body_payload()
+    try:
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload, project_id, "PREVIEW_CREATE", "research.preview.create",
+            providers=(payload.get("source_selection_policy") or {}).get("preferred_sources") or [],
+            universe_snapshot_id=str(payload.get("universe_snapshot_id") or ""),
+        )
+        request_payload = {
+            **payload,
+            "grant_id": decision.grant["grant_id"],
+            "actor_type": "AGENT",
+            "actor_id": actor_id,
+        }
+        result = ResearchRunPreviewService(get_default_store()).create(
+            project_id, request_payload, created_by=actor_id
+        )
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.preview.create",
+            target_type="run_inputs_preview", target_id=result["preview_id"], payload=payload, output=result,
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/projects/<project_id>/backfill-tasks")
+@require_local_request
+@debug_timing("agent_research_backfill_create")
+def agent_research_backfill_create(project_id: str):
+    payload = _agent_body_payload()
+    try:
+        symbol = str(payload.get("symbol") or "").strip().upper()
+        interval = str(payload.get("interval") or "").strip().lower()
+        instrument_id = str(payload.get("instrument_id") or f"crypto_spot:BINANCE:{symbol}").strip()
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload, project_id, "BACKFILL_CREATE", "research.backfill.create",
+            providers=["BINANCE"], intervals=[interval], instrument_ids=[instrument_id],
+            time_start=str(payload.get("start_time") or ""),
+            time_end=str(payload.get("end_time") or ""),
+        )
+        workflow_run_id = str(
+            payload.get("workflow_run_id")
+            or f"agent-backfill:{project_id}:{symbol}:{interval}"
+        ).strip()
+        tasks = ResearchControlPlane(get_default_store()).compile_tasks(
+            project_id=project_id,
+            plan_version=int(decision.grant["plan_version"]),
+            workflow_run_id=workflow_run_id,
+            task_specs=[{
+                "task_type": "BINANCE_BARS_BACKFILL",
+                "logical_key": str(payload.get("logical_key") or f"{symbol}:{interval}"),
+                "idempotency_key": str(
+                    payload.get("idempotency_key")
+                    or f"{workflow_run_id}:{symbol}:{interval}:{payload.get('start_time')}:{payload.get('end_time')}"
+                ),
+                "max_attempts": int(payload.get("max_attempts") or 5),
+                "timeout_seconds": int(payload.get("timeout_seconds") or 3600),
+                "input": {
+                    "grant_id": decision.grant["grant_id"],
+                    "symbol": symbol,
+                    "interval": interval,
+                    "start_time": str(payload.get("start_time") or ""),
+                    "end_time": str(payload.get("end_time") or ""),
+                    "requirement_id": str(payload.get("requirement_id") or ""),
+                    "library_asset_id": str(payload.get("library_asset_id") or ""),
+                    "page_limit": int(payload.get("page_limit") or 1000),
+                    "max_pages_per_attempt": int(payload.get("max_pages_per_attempt") or 20),
+                    "budget": dict(payload.get("budget") or {
+                        "download_bytes": 20_000_000,
+                        "runtime_seconds": 300,
+                    }),
+                },
+            }],
+        )
+        result = next(item for item in tasks if item["logical_key"] == str(payload.get("logical_key") or f"{symbol}:{interval}"))
+        data = {**result, "authorization": decision.to_dict()}
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.backfill.create",
+            target_type="research_task", target_id=result["task_id"], payload=payload, output=data,
+        )
+        return jsonify({"ok": True, "data": data}), 201
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/projects/<project_id>/openbb-export-tasks")
+@require_local_request
+@debug_timing("agent_research_openbb_export_create")
+def agent_research_openbb_export_create(project_id: str):
+    payload = _agent_body_payload()
+    try:
+        symbol = str(payload.get("symbol") or "").strip().upper()
+        provider = str(payload.get("provider") or "yfinance").strip().lower()
+        interval = str(payload.get("interval") or "1d").strip().lower()
+        instrument_id = str(payload.get("instrument_id") or "").strip()
+        parts = instrument_id.split(":", 2)
+        venue = str(payload.get("venue") or (parts[1] if len(parts) > 1 else "")).strip().upper()
+        if not symbol or not instrument_id:
+            raise ValueError("OpenBB export requires symbol and instrument_id")
+        if interval != "1d":
+            raise ValueError("OpenBB equity preparation currently supports 1d bars only")
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload, project_id, "BACKFILL_CREATE", "research.backfill.create",
+            providers=[provider], intervals=[interval], instrument_ids=[instrument_id],
+            time_start=str(payload.get("start_time") or ""),
+            time_end=str(payload.get("end_time") or ""),
+        )
+        workflow_run_id = str(
+            payload.get("workflow_run_id")
+            or f"agent-openbb:{project_id}:{provider}:{venue}:{symbol}:{interval}"
+        ).strip()
+        logical_key = str(
+            payload.get("logical_key") or f"{provider}:{venue}:{symbol}:{interval}"
+        ).strip()
+        adjustment = normalize_equity_adjustment(payload.get("adjustment"))
+        start_time = str(payload.get("start_time") or "").strip()
+        end_time = str(payload.get("end_time") or "").strip()
+        tasks = ResearchControlPlane(get_default_store()).compile_tasks(
+            project_id=project_id,
+            plan_version=int(decision.grant["plan_version"]),
+            workflow_run_id=workflow_run_id,
+            task_specs=[{
+                "task_type": "OPENBB_EQUITY_DAILY_EXPORT",
+                "logical_key": logical_key,
+                "idempotency_key": str(
+                    payload.get("idempotency_key")
+                    or f"{workflow_run_id}:{start_time}:{end_time}:{adjustment}"
+                ),
+                "max_attempts": int(payload.get("max_attempts") or 3),
+                "timeout_seconds": int(payload.get("timeout_seconds") or 3600),
+                "input": {
+                    "grant_id": decision.grant["grant_id"],
+                    "symbol": symbol,
+                    "venue": venue,
+                    "provider": provider,
+                    "instrument_id": instrument_id,
+                    "interval": interval,
+                    "frequency": interval,
+                    "start_date": start_time[:10],
+                    "end_date": end_time[:10],
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "latest_available": bool(payload.get("latest_available", False)),
+                    "adjustment": adjustment,
+                    "source_policy": {"mode": "FIXED", "providers": [provider]},
+                    "requirement_id": str(payload.get("requirement_id") or ""),
+                    "library_asset_id": str(payload.get("library_asset_id") or ""),
+                    "budget": dict(payload.get("budget") or {
+                        "download_bytes": 20_000_000,
+                        "runtime_seconds": 300,
+                    }),
+                },
+            }],
+        )
+        result = next(item for item in tasks if item["logical_key"] == logical_key)
+        data = {**result, "authorization": decision.to_dict()}
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.backfill.create",
+            target_type="research_task", target_id=result["task_id"], payload=payload, output=data,
+        )
+        return jsonify({"ok": True, "data": data}), 201
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/projects/<project_id>/polymarket-export-tasks")
+@require_local_request
+@debug_timing("agent_research_polymarket_export_create")
+def agent_research_polymarket_export_create(project_id: str):
+    payload = _agent_body_payload()
+    try:
+        instrument_id = str(payload.get("instrument_id") or "").strip()
+        interval = str(payload.get("interval") or "1h").strip().lower()
+        if not instrument_id.lower().startswith("polymarket_binary:polymarket:"):
+            raise ValueError("Polymarket export requires an outcome instrument_id")
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload, project_id, "BACKFILL_CREATE", "research.backfill.create",
+            providers=["POLYMARKET"], intervals=[interval], instrument_ids=[instrument_id],
+            time_start=str(payload.get("start_time") or ""),
+            time_end=str(payload.get("end_time") or ""),
+        )
+        token_id = instrument_id.split(":", 2)[2]
+        workflow_run_id = str(
+            payload.get("workflow_run_id")
+            or f"agent-polymarket:{project_id}:{token_id}:{interval}"
+        ).strip()
+        logical_key = str(
+            payload.get("logical_key") or f"polymarket:{token_id}:{interval}"
+        ).strip()
+        start_time = str(payload.get("start_time") or "").strip()
+        end_time = str(payload.get("end_time") or "").strip()
+        tasks = ResearchControlPlane(get_default_store()).compile_tasks(
+            project_id=project_id,
+            plan_version=int(decision.grant["plan_version"]),
+            workflow_run_id=workflow_run_id,
+            task_specs=[{
+                "task_type": "POLYMARKET_PRICE_HISTORY_EXPORT",
+                "logical_key": logical_key,
+                "idempotency_key": str(
+                    payload.get("idempotency_key")
+                    or f"{workflow_run_id}:{start_time}:{end_time}"
+                ),
+                "max_attempts": int(payload.get("max_attempts") or 3),
+                "timeout_seconds": int(payload.get("timeout_seconds") or 3600),
+                "input": {
+                    "grant_id": decision.grant["grant_id"],
+                    "instrument_id": instrument_id,
+                    "condition_id": str(payload.get("condition_id") or ""),
+                    "interval": interval,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "latest_available": bool(payload.get("latest_available", False)),
+                    "requirement_id": str(payload.get("requirement_id") or ""),
+                    "library_asset_id": str(payload.get("library_asset_id") or ""),
+                    "budget": dict(payload.get("budget") or {
+                        "download_bytes": 20_000_000,
+                        "runtime_seconds": 300,
+                    }),
+                },
+            }],
+        )
+        result = next(item for item in tasks if item["logical_key"] == logical_key)
+        data = {**result, "authorization": decision.to_dict()}
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.backfill.create",
+            target_type="research_task", target_id=result["task_id"], payload=payload, output=data,
+        )
+        return jsonify({"ok": True, "data": data}), 201
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/projects/<project_id>/runs")
+@require_local_request
+@debug_timing("agent_research_run_create")
+def agent_research_run_create(project_id: str):
+    payload = _agent_body_payload()
+    try:
+        actor_type, actor_id, _decision = _agent_research_authorize(
+            payload, project_id, "RUN_CREATE", "research.run.create"
+        )
+        preview = ResearchRunPreviewService(get_default_store()).get(str(payload.get("preview_id") or ""))
+        if preview is None or str(preview.get("project_id")) != project_id:
+            raise ResearchAuthorizationError("RESEARCH_RUN_PROJECT_MISMATCH", "Preview belongs to another Project")
+        result = ResearchRunService(get_default_store()).create(
+            preview_id=str(payload.get("preview_id") or ""),
+            preview_fingerprint=str(payload.get("preview_fingerprint") or ""),
+            idempotency_key=str(payload.get("idempotency_key") or ""),
+            actor_id=actor_id,
+            actor_type="AGENT",
+        )
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.run.create",
+            target_type="research_run", target_id=result["run_id"], payload=payload, output=result,
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except IdempotencyConflictError as exc:
+        return jsonify({"ok": False, "code": exc.code, "error": str(exc)}), 409
+    except PreviewStaleError as exc:
+        return jsonify({"ok": False, "code": exc.code, "error": str(exc)}), 409
+    except ReadinessBlockedError as exc:
+        return jsonify({"ok": False, "code": exc.code, "error": str(exc)}), 422
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/projects/<project_id>/run-worker/run-once")
+@require_local_request
+@debug_timing("agent_research_run_execute")
+def agent_research_run_execute(project_id: str):
+    payload = _agent_body_payload()
+    try:
+        actor_type, actor_id, _decision = _agent_research_authorize(
+            payload, project_id, "RUN_EXECUTE", "research.run.execute"
+        )
+        result = ResearchRunWorker(
+            get_default_store(), worker_id=str(payload.get("worker_id") or f"agent-worker:{actor_id}")
+        ).run_once(lease_seconds=int(payload.get("lease_seconds") or 300), project_id=project_id)
+        data = result or {"status": "IDLE", "project_id": project_id}
+        _audit_agent_research(
+            actor_type=actor_type, actor_id=actor_id, capability="research.run.execute",
+            target_type="research_run", target_id=str(data.get("run_id") or project_id), payload=payload, output=data,
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _agent_research_error(exc)
 
 
 @app.get("/api/agent/market-categories")
@@ -1684,6 +6114,108 @@ def agent_run_steps_list(run_id: str):
         return _json_error(exc)
 
 
+def _require_inspection_read(payload: dict) -> None:
+    actor_type = str(payload.get("actor_type") or "agent").strip().lower()
+    agent_service.require_agent_capability("audit.read", actor_type)
+
+
+@app.get("/api/agent/inspection/traces")
+@debug_timing("agent_inspection_traces")
+def agent_inspection_traces_list():
+    try:
+        payload = _agent_query_payload()
+        _require_inspection_read(payload)
+        return jsonify({
+            "ok": True,
+            "data": inspection_service.list_traces(
+                limit=request.args.get("limit", 50),
+                cursor=request.args.get("cursor", ""),
+                subject_type=request.args.get("subject_type", ""),
+                subject_id=request.args.get("subject_id", ""),
+                status=request.args.get("status", ""),
+                q=request.args.get("q", ""),
+                include_hidden=(
+                    str(request.args.get("include_hidden", "")).lower() in {"1", "true", "yes"}
+                    and str(payload.get("actor_type") or "").lower() == "human"
+                ),
+            ),
+        })
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/inspection/traces/<trace_id>")
+@debug_timing("agent_inspection_trace")
+def agent_inspection_trace_detail(trace_id: str):
+    try:
+        payload = _agent_query_payload()
+        _require_inspection_read(payload)
+        return jsonify({"ok": True, "data": inspection_service.get_trace(trace_id)})
+    except ValueError as exc:
+        return _json_error(exc, 404 if "not found" in str(exc).lower() else 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/inspection/traces/<trace_id>/events")
+@debug_timing("agent_inspection_events")
+def agent_inspection_events_list(trace_id: str):
+    try:
+        payload = _agent_query_payload()
+        _require_inspection_read(payload)
+        return jsonify({
+            "ok": True,
+            "data": inspection_service.list_events(
+                trace_id,
+                limit=request.args.get("limit", 100),
+                cursor=request.args.get("cursor", 0),
+                event_kind=request.args.get("event_kind", ""),
+                status=request.args.get("status", ""),
+                severity=request.args.get("severity", ""),
+                q=request.args.get("q", ""),
+            ),
+        })
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/inspection/traces/<trace_id>/search")
+@debug_timing("agent_inspection_search")
+def agent_inspection_events_search(trace_id: str):
+    try:
+        payload = _agent_query_payload()
+        _require_inspection_read(payload)
+        return jsonify({
+            "ok": True,
+            "data": inspection_service.search_events(
+                trace_id,
+                request.args.get("q", ""),
+                limit=request.args.get("limit", 50),
+            ),
+        })
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/agent/inspection/events/<event_id>")
+@debug_timing("agent_inspection_event")
+def agent_inspection_event_detail(event_id: str):
+    try:
+        payload = _agent_query_payload()
+        _require_inspection_read(payload)
+        return jsonify({"ok": True, "data": inspection_service.get_event(event_id)})
+    except ValueError as exc:
+        return _json_error(exc, 404 if "not found" in str(exc).lower() else 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
 @app.delete("/api/agent/audit")
 @debug_timing("agent_audit_clear")
 def agent_audit_clear():
@@ -2009,6 +6541,16 @@ def polymarket_strategy_chart(row_id: int):
         return _json_error(exc)
 
 
+@app.get("/api/polymarket/strategies/<int:row_id>/chart-history")
+@debug_timing("chart_history")
+def polymarket_strategy_chart_history(row_id: int):
+    """Read-only history window used for seamless left-edge chart prefetch."""
+    try:
+        return jsonify({"ok": True, "data": get_strategy_chart(row_id, request.args)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
 @app.get("/api/polymarket/strategies/<int:row_id>/chart-delta")
 @debug_timing("chart_delta")
 def polymarket_strategy_chart_delta(row_id: int):
@@ -2022,7 +6564,42 @@ def polymarket_strategy_chart_delta(row_id: int):
 @debug_timing("events")
 def polymarket_strategy_events(row_id: int):
     try:
-        return jsonify({"ok": True, "data": list_strategy_events(row_id, request.args)})
+        data = list_strategy_events(row_id, request.args)
+        compact = str(request.args.get("compact") or "").strip().lower() in {"1", "true", "yes", "on"}
+        if compact:
+            compact_items = []
+            for item in data.get("data") or []:
+                payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+                compact_items.append({
+                    key: value
+                    for key, value in {
+                        "id": item.get("id"),
+                        "ts": item.get("ts"),
+                        "event_type": item.get("event_type") or item.get("type"),
+                        "event_subtype": item.get("event_subtype") or item.get("subtype"),
+                        "summary": item.get("summary") or item.get("label"),
+                        "severity": item.get("severity"),
+                        "source": item.get("source") or item.get("env"),
+                        "leg": item.get("leg", payload.get("leg", payload.get("leg_index"))),
+                        "related_id": item.get("related_id") or item.get("correlation_id") or item.get("order_id") or payload.get("order_id"),
+                    }.items()
+                    if value not in (None, "")
+                })
+            data = {**data, "data": compact_items}
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/polymarket/strategies/<int:row_id>/events/<path:event_id>")
+@debug_timing("event_detail")
+def polymarket_strategy_event_detail(row_id: int, event_id: str):
+    try:
+        data = list_strategy_events(row_id, {"limit": 500})
+        item = next((entry for entry in (data.get("data") or []) if str(entry.get("id") or "") == str(event_id)), None)
+        if item is None:
+            return jsonify({"ok": False, "error": "event not found"}), 404
+        return jsonify({"ok": True, "data": item})
     except Exception as exc:
         return _json_error(exc)
 
@@ -2035,12 +6612,19 @@ def live_strategy_workspace(row_id: int):
     def event_stream():
         last_event_ts = ""
         last_event_type = ""
+        include_events = str(request.args.get("include_events") or "").strip().lower() in {"1", "true", "yes", "on"}
         deadline = time.time() + 3600
         while time.time() < deadline:
             try:
-                detail = fetch_strategy_detail(row_id, allow_remote_positions=False)
-                events_payload = list_strategy_events(row_id, {"limit": 1})
-                latest_event = (events_payload.get("data") or [None])[0]
+                detail = fetch_strategy_detail(
+                    row_id,
+                    allow_remote_positions=False,
+                    allow_clob_book=False,
+                )
+                latest_event = None
+                if include_events:
+                    events_payload = list_strategy_events(row_id, {"limit": 1}, detail=detail)
+                    latest_event = (events_payload.get("data") or [None])[0]
 
                 yield _sse(
                     "summary",
@@ -2261,6 +6845,16 @@ def api_strategy_code_inputs(code_name: str):
 def api_strategy_code_schemas(code_name: str):
     try:
         return jsonify({"ok": True, "data": get_strategy_code_schemas(code_name)})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/strategy-signal-sources/library-alphas")
+@debug_timing("strategy_library_alpha_sources")
+def api_strategy_library_alpha_sources():
+    """List immutable Library Alphas that a Strategy can pin."""
+    try:
+        return jsonify({"ok": True, "data": list_library_alpha_sources()})
     except Exception as exc:
         return _json_error(exc)
 
@@ -2629,4 +7223,5 @@ if __name__ == "__main__":
     collector.start()
     virtual_runner.start()
     event_news_scheduler.start()
+    _start_requirement_maintenance()
     app.run(host="127.0.0.1", port=5001, debug=False, use_reloader=False)

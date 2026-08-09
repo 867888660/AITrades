@@ -1,5 +1,7 @@
 # 多资产策略架构升级说明
 
+> 研究边界（2026-07-10）：多资产“策略运行时”和多资产“研究回测”是独立边界。Research V1 已验证 Binance 五标的严格对齐、横截面排名、Top-2 轮换和下一根 Open 成交；该结果不会自动导入 Strategy Draft，也不会触发 Virtual 或 Real Execution。详见 [Quant Research V1](quant-research-platform-v1.md)。
+
 本文记录 2026-05-19 之后策略系统从 Polymarket 专用策略，向多资产策略引擎演进的落地约定。目标不是一次性推倒重写，而是在保留旧策略兼容性的前提下，引入更专业的量化系统边界。
 
 ## 核心边界

@@ -44,18 +44,82 @@
 
   const drawerToggle = document.getElementById("workspaceDrawerToggle");
   const drawer = document.getElementById("workspaceDrawer");
-  if (drawerToggle && drawer) {
-    drawerToggle.addEventListener("click", () => drawer.classList.toggle("collapsed"));
-  }
-
   const drawerTabs = document.querySelectorAll("[data-drawer-tab]");
   const drawerPanes = document.querySelectorAll("[data-drawer-pane]");
+  const activateDrawerPane = (paneName) => {
+    drawerTabs.forEach((item) => item.classList.toggle("active", item.dataset.drawerTab === paneName));
+    drawerPanes.forEach((item) => item.classList.toggle("active", item.dataset.drawerPane === paneName));
+  };
+  let syncDrawerState = () => {};
+  if (drawerToggle && drawer) {
+    const drawerPreferenceKey = "workspaceDrawerExpanded";
+    syncDrawerState = (expanded) => {
+      drawer.classList.toggle("collapsed", !expanded);
+      drawerToggle.classList.toggle("active", expanded);
+      drawerToggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+      drawerToggle.textContent = expanded ? "收起面板" : "面板";
+    };
+    syncDrawerState(localStorage.getItem(drawerPreferenceKey) === "1");
+    drawerToggle.addEventListener("click", () => {
+      const expanded = drawer.classList.contains("collapsed");
+      localStorage.setItem(drawerPreferenceKey, expanded ? "1" : "0");
+      syncDrawerState(expanded);
+      window.setTimeout(() => window.dispatchEvent(new Event("resize")), 220);
+    });
+    window.openWorkspaceDrawerPane = (paneName = "settings") => {
+      localStorage.setItem(drawerPreferenceKey, "1");
+      syncDrawerState(true);
+      activateDrawerPane(paneName);
+      window.setTimeout(() => window.dispatchEvent(new Event("resize")), 220);
+    };
+  }
+
   drawerTabs.forEach((tab) => {
     tab.addEventListener("click", () => {
-      drawerTabs.forEach((item) => item.classList.remove("active"));
-      drawerPanes.forEach((item) => item.classList.remove("active"));
-      tab.classList.add("active");
-      document.querySelector(`[data-drawer-pane="${tab.dataset.drawerTab}"]`)?.classList.add("active");
+      activateDrawerPane(tab.dataset.drawerTab);
+    });
+  });
+
+  const applyChartPickerFilter = (filterName = "all") => {
+    const filter = String(filterName || "all");
+    document.querySelectorAll("[data-chart-picker-filter]").forEach((button) => {
+      button.classList.toggle("active", button.dataset.chartPickerFilter === filter);
+    });
+    const overlayPicker = document.getElementById("chartOverlayPicker");
+    const seriesSection = document.querySelector('[data-chart-picker-section="series"]');
+    if (overlayPicker) overlayPicker.hidden = filter !== "all" && filter !== "overlay";
+    if (seriesSection) seriesSection.hidden = filter !== "all" && filter !== "series";
+  };
+
+  window.openWorkspaceChartPicker = (filterName = "overlay") => {
+    window.openWorkspaceDrawerPane?.("chart-style");
+    applyChartPickerFilter(filterName);
+  };
+
+  const focusSubchartPicker = (sectionName) => {
+    const picker = document.getElementById("chartMetricPicker");
+    const shell = document.getElementById("chartSubchartPicker");
+    const group = picker?.querySelector(`.metric-picker-group[data-chart-picker-section="${sectionName}"]`);
+    if (!picker || !shell || !group) return;
+    shell.classList.add("is-focus");
+    picker.scrollTo({ left: Math.max(0, group.offsetLeft - picker.offsetLeft - 8), behavior: "smooth" });
+    window.setTimeout(() => shell.classList.remove("is-focus"), 900);
+  };
+
+  document.querySelectorAll("[data-chart-picker-open]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const target = button.dataset.chartPickerOpen || "metrics";
+      if (target === "metrics" || target === "status") {
+        focusSubchartPicker(target);
+        return;
+      }
+      window.openWorkspaceChartPicker(target);
+    });
+  });
+
+  document.querySelectorAll("[data-chart-picker-filter]").forEach((button) => {
+    button.addEventListener("click", () => {
+      applyChartPickerFilter(button.dataset.chartPickerFilter || "all");
     });
   });
 
@@ -153,7 +217,18 @@
         }
       } catch {}
     }
-    return raw;
+    const cleaned = String(raw)
+      .replace(/===DB_JSON_BEGIN===[\s\S]*$/i, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (type.includes("print")) {
+      const fields = ["decision", "actions", "candidates", "selected", "machine_state"]
+        .map((key) => cleaned.match(new RegExp(`(?:^|\\s)${key}=([^\\s]+)`, "i")))
+        .filter(Boolean)
+        .map((match) => `${match[0].trim()}`);
+      if (fields.length) return fields.join(" · ");
+    }
+    return cleaned.length > 280 ? `${cleaned.slice(0, 277)}…` : cleaned;
   }
 
   let _lastEventsSignature = "";
@@ -191,12 +266,16 @@
     if (sig === _lastEventsSignature) return;
     _lastEventsSignature = sig;
     container.innerHTML = events.map((event) => {
+      const eventId = typeof chartEventIdentity === "function"
+        ? chartEventIdentity(event)
+        : String(event.id || `${event.ts || ""}|${event.event_type || event.type || ""}|${event.summary || event.label || ""}`);
       const source = String(event?.source || event?.env || "").toLowerCase();
       const envClass = source.includes("real") ? "real" : source.includes("virtual") ? "virtual" : "";
       const body = _formatEventBody(event);
       const count = Number(event?.repeat_count || event?.payload?.repeat_count || event?.duplicate_count || 1);
+      const focused = String(window.workspaceFocusedEventId || "") === eventId;
       return `
-        <div class="ws3-event-item ${eventClass(event)}">
+        <div class="ws3-event-item ${eventClass(event)}${focused ? " is-focused" : ""}" data-event-id="${esc(eventId)}" role="button" tabindex="0" aria-selected="${focused ? "true" : "false"}">
           <div class="ws3-event-meta">
             <span class="ws3-event-kind">${esc(eventKind(event))}</span>
             ${envClass ? `<span class="ws3-event-env ${envClass}">${esc(envClass)}</span>` : ""}
@@ -209,6 +288,21 @@
     }).join("");
     applyEventFilter();
   };
+
+  document.getElementById("workspaceEvents")?.addEventListener("click", (event) => {
+    const row = event.target.closest(".ws3-event-item[data-event-id]");
+    if (row && typeof window.focusWorkspaceEvent === "function") {
+      window.focusWorkspaceEvent(row.dataset.eventId, "list");
+    }
+  });
+
+  document.getElementById("workspaceEvents")?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    const row = event.target.closest(".ws3-event-item[data-event-id]");
+    if (!row || typeof window.focusWorkspaceEvent !== "function") return;
+    event.preventDefault();
+    window.focusWorkspaceEvent(row.dataset.eventId, "list");
+  });
 
   window.renderSummary = function renderSummaryV3(strategy) {
     const bar = document.getElementById("workspaceLegsBar");
@@ -300,5 +394,88 @@
         ? `${primary.symbol || primary.label || "-"} · ${primary.interval || "1m"} · Row ${strategy?.row_id || "-"}`
         : `${strategy?.question || "-"} | Row ${strategy?.row_id || "-"}`;
     }
+  };
+
+  // The workspace is leg-oriented; the first leg is only an internal chart index.
+  window.renderSummary = function renderSummaryLegs(strategy) {
+    const bar = document.getElementById("workspaceLegsBar");
+    if (!bar) return;
+    const markets = Array.isArray(window.workspaceTrackedMarkets) ? window.workspaceTrackedMarkets : [];
+    const dataByIndex = new Map(
+      (Array.isArray(window.workspaceState?.legs_data) ? window.workspaceState.legs_data : [])
+        .map((item) => [Number(item?.leg_index ?? 0), item])
+    );
+    const legs = markets.map((market, index) => ({
+      ...market,
+      ...(dataByIndex.get(Number(market?.leg_index ?? index)) || {}),
+    }));
+    const sourceLegs = legs.length ? legs : (Array.isArray(window.workspaceState?.legs_data) ? window.workspaceState.legs_data : []);
+    const validModes = ["Stop", "Virtual", "Real"];
+    const legacyState = validModes.includes(strategy?.state) ? strategy.state : "";
+    const mode = strategy?.mode || legacyState || "Stop";
+    const machineState = strategy?.machine_state || (!validModes.includes(strategy?.state) ? strategy?.state : "") || "auto";
+    const pnl = Number(strategy?.strategy_pnl);
+    const pnlClass = pnl > 0 ? "positive" : pnl < 0 ? "negative" : "";
+    const summary = `
+      <div class="ws3-strat-summary">
+        <div class="ws3-leg-title">策略汇总 <span class="ws3-leg-direction observe">${esc(`${sourceLegs.length} legs`)}</span></div>
+        <div class="ws3-leg-row"><span>Bankroll</span><span class="val">${fmtNum(strategy?.strategy_bankroll)}</span></div>
+        <div class="ws3-leg-row"><span>Exposure</span><span class="val">${fmtNum(strategy?.exposure)}</span></div>
+        <div class="ws3-leg-row"><span>PnL</span><span class="val ws3-leg-pnl ${pnlClass}">${fmtNum(pnl)}</span></div>
+        <div class="ws3-leg-row"><span>Mode</span><span class="val">${esc(mode)}</span></div>
+        <div class="ws3-leg-row"><span>State</span><span class="val">${esc(machineState)}</span></div>
+      </div>
+    `;
+    const cards = sourceLegs.map((leg, index) => {
+      const legIndex = Number(leg?.leg_index ?? index);
+      const binary = !isBinanceTarget(leg) && (
+        String(leg?.leg_type || leg?.asset_class || "").toLowerCase().includes("polymarket")
+        || String(leg?.asset_class || "").toLowerCase().includes("binary")
+        || Boolean(leg?.condition_id || leg?.yes_token || leg?.no_token)
+      );
+      const name = leg?.display_name || leg?.question || leg?.label || leg?.symbol || `Leg ${legIndex + 1}`;
+      const kind = binary ? "Polymarket Yes/No" : (leg?.leg_type || leg?.position_kind || leg?.venue || "Position");
+      const direction = leg?.direction || "Observe";
+      const legPnlRaw = leg?.pnl ?? leg?.unrealized_pnl;
+      const legPnl = legPnlRaw == null || legPnlRaw === "" ? null : Number(legPnlRaw);
+      const legPnlClass = Number.isFinite(legPnl) && legPnl > 0 ? "positive" : Number.isFinite(legPnl) && legPnl < 0 ? "negative" : "";
+      const body = binary
+        ? [
+            ["Yes Bid/Ask", `${fmtNum(leg?.yes_bid, 4)} / ${fmtNum(leg?.yes_ask ?? leg?.yes_mark, 4)}`],
+            ["No Bid/Ask", `${fmtNum(leg?.no_bid, 4)} / ${fmtNum(leg?.no_ask ?? leg?.no_mark, 4)}`],
+            ["Yes Qty / Avg", `${fmtNum(leg?.yes_qty)} / ${fmtNum(leg?.yes_avg, 4)}`],
+            ["No Qty / Avg", `${fmtNum(leg?.no_qty)} / ${fmtNum(leg?.no_avg, 4)}`],
+            ["PnL", fmtNum(legPnl, 2)],
+          ]
+        : [
+            ["Position", fmtNum(leg?.position ?? leg?.position_qty ?? leg?.qty, 8)],
+            ["Qty", fmtNum(leg?.qty ?? leg?.position_qty ?? leg?.yes_qty, 8)],
+            ["Avg", fmtNum(leg?.avg ?? leg?.avg_price ?? leg?.yes_avg, 4)],
+            ["PnL", fmtNum(legPnl, 2)],
+          ];
+      const cardTooltip = [
+        `Leg ${legIndex + 1} · ${name}`,
+        `Type: ${kind}`,
+        `Direction: ${direction}`,
+        ...body.map(([label, value]) => `${label}: ${value}`),
+      ].join("\n");
+      return `
+        <div class="ws3-leg-card ${esc(String(mode).toLowerCase())}" title="${esc(cardTooltip)}" aria-label="${esc(`Leg ${legIndex + 1} ${name}`)}">
+          <div class="ws3-leg-title" title="${esc(name)}">Leg ${legIndex + 1} · ${esc(name)} <span class="ws3-leg-direction observe">${esc(kind)}</span></div>
+          ${body.map(([label, value]) => `<div class="ws3-leg-row"><span>${esc(label)}</span><span class="val ${label === "PnL" ? legPnlClass : ""}">${esc(value)}</span></div>`).join("")}
+        </div>
+      `;
+    }).join("");
+    bar.innerHTML = summary + cards;
+    if (window.syncWorkspaceStateControl) window.syncWorkspaceStateControl(strategy || {});
+    if (window.syncWorkspaceMachineStateControl) window.syncWorkspaceMachineStateControl(strategy || {}, window.workspaceStateStore || null);
+  };
+
+  window.renderHeader = function renderHeaderLegs(strategy) {
+    const title = document.getElementById("workspaceTitle");
+    const subtitle = document.getElementById("workspaceSubtitle");
+    const legs = Array.isArray(window.workspaceTrackedMarkets) ? window.workspaceTrackedMarkets : [];
+    if (title) title.textContent = strategy?.display_name || strategy?.strategy || "Unnamed";
+    if (subtitle) subtitle.textContent = `Row ${strategy?.row_id || "-"} · ${legs.length} strategy legs`;
   };
 })();

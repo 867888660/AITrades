@@ -1,0 +1,530 @@
+/* 专业量化交易系统UI优化 */
+/* 解决UI拥挤、缺少视觉层次的问题 */
+
+/* ========== 1. 全局布局优化 ========== */
+.ws3-shell {
+  --ws-spacing-xs: 4px;
+  --ws-spacing-sm: 8px;
+  --ws-spacing-md: 12px;
+  --ws-spacing-lg: 16px;
+  --ws-spacing-xl: 24px;
+  --ws-radius: 8px;
+  --ws-radius-sm: 4px;
+
+  /* 专业配色方案 */
+  --ws-bg-primary: #0a0e1a;
+  --ws-bg-secondary: #131824;
+  --ws-bg-tertiary: #1a1f2e;
+  --ws-border-color: rgba(100, 116, 139, 0.2);
+  --ws-text-primary: #f1f5f9;
+  --ws-text-secondary: #94a3b8;
+  --ws-text-muted: #64748b;
+
+  /* 功能色 */
+  --ws-success: #10b981;
+  --ws-warning: #f59e0b;
+  --ws-error: #ef4444;
+  --ws-info: #3b82f6;
+  --ws-long: #22c55e;
+  --ws-short: #ef4444;
+}
+
+/* 增加整体透气度 */
+.ws3-body {
+  padding: var(--ws-spacing-lg);
+  background: var(--ws-bg-primary);
+  gap: var(--ws-spacing-lg);
+}
+
+.ws3-main {
+  padding: var(--ws-spacing-lg);
+  background: var(--ws-bg-secondary);
+  border-radius: var(--ws-radius);
+  border: 1px solid var(--ws-border-color);
+}
+
+/* ========== 2. 工作台头部优化 ========== */
+.ws3-header {
+  padding: var(--ws-spacing-lg) var(--ws-spacing-xl);
+  background: var(--ws-bg-secondary);
+  border-bottom: 2px solid var(--ws-border-color);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  min-height: 72px; /* 增加高度，减少拥挤感 */
+}
+
+.ws3-header-left,
+.ws3-header-right {
+  gap: var(--ws-spacing-md);
+  align-items: center;
+}
+
+.ws3-title-block {
+  margin-left: var(--ws-spacing-md);
+  margin-right: var(--ws-spacing-lg);
+}
+
+.ws3-title-block h1 {
+  font-size: 20px; /* 加大标题 */
+  font-weight: 600;
+  color: var(--ws-text-primary);
+  margin: 0 0 4px 0;
+  letter-spacing: 0.3px;
+}
+
+.ws3-subtitle {
+  font-size: 13px;
+  color: var(--ws-text-secondary);
+  margin: 0;
+  font-family: 'Consolas', 'Monaco', monospace;
+}
+
+/* ========== 3. 图表区域优化 ========== */
+.ws3-chart-area {
+  margin-top: var(--ws-spacing-lg);
+  padding: var(--ws-spacing-lg);
+  background: var(--ws-bg-tertiary);
+  border-radius: var(--ws-radius);
+  border: 1px solid var(--ws-border-color);
+  min-height: 600px; /* 增加最小高度 */
+}
+
+.ws3-chart-toolbar {
+  padding: var(--ws-spacing-md) var(--ws-spacing-lg);
+  background: var(--ws-bg-tertiary);
+  border-radius: var(--ws-radius);
+  margin-bottom: var(--ws-spacing-lg);
+  gap: var(--ws-spacing-md);
+  flex-wrap: wrap;
+  align-items: center;
+  border: 1px solid var(--ws-border-color);
+}
+
+/* 图表时间范围按钮组 */
+.ws3-range-group {
+  display: flex;
+  gap: 6px;
+  padding: 4px;
+  background: var(--ws-bg-secondary);
+  border-radius: var(--ws-radius-sm);
+}
+
+.range-chip {
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 500;
+  border: none;
+  background: transparent;
+  color: var(--ws-text-secondary);
+  cursor: pointer;
+  border-radius: var(--ws-radius-sm);
+  transition: all 0.2s ease;
+  min-width: 52px;
+}
+
+.range-chip:hover {
+  background: rgba(59, 130, 246, 0.1);
+  color: var(--ws-info);
+}
+
+.range-chip.active {
+  background: var(--ws-info);
+  color: white;
+  box-shadow: 0 2px 6px rgba(59, 130, 246, 0.3);
+}
+
+/* 图表元数据显示 */
+.ws3-chart-meta {
+  padding: var(--ws-spacing-sm) var(--ws-spacing-md);
+  background: rgba(59, 130, 246, 0.05);
+  border-left: 3px solid var(--ws-info);
+  border-radius: var(--ws-radius-sm);
+  color: var(--ws-text-secondary);
+  font-size: 12px;
+  font-family: 'Consolas', 'Monaco', monospace;
+  margin-bottom: var(--ws-spacing-md);
+}
+
+/* ========== 4. 指标选择器优化 ========== */
+.metric-picker {
+  padding: var(--ws-spacing-md);
+  background: var(--ws-bg-tertiary);
+  border-radius: var(--ws-radius);
+  margin-bottom: var(--ws-spacing-md);
+  border: 1px solid var(--ws-border-color);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.metric-picker-chip {
+  padding: 6px 12px;
+  background: var(--ws-bg-secondary);
+  border: 1px solid var(--ws-border-color);
+  border-radius: 16px;
+  font-size: 12px;
+  color: var(--ws-text-secondary);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.metric-picker-chip:hover {
+  border-color: var(--ws-info);
+  color: var(--ws-info);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 4px rgba(59, 130, 246, 0.2);
+}
+
+.metric-picker-chip.selected {
+  background: var(--ws-info);
+  border-color: var(--ws-info);
+  color: white;
+  font-weight: 500;
+}
+
+/* ========== 5. 事件流优化 ========== */
+.ws3-events-section {
+  margin-top: var(--ws-spacing-xl);
+  padding: var(--ws-spacing-lg);
+  background: var(--ws-bg-tertiary);
+  border-radius: var(--ws-radius);
+  border: 1px solid var(--ws-border-color);
+}
+
+.ws3-events-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--ws-spacing-md);
+  padding-bottom: var(--ws-spacing-md);
+  border-bottom: 1px solid var(--ws-border-color);
+}
+
+.ws3-events-header h2 {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ws-text-primary);
+  margin: 0;
+}
+
+.ws3-event-filters {
+  display: flex;
+  gap: 6px;
+}
+
+.ws3-filter-chip {
+  padding: 4px 12px;
+  font-size: 12px;
+  border: 1px solid var(--ws-border-color);
+  background: var(--ws-bg-secondary);
+  color: var(--ws-text-secondary);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.ws3-filter-chip:hover {
+  border-color: var(--ws-info);
+  color: var(--ws-info);
+}
+
+.ws3-filter-chip.active {
+  background: var(--ws-info);
+  border-color: var(--ws-info);
+  color: white;
+}
+
+.ws3-events-list {
+  max-height: 400px;
+  overflow-y: auto;
+  padding: var(--ws-spacing-sm);
+}
+
+/* 事件列表项 */
+.ws3-event-item {
+  padding: var(--ws-spacing-sm) var(--ws-spacing-md);
+  margin-bottom: 6px;
+  background: var(--ws-bg-secondary);
+  border-radius: var(--ws-radius-sm);
+  border-left: 3px solid transparent;
+  transition: all 0.2s ease;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.ws3-event-item:hover {
+  background: var(--ws-bg-primary);
+  transform: translateX(2px);
+}
+
+.ws3-event-item.event-error {
+  border-left-color: var(--ws-error);
+  background: rgba(239, 68, 68, 0.05);
+}
+
+.ws3-event-item.event-trade {
+  border-left-color: var(--ws-success);
+  background: rgba(16, 185, 129, 0.05);
+}
+
+.ws3-event-item.event-action {
+  border-left-color: var(--ws-info);
+  background: rgba(59, 130, 246, 0.05);
+}
+
+/* ========== 6. 状态指示器优化 ========== */
+.state-chip {
+  padding: 4px 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border: 1px solid transparent;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.state-chip::before {
+  content: '';
+  display: block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.state-chip.good {
+  background: rgba(16, 185, 129, 0.1);
+  color: var(--ws-success);
+  border-color: rgba(16, 185, 129, 0.3);
+}
+
+.state-chip.good::before {
+  background: var(--ws-success);
+}
+
+.state-chip.error {
+  background: rgba(239, 68, 68, 0.1);
+  color: var(--ws-error);
+  border-color: rgba(239, 68, 68, 0.3);
+}
+
+.state-chip.error::before {
+  background: var(--ws-error);
+}
+
+.state-chip.pending {
+  background: rgba(245, 158, 11, 0.1);
+  color: var(--ws-warning);
+  border-color: rgba(245, 158, 11, 0.3);
+}
+
+.state-chip.pending::before {
+  background: var(--ws-warning);
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+/* ========== 7. 按钮系统优化 ========== */
+.ws3-btn {
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: var(--ws-radius-sm);
+  border: 1px solid transparent;
+  background: var(--ws-info);
+  color: white;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ws3-btn:hover:not(:disabled) {
+  background: #2563eb;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 8px rgba(59, 130, 246, 0.3);
+}
+
+.ws3-btn:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.ws3-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ws3-btn-ghost {
+  background: transparent;
+  border-color: var(--ws-border-color);
+  color: var(--ws-text-secondary);
+}
+
+.ws3-btn-ghost:hover:not(:disabled) {
+  background: var(--ws-bg-tertiary);
+  border-color: var(--ws-info);
+  color: var(--ws-info);
+}
+
+/* ========== 8. 侧边栏优化 ========== */
+.ws3-drawer {
+  padding: var(--ws-spacing-lg);
+  background: var(--ws-bg-secondary);
+  border-left: 2px solid var(--ws-border-color);
+  min-width: 320px;
+  max-width: 400px;
+}
+
+.ws3-drawer-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  background: var(--ws-bg-tertiary);
+  border-radius: var(--ws-radius-sm);
+  margin-bottom: var(--ws-spacing-lg);
+}
+
+.ws3-drawer-tab {
+  flex: 1;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  border: none;
+  background: transparent;
+  color: var(--ws-text-secondary);
+  cursor: pointer;
+  border-radius: var(--ws-radius-sm);
+  transition: all 0.2s ease;
+}
+
+.ws3-drawer-tab.active {
+  background: var(--ws-bg-secondary);
+  color: var(--ws-text-primary);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+/* ========== 9. 表单控件优化 ========== */
+.ws3-select,
+input[type="text"],
+input[type="number"],
+input[type="datetime-local"] {
+  padding: 8px 12px;
+  background: var(--ws-bg-tertiary);
+  border: 1px solid var(--ws-border-color);
+  border-radius: var(--ws-radius-sm);
+  color: var(--ws-text-primary);
+  font-size: 13px;
+  transition: all 0.2s ease;
+}
+
+.ws3-select:focus,
+input[type="text"]:focus,
+input[type="number"]:focus,
+input[type="datetime-local"]:focus {
+  outline: none;
+  border-color: var(--ws-info);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+/* ========== 10. 滚动条美化 ========== */
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: var(--ws-bg-primary);
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--ws-border-color);
+  border-radius: 4px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--ws-text-muted);
+}
+
+/* ========== 11. 响应式优化 ========== */
+@media (max-width: 1400px) {
+  .ws3-header {
+    padding: var(--ws-spacing-md) var(--ws-spacing-lg);
+  }
+
+  .ws3-drawer {
+    min-width: 280px;
+    max-width: 320px;
+  }
+}
+
+@media (max-width: 1200px) {
+  .ws3-body {
+    flex-direction: column;
+  }
+
+  .ws3-drawer {
+    max-width: none;
+    width: 100%;
+    border-left: none;
+    border-top: 2px solid var(--ws-border-color);
+  }
+}
+
+/* ========== 12. 性能提示UI ========== */
+.ws-performance-badge {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  padding: 12px 16px;
+  background: var(--ws-bg-secondary);
+  border: 1px solid var(--ws-border-color);
+  border-radius: var(--ws-radius);
+  font-size: 11px;
+  color: var(--ws-text-secondary);
+  font-family: 'Consolas', 'Monaco', monospace;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  z-index: 9999;
+  opacity: 0.8;
+  transition: opacity 0.2s ease;
+}
+
+.ws-performance-badge:hover {
+  opacity: 1;
+}
+
+.ws-perf-metric {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 4px 0;
+}
+
+.ws-perf-label {
+  color: var(--ws-text-muted);
+}
+
+.ws-perf-value {
+  color: var(--ws-success);
+  font-weight: 600;
+}
+
+.ws-perf-value.warning {
+  color: var(--ws-warning);
+}
+
+.ws-perf-value.error {
+  color: var(--ws-error);
+}
