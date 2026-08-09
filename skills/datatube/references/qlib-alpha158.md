@@ -3,6 +3,14 @@
 Use this workflow when the user asks to compute, test, cache, verify, or diagnose
 Qlib Alpha158 factors for stocks in DataTube.
 
+## Contents
+
+- Exact product name and architecture boundary
+- Preflight and Manifest selection
+- Optional Qlib runtime and computation
+- Verification and failure routing
+- Closeout contract
+
 ## Exact Product Name
 
 The currently implemented pack is:
