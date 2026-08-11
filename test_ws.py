@@ -1,7 +1,11 @@
 import asyncio
-from websockets_proxy import Proxy, proxy_connect
+
+# Manual network diagnostic, not an automated pytest test.  Keep its optional
+# proxy dependency out of collection and import it only when executed directly.
+__test__ = False
 
 async def test_ws_connection():
+    from websockets_proxy import Proxy, proxy_connect
     url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     proxy_url = "http://127.0.0.1:7890"
     print(f"[*] 准备连接到: {url}")

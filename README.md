@@ -65,6 +65,18 @@ Fresh databases start empty. Use the Dictionary refresh button or the collector 
 
 API keys entered on the Settings page are saved to `web_settings.secrets.json`. On Windows, secrets use current-user DPAPI protection; non-Windows installations use a local Fernet key. Secret files are ignored by Git. The Settings page and `/api/settings` are restricted to requests from this computer, and the API returns only configured/count flags—not saved secret values. Leaving a secret field blank preserves the current value; deletion requires the explicit clear checkbox.
 
+### Managed History Data root
+
+Settings > History Data can consolidate historical storage under one absolute
+directory, such as `E:\DataTubeHistoricalData`. The inspection step inventories
+the History workspace DB, Data Platform storage, strategy-history DBs, configured
+source archives, and external catalog paths. Normalization runs in the background,
+uses online SQLite backups, copies files through temporary targets, preserves all
+source data, and writes the activation marker only after verification succeeds.
+Restart DataTube after a successful normalization so every history and Research
+service uses the managed root. Existing immutable Manifest paths are resolved
+through marker aliases instead of rewriting Manifest records.
+
 Before publishing, rotate any API key that was ever committed or shared.
 
 ## Offline Package

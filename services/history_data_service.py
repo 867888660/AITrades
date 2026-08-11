@@ -13,10 +13,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from services.config_loader import BASE_DIR, get_market_realtime_db_path, load_web_settings
+from services.history_storage_service import get_history_workspace_db_path
 from services.http_client import SESSION, get_timeout
 
 
-HISTORY_DB_PATH = BASE_DIR / "Data" / "history_workspace.db"
+HISTORY_DB_PATH = get_history_workspace_db_path()
 BINANCE_BASE_URLS = ("https://api.binance.com", "https://data-api.binance.vision")
 CLOB_BASE_URL = "https://clob.polymarket.com"
 DEFAULT_BINANCE_INTERVAL = "1m"
@@ -298,15 +299,18 @@ def list_watchlist(source: str = "") -> List[Dict[str, Any]]:
 
 def add_watchlist_item(payload: Dict[str, Any]) -> Dict[str, Any]:
     source = str(payload.get("source") or "").strip().lower()
-    if source not in {"binance", "polymarket"}:
-        raise ValueError("source must be binance or polymarket")
+    if source not in {"binance", "polymarket", "datatube_manifest"}:
+        raise ValueError("source must be binance, polymarket, or datatube_manifest")
     interval = str(payload.get("interval") or "").strip()
     if source == "binance" and not interval:
         interval = DEFAULT_BINANCE_INTERVAL
+    if source == "datatube_manifest" and not interval:
+        interval = "1d"
     instrument_id = str(payload.get("instrument_id") or "").strip()
     symbol = str(payload.get("symbol") or "").strip().upper()
     condition_id = str(payload.get("condition_id") or "").strip()
     token_id = str(payload.get("token_id") or "").strip()
+    manifest_id = str(payload.get("manifest_id") or payload.get("dataset_manifest_id") or "").strip()
     if not instrument_id:
         if source == "binance" and symbol:
             instrument_id = f"crypto_spot:binance:{symbol}"
@@ -314,12 +318,26 @@ def add_watchlist_item(payload: Dict[str, Any]) -> Dict[str, Any]:
             instrument_id = f"polymarket:token:{token_id}"
         elif source == "polymarket" and condition_id:
             instrument_id = f"polymarket:condition:{condition_id}"
+        elif source == "datatube_manifest" and manifest_id:
+            from services.data_platform import DatasetCatalogService, get_default_store
+
+            manifest = DatasetCatalogService(get_default_store()).get_manifest(manifest_id)
+            catalog = (
+                DatasetCatalogService(get_default_store()).get_catalog(manifest.dataset_id)
+                if manifest is not None
+                else None
+            )
+            instrument_id = str(catalog.instrument_id if catalog is not None else "").strip()
     if not instrument_id:
         raise ValueError("instrument_id, symbol, condition_id, or token_id is required")
+    if source == "datatube_manifest" and not manifest_id:
+        raise ValueError("datatube_manifest watchlist item requires manifest_id")
     ts = _now_iso()
     meta = payload.get("meta")
     if not isinstance(meta, dict):
         meta = {k: v for k, v in payload.items() if k not in {"meta"}}
+    if manifest_id:
+        meta = {**meta, "manifest_id": manifest_id}
     conn = _connect()
     try:
         conn.execute(
@@ -437,6 +455,22 @@ def _coverage_window_for_leg(
             "status": coverage.get("status") or "empty",
             "coverage": coverage,
         }
+    if source == "datatube_manifest":
+        coverage = _get_coverage_cached(
+            coverage_cache,
+            "datatube_manifest",
+            manifest_id=_leg_manifest_id(leg),
+            instrument_id=leg.get("instrument_id"),
+        )
+        return {
+            "source": "datatube_manifest",
+            "instrument": leg.get("display_name") or leg.get("symbol") or leg.get("instrument_id"),
+            "count": int(coverage.get("count") or 0),
+            "from": coverage.get("from"),
+            "to": coverage.get("to"),
+            "status": coverage.get("status") or "empty",
+            "coverage": coverage,
+        }
     return {
         "source": source or "unknown",
         "instrument": leg.get("display_name") or leg.get("instrument_id"),
@@ -512,6 +546,18 @@ def _decode_case_row(
 
 def _leg_source(leg: Dict[str, Any]) -> str:
     return str(leg.get("source") or leg.get("venue") or "").strip().lower()
+
+
+def _leg_manifest_id(leg: Dict[str, Any]) -> str:
+    meta = leg.get("meta") if isinstance(leg.get("meta"), dict) else {}
+    instrument_json = leg.get("instrument_json") if isinstance(leg.get("instrument_json"), dict) else {}
+    return str(
+        leg.get("manifest_id")
+        or leg.get("dataset_manifest_id")
+        or meta.get("manifest_id")
+        or instrument_json.get("manifest_id")
+        or ""
+    ).strip()
 
 
 def _leg_asset_class(leg: Dict[str, Any]) -> str:
@@ -613,14 +659,29 @@ def _case_compatibility(
         issues.append({"level": "error", "message": "No legs selected."})
     for leg in legs:
         source = _leg_source(leg)
-        coverage = _get_coverage_cached(
-            coverage_cache,
-            "binance" if source == "binance" else "polymarket",
-            symbol=leg.get("symbol"),
-            interval=leg.get("interval") or DEFAULT_BINANCE_INTERVAL,
-            condition_id=leg.get("condition_id"),
-            token_id=leg.get("token_id") or leg.get("yes_token"),
-        )
+        if source == "binance":
+            coverage = _get_coverage_cached(
+                coverage_cache,
+                "binance",
+                symbol=leg.get("symbol"),
+                interval=leg.get("interval") or DEFAULT_BINANCE_INTERVAL,
+            )
+        elif source == "polymarket":
+            coverage = _get_coverage_cached(
+                coverage_cache,
+                "polymarket",
+                condition_id=leg.get("condition_id"),
+                token_id=leg.get("token_id") or leg.get("yes_token"),
+            )
+        elif source == "datatube_manifest":
+            coverage = _get_coverage_cached(
+                coverage_cache,
+                "datatube_manifest",
+                manifest_id=_leg_manifest_id(leg),
+                instrument_id=leg.get("instrument_id"),
+            )
+        else:
+            coverage = {"count": 0, "status": "unknown_source"}
         if source == "binance":
             if int(coverage.get("count") or 0) <= 0:
                 issues.append({"level": "warning", "message": f"{leg.get('display_name') or leg.get('symbol') or leg.get('instrument_id')} has no local Binance kline coverage."})
@@ -629,6 +690,11 @@ def _case_compatibility(
             downloaded = coverage.get("downloaded_price_history") or {}
             if int(local.get("count") or 0) <= 0 and int(downloaded.get("count") or 0) <= 0:
                 issues.append({"level": "warning", "message": f"{leg.get('display_name') or leg.get('instrument_id')} has no local Polymarket history coverage."})
+        elif source == "datatube_manifest":
+            if int(coverage.get("count") or 0) <= 0:
+                issues.append({"level": "error", "message": f"{leg.get('display_name') or leg.get('instrument_id')} has no READY DataTube Manifest coverage."})
+            if str(coverage.get("schema_version") or "") != "bars.v1":
+                issues.append({"level": "error", "message": "History backtest requires a bars.v1 DataTube Manifest."})
         else:
             issues.append({"level": "warning", "message": f"{leg.get('display_name') or leg.get('instrument_id')} source is unknown."})
 
@@ -647,13 +713,24 @@ def _case_compatibility(
         signal_source_type = str(signal_source.get("type") or "LEGACY_STRATEGY_CODE").upper()
         strategy_code = str(strategy.get("strategy_code") or "").strip()
         if signal_source_type == "LIBRARY_ALPHA":
-            intervals = {str(leg.get("interval") or DEFAULT_BINANCE_INTERVAL).lower() for leg in legs}
+            intervals = {
+                str(
+                    leg.get("interval")
+                    or ("1d" if _leg_source(leg) == "datatube_manifest" else DEFAULT_BINANCE_INTERVAL)
+                ).lower()
+                for leg in legs
+            }
             instrument_ids = {
                 str(leg.get("instrument_id") or leg.get("symbol") or "").strip()
                 for leg in legs
             }
-            if sources != {"binance"} or (asset_classes and asset_classes != {"crypto_spot"}):
-                issues.append({"level": "error", "message": "Library Alpha backtest currently requires all-Binance crypto_spot legs."})
+            supported_library_inputs = (
+                sources == {"binance"} and (not asset_classes or asset_classes == {"crypto_spot"})
+            ) or (
+                sources == {"datatube_manifest"} and (not asset_classes or asset_classes == {"equity"})
+            )
+            if not supported_library_inputs:
+                issues.append({"level": "error", "message": "Library Alpha backtest requires all-Binance crypto_spot legs or all-DataTube-Manifest equity legs."})
             if len(intervals) > 1:
                 issues.append({"level": "error", "message": "Library Alpha backtest requires one shared bar interval across all legs."})
             if "" in instrument_ids or len(instrument_ids) != len(legs):
@@ -1285,6 +1362,68 @@ def _read_binance_kline_rows(
         params,
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+def _read_datatube_manifest_rows(
+    leg: Dict[str, Any],
+    start_ms: Optional[int],
+    end_ms: Optional[int],
+    limit: int = 500_000,
+) -> List[Dict[str, Any]]:
+    from services.data_platform import DatasetCatalogService, FrozenManifestData, get_default_store
+
+    manifest_id = _leg_manifest_id(leg)
+    if not manifest_id:
+        raise ValueError("datatube_manifest leg requires manifest_id")
+    store = get_default_store()
+    frozen = FrozenManifestData(store, manifest_id)
+    if frozen.manifest.schema_version != "bars.v1":
+        raise ValueError(f"history backtest requires bars.v1 Manifest: {manifest_id}")
+    catalog = DatasetCatalogService(store).get_catalog(frozen.dataset_id)
+    if catalog is None:
+        raise ValueError(f"catalog entry is missing for Manifest: {manifest_id}")
+    expected_instrument = str(leg.get("instrument_id") or "").strip()
+    if expected_instrument and expected_instrument != str(catalog.instrument_id):
+        raise ValueError(
+            f"Manifest {manifest_id} binds {catalog.instrument_id}, not {expected_instrument}"
+        )
+    requested_interval = str(leg.get("interval") or catalog.frequency or "1d").strip().lower()
+    if requested_interval != str(catalog.frequency or "").strip().lower():
+        raise ValueError(
+            f"Manifest {manifest_id} frequency is {catalog.frequency}, not {requested_interval}"
+        )
+    rows = frozen.read_rows(columns=[
+        "instrument_id", "bar_start_time", "bar_end_time", "available_time",
+        "open", "high", "low", "close", "volume", "bar_status",
+    ])
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        open_time_ms = _parse_time_ms(row.get("bar_start_time"))
+        if open_time_ms is None:
+            continue
+        if start_ms is not None and open_time_ms < start_ms:
+            continue
+        if end_ms is not None and open_time_ms > end_ms:
+            continue
+        if str(row.get("bar_status") or "").upper() != "COMPLETE":
+            continue
+        result.append({
+            "open_time_ms": open_time_ms,
+            "open_time_utc": _ms_to_iso(open_time_ms),
+            "open": row.get("open"),
+            "high": row.get("high"),
+            "low": row.get("low"),
+            "close": row.get("close"),
+            "volume": row.get("volume"),
+            "manifest_id": manifest_id,
+            "manifest_hash": frozen.manifest.manifest_hash,
+            "dataset_id": frozen.dataset_id,
+            "available_time": row.get("available_time"),
+        })
+        if len(result) >= int(limit):
+            break
+    result.sort(key=lambda item: int(item["open_time_ms"]))
+    return result
 
 
 def _maybe_download_binance_for_run(
@@ -2737,10 +2876,12 @@ def _execute_library_alpha_backtest(
 ) -> None:
     from services.library_alpha_backtest_adapter import LibraryAlphaHistoryBacktestAdapter
 
-    if not legs or any(_leg_source(leg) != "binance" for leg in legs):
-        finish_failed("Library Alpha backtest currently requires all-Binance case legs.")
+    sources = {_leg_source(leg) for leg in legs}
+    if not legs or sources not in ({"binance"}, {"datatube_manifest"}):
+        finish_failed("Library Alpha backtest requires all-Binance or all-DataTube-Manifest case legs.")
         return
-    intervals = {str(leg.get("interval") or DEFAULT_BINANCE_INTERVAL).strip() for leg in legs}
+    default_interval = DEFAULT_BINANCE_INTERVAL if sources == {"binance"} else "1d"
+    intervals = {str(leg.get("interval") or default_interval).strip() for leg in legs}
     if len(intervals) != 1:
         finish_failed("Library Alpha backtest requires one shared interval across all legs.")
         return
@@ -2750,20 +2891,26 @@ def _execute_library_alpha_backtest(
     strict_window = bool(window.get("strict"))
     events: List[Dict[str, Any]] = []
     _mark_backtest_progress(run_id, 18, "loading_data", f"Loading local bars for Library Alpha across {len(legs)} instruments.")
-    conn = _connect()
-    try:
+    if sources == {"binance"}:
+        conn = _connect()
+        try:
+            leg_rows = [
+                _read_binance_kline_rows(
+                    conn,
+                    str(leg.get("symbol") or "").upper().strip(),
+                    interval,
+                    start_ms,
+                    end_ms,
+                )
+                for leg in legs
+            ]
+        finally:
+            conn.close()
+    else:
         leg_rows = [
-            _read_binance_kline_rows(
-                conn,
-                str(leg.get("symbol") or "").upper().strip(),
-                interval,
-                start_ms,
-                end_ms,
-            )
+            _read_datatube_manifest_rows(leg, start_ms, end_ms)
             for leg in legs
         ]
-    finally:
-        conn.close()
 
     min_points = max(20, _safe_int(params.get("min_points"), 20))
     for index, (leg, rows) in enumerate(zip(legs, leg_rows)):
@@ -2771,9 +2918,14 @@ def _execute_library_alpha_backtest(
             events.append({
                 "event_type": "data_window_missing_download_required",
                 "message": f"{leg.get('symbol') or leg.get('instrument_id')} has only {len(rows)} local bars.",
-                "meta": {"leg_index": index, "points": len(rows), "min_points": min_points, "download_required": True},
+                "meta": {
+                    "leg_index": index,
+                    "points": len(rows),
+                    "min_points": min_points,
+                    "download_required": sources == {"binance"},
+                },
             })
-            finish_failed(f"Missing Binance history for Library Alpha leg {index + 1}.", events)
+            finish_failed(f"Missing local history for Library Alpha leg {index + 1}.", events)
             return
         if strict_window:
             first_ms = _safe_int(rows[0].get("open_time_ms"), 0)
@@ -2784,7 +2936,7 @@ def _execute_library_alpha_backtest(
                     "message": f"{leg.get('symbol') or leg.get('instrument_id')} has partial data in the strict window.",
                     "meta": {"leg_index": index, "actual_start": _ms_to_iso(first_ms), "actual_end": _ms_to_iso(last_ms)},
                 })
-                finish_failed(f"Missing strict-window Binance history for Library Alpha leg {index + 1}.", events)
+                finish_failed(f"Missing strict-window local history for Library Alpha leg {index + 1}.", events)
                 return
 
     row_maps = [{_safe_int(row.get("open_time_ms"), 0): row for row in rows} for rows in leg_rows]
@@ -3035,21 +3187,23 @@ def _execute_backtest_run(run_id: int) -> None:
     if not strategy_code:
         finish_failed("No StrategyCode selected.")
         return
-    if len(legs) != 1 or _leg_source(legs[0]) != "binance":
+    if len(legs) != 1 or _leg_source(legs[0]) not in {"binance", "datatube_manifest"}:
         if legs and all(_leg_source(leg) == "binance" for leg in legs):
             _execute_multi_binance_backtest(run_id, snapshot, strategy_code, params, legs, ts, finish_failed)
             return
         if legs and all(_leg_source(leg) == "polymarket" for leg in legs):
             _execute_polymarket_backtest(run_id, snapshot, strategy_code, params, legs, ts, finish_failed)
             return
-        finish_failed("Backtest execution currently supports all-Binance or all-Polymarket cases. Mixed-source replay is planned.")
+        finish_failed("Backtest execution supports all-Binance, all-Polymarket, or a single DataTube Manifest case. Mixed-source replay is planned.")
         return
 
     _mark_backtest_progress(run_id, 15, "validated", "Strategy and case compatibility passed.")
     leg = legs[0]
+    source = _leg_source(leg)
     availability = _case_data_availability(legs)
-    symbol = str(leg.get("symbol") or "").upper().strip()
-    interval = str(leg.get("interval") or DEFAULT_BINANCE_INTERVAL).strip() or DEFAULT_BINANCE_INTERVAL
+    symbol = str(leg.get("symbol") or leg.get("instrument_id") or "").upper().strip()
+    default_interval = "1d" if source == "datatube_manifest" else DEFAULT_BINANCE_INTERVAL
+    interval = str(leg.get("interval") or default_interval).strip() or default_interval
     start_ms, end_ms = _window_ms_from_snapshot(snapshot)
     window = snapshot.get("data_window") if isinstance(snapshot.get("data_window"), dict) else {}
     strict_window = bool(window.get("strict"))
@@ -3060,15 +3214,18 @@ def _execute_backtest_run(run_id: int) -> None:
         run_id,
         20,
         "loading_data",
-        f"Loading local klines for {symbol} {interval}.",
-        meta={"symbol": symbol, "interval": interval, "requested_start": _ms_to_iso(start_ms), "requested_end": _ms_to_iso(end_ms)},
+        f"Loading pinned Manifest bars for {symbol} {interval}." if source == "datatube_manifest" else f"Loading local klines for {symbol} {interval}.",
+        meta={"symbol": symbol, "interval": interval, "manifest_id": _leg_manifest_id(leg), "requested_start": _ms_to_iso(start_ms), "requested_end": _ms_to_iso(end_ms)},
     )
-    conn = _connect()
-    try:
-        rows = _read_binance_kline_rows(conn, symbol, interval, start_ms, end_ms)
-    finally:
-        conn.close()
-    _mark_backtest_progress(run_id, 25, "checking_data", f"Loaded {len(rows)} local kline points; checking coverage.")
+    if source == "datatube_manifest":
+        rows = _read_datatube_manifest_rows(leg, start_ms, end_ms)
+    else:
+        conn = _connect()
+        try:
+            rows = _read_binance_kline_rows(conn, symbol, interval, start_ms, end_ms)
+        finally:
+            conn.close()
+    _mark_backtest_progress(run_id, 25, "checking_data", f"Loaded {len(rows)} local bar points; checking coverage.")
 
     def download_progress(meta: Dict[str, Any]) -> None:
         pages = _safe_int(meta.get("pages"), 0)
@@ -3087,7 +3244,7 @@ def _execute_backtest_run(run_id: int) -> None:
         needs_more_before = bool(start_ms and first_ms and first_ms > start_ms + _interval_ms(interval))
         needs_more_after = bool(end_ms and last_ms and last_ms < end_ms - _interval_ms(interval))
         if needs_more_before or needs_more_after:
-            if auto_download_missing:
+            if auto_download_missing and source == "binance":
                 fetch_start = start_ms if needs_more_before else (last_ms + _interval_ms(interval) if last_ms else start_ms)
                 _mark_backtest_progress(run_id, 28, "downloading_data", f"Downloading missing Binance window for {symbol} {interval}.")
                 download_result = _maybe_download_binance_for_run(symbol, interval, fetch_start, end_ms, download_progress)
@@ -3103,21 +3260,37 @@ def _execute_backtest_run(run_id: int) -> None:
                 finally:
                     conn.close()
             else:
+                source_name = "pinned DataTube Manifest" if source == "datatube_manifest" else "Binance kline data"
                 events.append({
                     "event_type": "data_window_missing_download_required",
-                    "message": f"{symbol} has partial local data in the requested window. Confirm download in Backtest Report to fill the missing range.",
+                    "message": f"{symbol} has partial {source_name} in the requested window.",
                     "meta": {
                         "requested_start": _ms_to_iso(start_ms) if start_ms else None,
                         "requested_end": _ms_to_iso(end_ms) if end_ms else None,
                         "actual_start": rows[0].get("open_time_utc") if rows else None,
                         "actual_end": rows[-1].get("open_time_utc") if rows else None,
-                        "download_required": True,
+                        "download_required": source == "binance",
                     },
                 })
-                finish_failed(f"Missing Binance kline data for {symbol} {interval}. Download is required before backtest.", events)
+                finish_failed(f"Missing {source_name} for {symbol} {interval}.", events)
                 return
     if len(rows) < min_points:
-        if auto_download_missing:
+        if source == "datatube_manifest" and not strict_window:
+            rows = _read_datatube_manifest_rows(leg, None, None)
+            if rows:
+                events.append({
+                    "event_type": "data_window_fallback",
+                    "message": f"{symbol} has too few Manifest bars in the requested window; using the full pinned Manifest.",
+                    "meta": {
+                        "manifest_id": _leg_manifest_id(leg),
+                        "requested_start": _ms_to_iso(start_ms) if start_ms else None,
+                        "requested_end": _ms_to_iso(end_ms) if end_ms else None,
+                        "available_start": rows[0].get("open_time_utc"),
+                        "available_end": rows[-1].get("open_time_utc"),
+                        "points": len(rows),
+                    },
+                })
+        elif auto_download_missing:
             _mark_backtest_progress(run_id, 30, "downloading_data", f"Downloading Binance klines for {symbol} {interval}.")
             download_result = _maybe_download_binance_for_run(symbol, interval, start_ms, end_ms, download_progress)
             events.append({
@@ -3146,17 +3319,18 @@ def _execute_backtest_run(run_id: int) -> None:
             finally:
                 conn.close()
         else:
+            source_name = "pinned DataTube Manifest" if source == "datatube_manifest" else "Binance kline data"
             events.append({
                 "event_type": "data_window_missing_download_required",
-                "message": f"{symbol} has not enough local klines in the requested window. Confirm download in Backtest Report to fill the range.",
+                "message": f"{symbol} has insufficient {source_name} in the requested window.",
                 "meta": {
                     "requested_start": _ms_to_iso(start_ms) if start_ms else None,
                     "requested_end": _ms_to_iso(end_ms) if end_ms else None,
                     "points": len(rows),
-                    "download_required": True,
+                    "download_required": source == "binance",
                 },
             })
-            finish_failed(f"Missing Binance kline data for {symbol} {interval}. Download is required before backtest.", events)
+            finish_failed(f"Missing {source_name} for {symbol} {interval}.", events)
             return
     if len(rows) < min_points:
         if strict_window:
@@ -3169,7 +3343,7 @@ def _execute_backtest_run(run_id: int) -> None:
                     "points": len(rows),
                 },
             })
-        finish_failed(f"Not enough Binance kline data for {symbol} {interval}: {len(rows)} points.", events)
+        finish_failed(f"Not enough local bar data for {symbol} {interval}: {len(rows)} points.", events)
         return
     _mark_backtest_progress(run_id, 50, "data_ready", f"Data ready: {len(rows)} kline points will be evaluated.")
     if strict_window and rows:
@@ -4301,13 +4475,69 @@ def get_polymarket_coverage(condition_id: str = "", token_id: str = "") -> Dict[
     }
 
 
+def get_datatube_manifest_coverage(manifest_id: str, instrument_id: str = "") -> Dict[str, Any]:
+    from services.data_platform import DatasetCatalogService, get_default_store
+
+    manifest_id = str(manifest_id or "").strip()
+    instrument_id = str(instrument_id or "").strip()
+    if not manifest_id:
+        return {
+            "source": "datatube_manifest",
+            "manifest_id": "",
+            "instrument_id": instrument_id,
+            "count": 0,
+            "from": None,
+            "to": None,
+            "status": "missing_manifest_id",
+        }
+    catalog_service = DatasetCatalogService(get_default_store())
+    manifest = catalog_service.get_manifest(manifest_id)
+    if manifest is None:
+        return {
+            "source": "datatube_manifest",
+            "manifest_id": manifest_id,
+            "instrument_id": instrument_id,
+            "count": 0,
+            "from": None,
+            "to": None,
+            "status": "missing_manifest",
+        }
+    catalog = catalog_service.get_catalog(manifest.dataset_id)
+    actual_instrument = str(catalog.instrument_id if catalog is not None else "").strip()
+    identity_match = not instrument_id or not actual_instrument or instrument_id == actual_instrument
+    starts = [item.min_event_time or item.start_time for item in manifest.partitions if item.min_event_time or item.start_time]
+    ends = [item.max_event_time or item.end_time for item in manifest.partitions if item.max_event_time or item.end_time]
+    count = sum(int(item.row_count) for item in manifest.partitions) if identity_match else 0
+    status = "ok" if manifest.status == "READY" and identity_match and count else (
+        "instrument_mismatch" if not identity_match else str(manifest.status or "empty").lower()
+    )
+    return {
+        "source": "datatube_manifest",
+        "manifest_id": manifest_id,
+        "dataset_id": manifest.dataset_id,
+        "instrument_id": actual_instrument or instrument_id,
+        "count": count,
+        "from": min(starts) if starts and identity_match else None,
+        "to": max(ends) if ends and identity_match else None,
+        "frequency": str(catalog.frequency if catalog is not None else ""),
+        "schema_version": manifest.schema_version,
+        "manifest_hash": manifest.manifest_hash,
+        "status": status,
+    }
+
+
 def get_coverage(source: str, **kwargs: Any) -> Dict[str, Any]:
     source = str(source or "").strip().lower()
     if source == "binance":
         return get_binance_coverage(str(kwargs.get("symbol") or ""), str(kwargs.get("interval") or DEFAULT_BINANCE_INTERVAL))
     if source == "polymarket":
         return get_polymarket_coverage(str(kwargs.get("condition_id") or ""), str(kwargs.get("token_id") or ""))
-    raise ValueError("source must be binance or polymarket")
+    if source == "datatube_manifest":
+        return get_datatube_manifest_coverage(
+            str(kwargs.get("manifest_id") or ""),
+            str(kwargs.get("instrument_id") or ""),
+        )
+    raise ValueError("source must be binance, polymarket, or datatube_manifest")
 
 
 def download_binance_klines(payload: Dict[str, Any]) -> Dict[str, Any]:

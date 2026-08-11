@@ -20,11 +20,13 @@ class SecureSettingsV2Test(unittest.TestCase):
                 "coingecko_api_key": "two",
                 "llm_api_key": "three",
                 "openbb_fred_api_key": "four",
+                "openbb_provider_credentials": {"polygon_api_key": "five"},
             }
             save_secrets(secrets_path, key_path, original)
             stored = json.loads(secrets_path.read_text(encoding="utf-8"))
             self.assertEqual(stored["version"], 2)
             self.assertNotIn("four", secrets_path.read_text(encoding="utf-8"))
+            self.assertNotIn("five", secrets_path.read_text(encoding="utf-8"))
             if os.name == "nt":
                 self.assertEqual(stored["protection"], "dpapi-user")
                 self.assertFalse(key_path.exists())
@@ -32,6 +34,7 @@ class SecureSettingsV2Test(unittest.TestCase):
             public = strip_sensitive(original)
             self.assertNotIn("openbb_fred_api_key", public)
             self.assertTrue(public["has_openbb_fred_api_key"])
+            self.assertTrue(public["openbb_provider_credential_status"]["polygon_api_key"])
             self.assertEqual(public["finnhub_api_key_count"], 1)
 
 

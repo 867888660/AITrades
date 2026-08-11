@@ -8,6 +8,7 @@ from typing import Any
 
 from .catalog_service import DatasetCatalogService
 from .store import BASE_DIR, DataPlatformStore
+from services.history_storage_service import get_data_platform_canonical_root
 
 
 CANONICAL_BAR_SCHEMA_VERSION = "bars.v1"
@@ -27,7 +28,7 @@ class CanonicalBarsCommitter:
     def __init__(self, store: DataPlatformStore, output_root: str | Path | None = None):
         self.store = store
         self.catalog = DatasetCatalogService(store)
-        self.output_root = Path(output_root or (BASE_DIR / "storage" / "canonical"))
+        self.output_root = Path(output_root or get_data_platform_canonical_root())
 
     def commit(
         self,

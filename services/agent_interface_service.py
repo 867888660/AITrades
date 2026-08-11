@@ -166,7 +166,9 @@ BACKTEST_CAPABILITIES: Dict[str, Any] = {
         "Batch requests select existing history cases by case_ids, collection_name, or strategy_id.",
         "Library Alpha Strategies compile Factor -> Alpha -> target weights and execute at next-bar open with explicit fees and slippage.",
         "History-case Alpha runs record HISTORY_CASE_SNAPSHOT identity; they are not Data Platform Manifest-pinned Research Runs.",
-        "Mixed Binance/Polymarket source replay is reported as planned rather than executed.",
+        "History cases can pin READY bars.v1 DataTube Manifests, including local equity data stored outside the repository.",
+        "A single Manifest leg supports legacy StrategyCode replay; all-Manifest equity legs support Library Alpha replay.",
+        "Mixed Binance/Polymarket/Manifest source replay is reported as planned rather than executed.",
     ],
 }
 
@@ -1471,8 +1473,9 @@ def _build_research_asset_matrix() -> dict:
             "asset_class": "equity",
             "supported_frequencies": ["1d"],
             "prepare_supported": True,
-            "supported_run_types": ["FACTOR_EVALUATION", "ALPHA_EVALUATION"],
-            "notes": "RESEARCH_BACKTEST not supported for equity in v1. "
+            "supported_run_types": ["FACTOR_EVALUATION", "ALPHA_EVALUATION"]
+            + (["RESEARCH_BACKTEST"] if "equity" in rb_classes else []),
+            "notes": "RESEARCH_BACKTEST requires pinned READY daily manifests. "
             "instrument_scope must be comma-separated list or JSON array for multiple tickers. "
             "frequency must be exactly '1d'; any other value is rejected at START.",
         },

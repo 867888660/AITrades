@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from services.history_data_service import HISTORY_DB_PATH, download_polymarket_price_history
+from services.history_storage_service import get_data_platform_canonical_root
 
 from .catalog_service import DatasetCatalogService
 from .store import BASE_DIR, DataPlatformStore
@@ -43,7 +44,7 @@ class PolymarketHistoryPreparer:
     def __init__(self, store: DataPlatformStore, output_root: str | Path | None = None):
         self.store = store
         self.catalog = DatasetCatalogService(store)
-        self.output_root = Path(output_root or (BASE_DIR / "storage" / "canonical"))
+        self.output_root = Path(output_root or get_data_platform_canonical_root())
 
     def prepare(self, payload: dict[str, Any]) -> dict[str, Any]:
         instrument_id = str(payload.get("instrument_id") or "").strip()

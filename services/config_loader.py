@@ -5,6 +5,10 @@ from pathlib import Path
 from typing import Any, Dict
 
 from services.secure_settings import SENSITIVE_SETTING_KEYS, load_secrets, save_secrets, strip_sensitive
+from services.data_source_definitions import (
+    OPENBB_CREDENTIAL_KEYS,
+    normalize_data_source_settings,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -370,6 +374,39 @@ def _normalize_dir_paths(settings: Dict[str, Any]) -> Dict[str, Any]:
     return settings
 
 
+def _normalize_history_storage_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    root_text = str(settings.get("history_data_root") or "").strip()
+    if root_text:
+        root = Path(root_text).expanduser()
+        if not root.is_absolute():
+            raise ValueError("history_data_root must be an absolute path")
+        root = root.resolve(strict=False)
+        if root == Path(root.anchor):
+            raise ValueError("history_data_root cannot be a drive or filesystem root")
+        settings["history_data_root"] = str(root)
+    else:
+        settings["history_data_root"] = ""
+    raw_sources = settings.get("history_data_source_roots") or []
+    if isinstance(raw_sources, str):
+        raw_sources = raw_sources.replace("\r", "\n").split("\n")
+    normalized_sources: list[str] = []
+    for value in raw_sources if isinstance(raw_sources, (list, tuple)) else []:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            raise ValueError(f"history_data_source_roots must contain absolute paths: {text}")
+        path = path.resolve(strict=False)
+        if path == Path(path.anchor):
+            raise ValueError(f"history_data_source_roots cannot contain a drive root: {path}")
+        normalized = str(path)
+        if normalized not in normalized_sources:
+            normalized_sources.append(normalized)
+    settings["history_data_source_roots"] = normalized_sources
+    return settings
+
+
 def _normalize_strategy_storage_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
     legacy_realtime_db_path = str(settings.get("strategy_option_sqlite_db_path", "")).strip()
     table_value = str(settings.get("strategy_monitoring_table", "")).strip()
@@ -422,6 +459,8 @@ def get_default_web_settings() -> Dict[str, Any]:
         "market_realtime_db_path": str(BASE_DIR / "polymarket_realtime.db"),
         "polymarket_dictionary_db_path": str(BASE_DIR / "Data" / "PolyMarketDictionary.db"),
         "strategy_metrics_db_dir": str(BASE_DIR / "strategy_metrics_dbs"),
+        "history_data_root": "",
+        "history_data_source_roots": [],
         "strategy_monitoring_table": "monitoring",
         "include_crypto_fundamentals": True,
         "coingecko_api_key": "",
@@ -431,6 +470,8 @@ def get_default_web_settings() -> Dict[str, Any]:
         "llm_api_key": "",
         "openbb_settings": _normalize_openbb_settings({}),
         "openbb_fred_api_key": "",
+        "openbb_provider_credentials": {},
+        "data_source_settings": normalize_data_source_settings({}),
     }
 
 
@@ -448,6 +489,17 @@ def _load_web_settings_uncached() -> Dict[str, Any]:
     defaults["agent_policy"] = _normalize_agent_policy(defaults.get("agent_policy", {}))
     defaults["llm_settings"] = _normalize_llm_settings(defaults.get("llm_settings", {}))
     defaults["openbb_settings"] = _normalize_openbb_settings(defaults.get("openbb_settings", {}))
+    credentials = defaults.get("openbb_provider_credentials")
+    defaults["openbb_provider_credentials"] = {
+        str(key).strip().lower(): str(value).strip()
+        for key, value in (credentials.items() if isinstance(credentials, dict) else [])
+        if str(key).strip().lower() in OPENBB_CREDENTIAL_KEYS and str(value).strip()
+    }
+    legacy_fred_key = str(defaults.get("openbb_fred_api_key") or "").strip()
+    if legacy_fred_key and not defaults["openbb_provider_credentials"].get("fred_api_key"):
+        defaults["openbb_provider_credentials"]["fred_api_key"] = legacy_fred_key
+    defaults["data_source_settings"] = normalize_data_source_settings(defaults.get("data_source_settings", {}))
+    defaults = _normalize_history_storage_settings(defaults)
     defaults = _normalize_strategy_storage_settings(defaults)
     defaults = _normalize_db_paths(defaults)
     return _normalize_dir_paths(defaults)
@@ -535,11 +587,44 @@ def save_web_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
             current[secret_key] = ""
         elif incoming_secret:
             current[secret_key] = incoming_secret
+    incoming_openbb_credentials = payload.get("openbb_provider_credentials")
+    current_openbb_credentials = current.get("openbb_provider_credentials")
+    current_openbb_credentials = dict(current_openbb_credentials) if isinstance(current_openbb_credentials, dict) else {}
+    if isinstance(incoming_openbb_credentials, dict):
+        for key, value in incoming_openbb_credentials.items():
+            normalized_key = str(key).strip().lower()
+            normalized_value = str(value or "").strip()
+            if normalized_key in OPENBB_CREDENTIAL_KEYS and normalized_value:
+                current_openbb_credentials[normalized_key] = normalized_value
+    clear_openbb_credentials = payload.get("clear_openbb_provider_credentials") or []
+    if isinstance(clear_openbb_credentials, str):
+        clear_openbb_credentials = [clear_openbb_credentials]
+    for key in clear_openbb_credentials:
+        current_openbb_credentials.pop(str(key).strip().lower(), None)
+    current["openbb_provider_credentials"] = {
+        key: value
+        for key, value in current_openbb_credentials.items()
+        if key in OPENBB_CREDENTIAL_KEYS and value
+    }
+    if current["openbb_provider_credentials"].get("fred_api_key"):
+        current["openbb_fred_api_key"] = current["openbb_provider_credentials"]["fred_api_key"]
+    elif "fred_api_key" in {str(item).strip().lower() for item in clear_openbb_credentials}:
+        current["openbb_fred_api_key"] = ""
     current["coingecko_api_key_header"] = str(payload.get("coingecko_api_key_header", current.get("coingecko_api_key_header", "x-cg-demo-api-key"))).strip() or "x-cg-demo-api-key"
     current["include_crypto_fundamentals"] = bool(payload.get("include_crypto_fundamentals", current.get("include_crypto_fundamentals", True)))
     current["agent_policy"] = _normalize_agent_policy(payload.get("agent_policy", current.get("agent_policy", {})))
     current["llm_settings"] = _normalize_llm_settings(payload.get("llm_settings", current.get("llm_settings", {})))
     current["openbb_settings"] = _normalize_openbb_settings(payload.get("openbb_settings", current.get("openbb_settings", {})))
+    current["data_source_settings"] = normalize_data_source_settings(
+        payload.get("data_source_settings", current.get("data_source_settings", {}))
+    )
+    current["history_data_root"] = payload.get(
+        "history_data_root", current.get("history_data_root", "")
+    )
+    current["history_data_source_roots"] = payload.get(
+        "history_data_source_roots", current.get("history_data_source_roots", [])
+    )
+    current = _normalize_history_storage_settings(current)
     current = _normalize_strategy_storage_settings(current)
     current = _normalize_db_paths(current)
     current = _normalize_dir_paths(current)

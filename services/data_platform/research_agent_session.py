@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -52,6 +54,19 @@ DEFAULT_SESSION_POLICY = {
         "LIVE_TRADING",
         "HISTORY_DELETE",
     ],
+}
+
+_START_LOCK = threading.Lock()
+_BRIEF_FIELDS = {
+    "objective",
+    "goal",
+    "instrument_scope",
+    "provider",
+    "frequency",
+    "research_period",
+    "evaluation_metrics",
+    "constraints",
+    "benchmark",
 }
 
 
@@ -118,22 +133,38 @@ class ResearchAgentSessionService:
     def start(self, payload: dict[str, Any], *, created_by: str = "local_user") -> dict[str, Any]:
         brief = normalize_research_brief(payload)
         title = _clean(payload.get("title")) or brief["objective"][:96]
-        project = self.control.create_project(title=title, objective=brief["objective"], created_by=created_by)
-        context = self.resolver.resolve("PROJECT", project["project_id"])
-        grant = self._create_internal_research_budget(project["project_id"], brief, created_by=created_by)
-        session = self._insert_session(
-            entry_mode="START",
-            project_id=project["project_id"],
-            objective=brief["objective"],
-            brief=brief,
-            context=context,
-            internal_grant_id=grant["grant_id"],
-            created_by=created_by,
-        )
+        idempotency_key = self._start_idempotency_key(payload, brief, title, created_by)
+        with _START_LOCK:
+            existing = self._get_by_idempotency_key(idempotency_key)
+            if existing is not None:
+                if dict(existing.get("brief") or {}) != brief:
+                    raise ValueError(
+                        "RESEARCH_IDEMPOTENCY_CONFLICT: idempotency_key was already used "
+                        "for a different Research Brief"
+                    )
+                grant = self.control.get_grant(_clean(existing.get("internal_grant_id")))
+                existing["resolved_grant_scope"] = dict((grant or {}).get("scope") or {})
+                existing["idempotency_reused"] = True
+                return existing
+
+            project = self.control.create_project(title=title, objective=brief["objective"], created_by=created_by)
+            context = self.resolver.resolve("PROJECT", project["project_id"])
+            grant = self._create_internal_research_budget(project["project_id"], brief, created_by=created_by)
+            session = self._insert_session(
+                entry_mode="START",
+                project_id=project["project_id"],
+                objective=brief["objective"],
+                brief=brief,
+                context=context,
+                internal_grant_id=grant["grant_id"],
+                idempotency_key=idempotency_key,
+                created_by=created_by,
+            )
         # Echo back the resolved grant scope so agents see exactly what was
         # authorized; this makes silent truncation or scope mismatches visible
         # at START instead of three steps later at write time.
         session["resolved_grant_scope"] = dict(grant.get("scope") or {})
+        session["idempotency_reused"] = False
         return session
 
     def resume(
@@ -147,10 +178,18 @@ class ResearchAgentSessionService:
         payload = dict(payload or {})
         context = self.resolver.resolve(anchor_type, anchor_id)
         project_id = _clean(context.get("project_id"))
-        objective = _clean(payload.get("objective"))
+        base_brief, resume_brief_source = self._resume_base_brief(
+            anchor_type, anchor_id, project_id
+        )
+        merged_brief = dict(base_brief)
+        for key in _BRIEF_FIELDS:
+            if key in payload and payload.get(key) is not None:
+                merged_brief[key] = payload[key]
+        objective = _clean(merged_brief.get("objective") or merged_brief.get("goal"))
         if not objective:
             objective = _clean((context.get("project") or {}).get("objective")) or f"Resume research from {anchor_type}:{anchor_id}"
-        brief = normalize_research_brief({**payload, "objective": objective})
+        merged_brief["objective"] = objective
+        brief = normalize_research_brief(merged_brief)
         if context.get("resolution_status") != "RESOLVED":
             return self._insert_session(
                 entry_mode="RESUME",
@@ -170,7 +209,7 @@ class ResearchAgentSessionService:
             )
         grant = self._create_internal_research_budget(project_id, brief, created_by=created_by)
         baseline = _clean(context.get("baseline_run_id"))
-        return self._insert_session(
+        session = self._insert_session(
             entry_mode="RESUME",
             project_id=project_id,
             objective=brief["objective"],
@@ -183,6 +222,9 @@ class ResearchAgentSessionService:
             internal_grant_id=grant["grant_id"],
             created_by=created_by,
         )
+        session["resolved_grant_scope"] = dict(grant.get("scope") or {})
+        session["resume_brief_source"] = resume_brief_source
+        return session
 
     def get(self, session_id: str, *, include_events: bool = True, include_iterations: bool = True) -> dict[str, Any] | None:
         with self.store.connection() as conn:
@@ -203,7 +245,107 @@ class ResearchAgentSessionService:
                     (_clean(session_id),),
                 ).fetchall()
                 result["events"] = [self._event_row(item) for item in events]
+        project_id = _clean(result.get("project_id"))
+        if project_id and _clean(result.get("resolution_status")).upper() == "RESOLVED":
+            latest_context = self.resolver.resolve("PROJECT", project_id)
+            if latest_context.get("resolution_status") == "RESOLVED":
+                result["context"] = latest_context
         return result
+
+    def _get_by_idempotency_key(self, idempotency_key: str) -> dict[str, Any] | None:
+        with self.store.connection() as conn:
+            row = conn.execute(
+                "SELECT session_id FROM research_agent_sessions WHERE idempotency_key=?",
+                (_clean(idempotency_key),),
+            ).fetchone()
+        return self.get(str(row[0])) if row else None
+
+    @staticmethod
+    def _start_idempotency_key(
+        payload: dict[str, Any], brief: dict[str, Any], title: str, created_by: str
+    ) -> str:
+        explicit = _clean(payload.get("idempotency_key"))
+        if explicit:
+            return f"research-start:{_clean(created_by) or 'local_user'}:{explicit}"
+        fingerprint = hashlib.sha256(
+            json_dumps(
+                {
+                    "brief": brief,
+                    "created_by": _clean(created_by) or "local_user",
+                    "title": title,
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        return f"research-start:auto:{fingerprint}"
+
+    def _resume_base_brief(
+        self, anchor_type: str, anchor_id: str, project_id: str
+    ) -> tuple[dict[str, Any], str]:
+        if _clean(anchor_type).upper() == "SESSION":
+            anchored = self.get(anchor_id, include_events=False, include_iterations=False)
+            if anchored is not None:
+                brief = dict(anchored.get("brief") or {})
+                if brief:
+                    return brief, "ANCHOR_SESSION"
+        if not project_id:
+            return {}, "REQUEST_DEFAULTS"
+        project = self.control.get_project(project_id) or {}
+        current_version = int(project.get("current_plan_version") or 0)
+        plans = self.control.list_plans(project_id)
+        candidates = [item for item in plans if int(item.get("plan_version") or 0) == current_version]
+        candidates.sort(
+            key=lambda item: (
+                _clean(item.get("status")).upper() == "APPROVED",
+                _clean(item.get("plan_stage")).upper() in {"APPROVED", "RESOLVED"},
+            ),
+            reverse=True,
+        )
+        for item in candidates:
+            brief = dict((item.get("plan") or {}).get("research_brief") or {})
+            if brief:
+                if self._looks_like_legacy_resume_default_drift(brief):
+                    recovered = self._recover_start_brief(project_id)
+                    if recovered:
+                        return recovered, "START_SESSION_RECOVERY"
+                return brief, "PROJECT_PLAN"
+        recovered = self._recover_start_brief(project_id)
+        if recovered:
+            return recovered, "START_SESSION_RECOVERY"
+        return {}, "REQUEST_DEFAULTS"
+
+    @staticmethod
+    def _looks_like_legacy_resume_default_drift(brief: dict[str, Any]) -> bool:
+        scope = brief.get("instrument_scope")
+        has_scope = bool(scope) if isinstance(scope, (list, tuple, set, dict)) else bool(_clean(scope))
+        return (
+            not has_scope
+            and _clean(brief.get("provider") or "BINANCE").upper() == "BINANCE"
+            and _clean(brief.get("frequency") or "1h").lower() == "1h"
+        )
+
+    def _recover_start_brief(self, project_id: str) -> dict[str, Any]:
+        with self.store.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT brief_json
+                FROM research_agent_sessions
+                WHERE project_id=? AND entry_mode='START'
+                ORDER BY created_at ASC, session_id ASC
+                """,
+                (_clean(project_id),),
+            ).fetchall()
+        for row in rows:
+            try:
+                candidate = json.loads(str(row["brief_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(candidate, dict)
+                and candidate
+                and not self._looks_like_legacy_resume_default_drift(candidate)
+            ):
+                return candidate
+        return {}
 
     def list(self, *, project_id: str = "", status: str = "", limit: int = 100) -> list[dict[str, Any]]:
         clauses: list[str] = []
@@ -519,6 +661,7 @@ class ResearchAgentSessionService:
         original_baseline_run_id: str = "",
         current_branch_head_run_id: str = "",
         internal_grant_id: str = "",
+        idempotency_key: str = "",
         status: str = "PLANNING",
         pending_question: dict[str, Any] | None = None,
         created_by: str = "local_user",
@@ -532,8 +675,9 @@ class ResearchAgentSessionService:
                     session_id, project_id, entry_mode, anchor_type, anchor_id, resolution_status,
                     status, objective, brief_json, context_json, original_baseline_run_id,
                     current_branch_head_run_id, session_policy_json, usage_json,
-                    pending_question_json, resume_state, internal_grant_id, created_by, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pending_question_json, resume_state, internal_grant_id, created_by,
+                    created_at, updated_at, idempotency_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id, project_id, entry_mode, _clean(anchor_type).upper(), _clean(anchor_id),
@@ -543,6 +687,7 @@ class ResearchAgentSessionService:
                     json_dumps({"runs": 0, "runtime_seconds": 0, "download_bytes": 0}),
                     json_dumps(pending_question or {}), "PLANNING" if status == "NEED_HUMAN" else "",
                     internal_grant_id, _clean(created_by) or "local_user", now, now,
+                    _clean(idempotency_key),
                 ),
             )
             message = "已恢复历史研究上下文" if entry_mode == "RESUME" else "已根据用户目标创建研究草案"

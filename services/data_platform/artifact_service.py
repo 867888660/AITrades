@@ -9,6 +9,7 @@ from typing import Any, Iterable, Optional
 
 from .models import ResearchArtifact
 from .store import BASE_DIR, DataPlatformStore, json_dumps
+from services.history_storage_service import get_data_platform_storage_root
 
 
 ARTIFACT_TYPES = {
@@ -282,7 +283,7 @@ class ResearchArtifactMaterializer:
 
     def __init__(self, store: DataPlatformStore, *, root: str | Path | None = None):
         self.store = store
-        self.root = Path(root or (BASE_DIR / "storage"))
+        self.root = Path(root or get_data_platform_storage_root())
         self.artifacts = ArtifactService(store)
 
     def materialize_rows(

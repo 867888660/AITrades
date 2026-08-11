@@ -21,7 +21,7 @@ RESEARCH_BACKTEST_CODE_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdig
 RESEARCH_BACKTEST_CAPABILITIES = BacktestCapabilities(
     provider="research_backtest_v2",
     provider_version="2",
-    asset_classes=("crypto_spot",),
+    asset_classes=("crypto_spot", "equity"),
     supports_multi_leg=True,
     supports_target_position=True,
     supports_target_weight=True,
@@ -44,6 +44,8 @@ RESEARCH_BACKTEST_CAPABILITIES = BacktestCapabilities(
         "Right-censored signals after the final executable open are skipped and counted.",
         "Missing execution prices fail the run; no silent forward fill is used.",
         "The provider is separate from the legacy StrategyCode replay.",
+        "Daily US-equity bars are supported when supplied by pinned READY manifests.",
+        "VWAP is not required by the execution engine.",
     ),
 )
 

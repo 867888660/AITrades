@@ -1,4 +1,4 @@
 interface:
   display_name: "DataTube"
-  short_description: "Run controlled market research and Qlib stock factors"
-  default_prompt: "Use $datatube to run controlled Polymarket, crypto, or US-equity research, including Qlib Alpha158-compatible stock factors without fabricated VWAP."
+  short_description: "Run DataTube research, history storage, and stock factors"
+  default_prompt: "Use $datatube to operate DataTube research, managed history storage, archive coverage, sharing, and US-equity factor workflows safely."

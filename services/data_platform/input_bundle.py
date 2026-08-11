@@ -11,6 +11,7 @@ from .artifact_service import ArtifactService
 from .catalog_service import DatasetCatalogService
 from .data_client import FrozenManifestData
 from .store import BASE_DIR, DataPlatformStore, json_dumps
+from services.history_storage_service import get_data_platform_storage_root
 
 
 class ResearchInputBundleService:
@@ -20,7 +21,7 @@ class ResearchInputBundleService:
         self.store = store
         self.artifacts = ArtifactService(store)
         self.catalog = DatasetCatalogService(store)
-        self.output_root = Path(output_root or BASE_DIR / "storage" / "research_artifacts" / "input_bundles")
+        self.output_root = Path(output_root or get_data_platform_storage_root() / "research_artifacts" / "input_bundles")
 
     def create(self, *, project_id: str, logical_name: str, manifest_ids: Iterable[str],
                universe_snapshot_id: str = "", requirement_set_id: str = "",

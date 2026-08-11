@@ -18,6 +18,8 @@
   "market_realtime_db_path": "Data/polymarket_realtime.db",
   "polymarket_dictionary_db_path": "Data/PolyMarketDictionary.db",
   "strategy_metrics_db_dir": "strategy_metrics_dbs",
+  "history_data_root": "",
+  "history_data_source_roots": [],
   "strategy_monitoring_table": "strategy_registry",
   "include_crypto_fundamentals": true,
   "coingecko_api_key_header": "x-cg-demo-api-key",
@@ -27,6 +29,24 @@
     "default_provider": "yfinance",
     "allowed_providers": ["yfinance"],
     "timeout_sec": 30
+  },
+  "data_source_settings": {
+    "mode": "HYBRID",
+    "version": 1,
+    "priority_orders": {
+      "EQUITY:1D:BARS": [
+        "OPENBB:YFINANCE",
+        "OPENBB:POLYGON",
+        "OPENBB:TIINGO",
+        "OPENBB:FMP",
+        "OPENBB:INTRINIO"
+      ],
+      "EQUITY:SNAPSHOT:QUOTE": ["FINNHUB"],
+      "CRYPTO_SPOT:*:BARS": ["BINANCE"],
+      "CRYPTO:SNAPSHOT:SNAPSHOT": ["COINGECKO"],
+      "POLYMARKET_BINARY:*:PRICE_HISTORY": ["POLYMARKET"],
+      "MACRO:1D:SERIES": ["OPENBB:FRED"]
+    }
   },
   "agent_policy": {
     "enabled": true,

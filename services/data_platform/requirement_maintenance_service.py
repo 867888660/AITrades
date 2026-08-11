@@ -4,6 +4,12 @@ import hashlib
 import json
 from typing import Any
 
+from services.config_loader import load_web_settings
+from services.data_source_definitions import (
+    normalize_data_source_settings,
+    openbb_equity_provider_sequence,
+)
+
 from .requirement_workspace_service import RequirementWorkspaceService
 from .requirement_compiler import RequirementCompiler
 from .research_control_plane import ResearchControlPlane
@@ -205,20 +211,52 @@ class RequirementMaintenanceService:
                 # Grant scope authorizes bare tickers (e.g. "AAPL"); OpenBB
                 # export still needs a venue, so default to XNAS.
                 venue, symbol = "XNAS", instrument_id.upper()
-            source = provider if provider not in {"", "xnas", "xnys"} else "yfinance"
+            source_selection_policy = row.get("source_selection_policy")
+            source_selection_policy = (
+                dict(source_selection_policy)
+                if isinstance(source_selection_policy, dict)
+                else {}
+            )
+            mode = _clean(source_selection_policy.get("mode") or "FIXED").upper()
+            preferred_sources = list(source_selection_policy.get("preferred_sources") or [])
+            allowed_sources = list(source_selection_policy.get("allowed_sources") or [])
+            source = provider if provider not in {"", "auto", "xnas", "xnys"} else "yfinance"
+            settings = load_web_settings()
+            if mode == "FIXED":
+                providers = [str(preferred_sources[0] if preferred_sources else source).lower()]
+            else:
+                providers = openbb_equity_provider_sequence(
+                    settings,
+                    preferred_sources=preferred_sources,
+                    allowed_sources=allowed_sources,
+                )
+                if not providers:
+                    providers = [source]
+            source_policy_mode = "PRIMARY_FALLBACK" if len(providers) > 1 else "FIXED"
+            routing = normalize_data_source_settings(settings.get("data_source_settings"))
+            openbb_digest = _fingerprint({
+                **material,
+                "providers": providers,
+                "source_policy_mode": source_policy_mode,
+                "data_source_routing_version": routing["version"],
+            })
             return {
                 **base,
+                "workflow_run_id": f"requirement-maintenance:{openbb_digest[:24]}",
+                "idempotency_key": openbb_digest,
+                "logical_key": f"requirement-maintenance:{openbb_digest[:24]}",
                 "task_type": "OPENBB_EQUITY_DAILY_EXPORT",
                 "input": {
                     **common,
-                    "provider": source,
+                    "provider": providers[0],
                     "venue": venue,
                     "symbol": symbol,
                     "frequency": interval,
                     "start_date": start_time[:10],
                     "end_date": end_time[:10],
                     "adjustment": adjustment,
-                    "source_policy": {"mode": "FIXED", "providers": [source]},
+                    "source_policy": {"mode": source_policy_mode, "providers": providers},
+                    "data_source_routing_version": routing["version"],
                 },
             }
         if data_type == "PRICE_HISTORY" and lowered.startswith(

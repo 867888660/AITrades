@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterable
 from requests import RequestException
 
 from .binance_history_adapter import BinanceHistoryAdapter
+from services.history_storage_service import get_history_workspace_db_path
 from .provenance_service import ManifestProvenanceService
 from .research_control_plane import (
     ResearchControlPlane,
@@ -136,7 +137,7 @@ class LegacyBinanceHistorySource:
     """Controlled adapter around the existing Binance history downloader/store."""
 
     def __init__(self, history_db_path: str | Path | None = None, adapter: BinanceHistoryAdapter | None = None):
-        self.history_db_path = Path(history_db_path or (BASE_DIR / "Data" / "history_workspace.db"))
+        self.history_db_path = Path(history_db_path or get_history_workspace_db_path())
         self.adapter = adapter or BinanceHistoryAdapter(history_db_path=self.history_db_path)
 
     def observed_open_times(self, symbol: str, interval: str, start_time: str, end_time: str) -> list[int]:

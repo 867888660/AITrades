@@ -10,9 +10,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+from services.history_storage_service import get_data_platform_metadata_db_path
+
 
 BASE_DIR = Path(__file__).resolve().parents[2]
-DEFAULT_METADATA_DB = BASE_DIR / "storage" / "metadata" / "data_platform.db"
+DEFAULT_METADATA_DB = get_data_platform_metadata_db_path()
 _DEFAULT_STORE: "DataPlatformStore | None" = None
 _DEFAULT_STORE_LOCK = threading.Lock()
 
@@ -1460,6 +1462,257 @@ class DataPlatformStore:
             conn.execute(
                 "INSERT INTO schema_migrations(migration_version, migration_name, applied_at) VALUES (?, ?, ?)",
                 (23, "library_groups", utc_now()),
+            )
+        if 24 not in applied:
+            session_columns = self._column_names(conn, "research_agent_sessions")
+            if "idempotency_key" not in session_columns:
+                conn.execute(
+                    "ALTER TABLE research_agent_sessions "
+                    "ADD COLUMN idempotency_key TEXT NOT NULL DEFAULT ''"
+                )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_research_agent_sessions_idempotency
+                ON research_agent_sessions(idempotency_key)
+                WHERE idempotency_key <> ''
+                """
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations(migration_version, migration_name, applied_at) VALUES (?, ?, ?)",
+                (24, "research_agent_session_idempotency", utc_now()),
+            )
+        if 25 not in applied:
+            existing_keys = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT idempotency_key FROM research_agent_sessions "
+                    "WHERE idempotency_key <> ''"
+                ).fetchall()
+            }
+            legacy_rows = conn.execute(
+                """
+                SELECT s.session_id, s.brief_json, s.created_by, p.title
+                FROM research_agent_sessions AS s
+                LEFT JOIN research_projects AS p ON p.project_id = s.project_id
+                WHERE s.entry_mode='START' AND s.idempotency_key=''
+                ORDER BY s.created_at ASC, s.session_id ASC
+                """
+            ).fetchall()
+            for row in legacy_rows:
+                try:
+                    brief = json.loads(str(row["brief_json"] or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    brief = {}
+                fingerprint = hashlib.sha256(
+                    json_dumps(
+                        {
+                            "brief": brief if isinstance(brief, dict) else {},
+                            "created_by": str(row["created_by"] or "local_user").strip()
+                            or "local_user",
+                            "title": str(row["title"] or "").strip(),
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                key = f"research-start:auto:{fingerprint}"
+                if key in existing_keys:
+                    continue
+                conn.execute(
+                    "UPDATE research_agent_sessions SET idempotency_key=? WHERE session_id=?",
+                    (key, str(row["session_id"])),
+                )
+                existing_keys.add(key)
+            conn.execute(
+                "INSERT INTO schema_migrations(migration_version, migration_name, applied_at) VALUES (?, ?, ?)",
+                (25, "research_agent_session_idempotency_backfill", utc_now()),
+            )
+        if 26 not in applied:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS equity_security_master (
+                    security_id TEXT PRIMARY KEY,
+                    permno INTEGER UNIQUE,
+                    permco INTEGER,
+                    cik TEXT NOT NULL DEFAULT '',
+                    cusip TEXT NOT NULL DEFAULT '',
+                    issuer_name TEXT NOT NULL DEFAULT '',
+                    security_name TEXT NOT NULL DEFAULT '',
+                    security_type TEXT NOT NULL DEFAULT '',
+                    share_type TEXT NOT NULL DEFAULT '',
+                    share_class TEXT NOT NULL DEFAULT '',
+                    primary_exchange TEXT NOT NULL DEFAULT '',
+                    currency TEXT NOT NULL DEFAULT 'USD',
+                    country TEXT NOT NULL DEFAULT 'US',
+                    valid_from TEXT,
+                    valid_to TEXT,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    source TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS equity_security_aliases (
+                    security_id TEXT NOT NULL,
+                    alias_type TEXT NOT NULL,
+                    alias_value TEXT NOT NULL,
+                    valid_from TEXT NOT NULL DEFAULT '',
+                    valid_to TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (
+                        security_id, alias_type, alias_value, valid_from, source
+                    ),
+                    FOREIGN KEY (security_id)
+                        REFERENCES equity_security_master(security_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_equity_security_alias_lookup
+                    ON equity_security_aliases(alias_type, alias_value, valid_from, valid_to);
+                CREATE INDEX IF NOT EXISTS idx_equity_security_master_permco
+                    ON equity_security_master(permco);
+                CREATE INDEX IF NOT EXISTS idx_equity_security_master_cik
+                    ON equity_security_master(cik);
+                """
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations(migration_version, migration_name, applied_at) VALUES (?, ?, ?)",
+                (26, "equity_security_master", utc_now()),
+            )
+        if 27 not in applied:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS crsp_import_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    source_path TEXT NOT NULL,
+                    source_entry TEXT NOT NULL,
+                    source_fingerprint TEXT NOT NULL,
+                    dataset_prefix TEXT NOT NULL,
+                    normalizer_version TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    rows_processed INTEGER NOT NULL DEFAULT 0,
+                    chunk_count INTEGER NOT NULL DEFAULT 0,
+                    output_counts_json TEXT NOT NULL DEFAULT '{}',
+                    checkpoint_json TEXT NOT NULL DEFAULT '{}',
+                    staging_root TEXT NOT NULL,
+                    manifests_json TEXT NOT NULL DEFAULT '{}',
+                    worker_id TEXT NOT NULL DEFAULT '',
+                    heartbeat_at TEXT,
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS crsp_import_partitions (
+                    job_id TEXT NOT NULL,
+                    dataset_key TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    partition_key TEXT NOT NULL,
+                    start_time TEXT,
+                    end_time TEXT,
+                    row_count INTEGER NOT NULL,
+                    file_uri TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    checksum TEXT NOT NULL,
+                    min_event_time TEXT,
+                    max_event_time TEXT,
+                    quality_status TEXT NOT NULL DEFAULT 'PASS',
+                    PRIMARY KEY(job_id, dataset_key, chunk_index),
+                    FOREIGN KEY(job_id) REFERENCES crsp_import_jobs(job_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_crsp_import_jobs_status
+                    ON crsp_import_jobs(status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_crsp_import_partitions_job
+                    ON crsp_import_partitions(job_id, dataset_key, chunk_index);
+                """
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations(migration_version, migration_name, applied_at) VALUES (?, ?, ?)",
+                (27, "crsp_resumable_bulk_import", utc_now()),
+            )
+        if 28 not in applied:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS sec_security_links (
+                    link_id TEXT PRIMARY KEY,
+                    security_id TEXT NOT NULL,
+                    permno INTEGER NOT NULL,
+                    permco INTEGER,
+                    cik TEXT NOT NULL,
+                    valid_from TEXT NOT NULL DEFAULT '',
+                    valid_to TEXT NOT NULL DEFAULT '',
+                    sec_ticker TEXT NOT NULL,
+                    sec_exchange TEXT NOT NULL DEFAULT '',
+                    evidence_type TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL DEFAULT '{}',
+                    source_version TEXT NOT NULL,
+                    confidence TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(security_id, cik, valid_from, source_version),
+                    FOREIGN KEY(security_id) REFERENCES equity_security_master(security_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_sec_security_links_cik
+                    ON sec_security_links(cik, valid_from, valid_to, status);
+                CREATE INDEX IF NOT EXISTS idx_sec_security_links_permco
+                    ON sec_security_links(permco, cik, status);
+
+                CREATE TABLE IF NOT EXISTS sec_bulk_import_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    dataset_id TEXT NOT NULL,
+                    staging_root TEXT NOT NULL,
+                    source_urls_json TEXT NOT NULL,
+                    source_files_json TEXT NOT NULL DEFAULT '{}',
+                    source_fingerprint TEXT NOT NULL DEFAULT '',
+                    mapping_report_json TEXT NOT NULL DEFAULT '{}',
+                    quality_report_json TEXT NOT NULL DEFAULT '{}',
+                    entry_index INTEGER NOT NULL DEFAULT 0,
+                    company_count INTEGER NOT NULL DEFAULT 0,
+                    mapped_company_count INTEGER NOT NULL DEFAULT 0,
+                    row_count INTEGER NOT NULL DEFAULT 0,
+                    partition_count INTEGER NOT NULL DEFAULT 0,
+                    checkpoint_json TEXT NOT NULL DEFAULT '{}',
+                    manifest_json TEXT NOT NULL DEFAULT '{}',
+                    worker_id TEXT NOT NULL DEFAULT '',
+                    heartbeat_at TEXT,
+                    error TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS sec_bulk_import_partitions (
+                    job_id TEXT NOT NULL,
+                    partition_index INTEGER NOT NULL,
+                    partition_key TEXT NOT NULL,
+                    start_time TEXT,
+                    end_time TEXT,
+                    row_count INTEGER NOT NULL,
+                    file_uri TEXT NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    checksum TEXT NOT NULL,
+                    min_event_time TEXT,
+                    max_event_time TEXT,
+                    quality_status TEXT NOT NULL DEFAULT 'PASS',
+                    PRIMARY KEY(job_id, partition_index),
+                    FOREIGN KEY(job_id) REFERENCES sec_bulk_import_jobs(job_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_sec_bulk_jobs_status
+                    ON sec_bulk_import_jobs(status, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_sec_bulk_partitions_job
+                    ON sec_bulk_import_partitions(job_id, partition_index);
+                """
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations(migration_version, migration_name, applied_at) VALUES (?, ?, ?)",
+                (28, "sec_authoritative_mapping_and_bulk_pit", utc_now()),
             )
 
     @staticmethod

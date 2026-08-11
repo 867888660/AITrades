@@ -268,7 +268,10 @@ def ensure_openbb_companion(runtime_root: Path, wait_seconds: int) -> Dict[str, 
             return fail("failed to create isolated OpenBB environment", stderr=created.stderr.strip())
 
     site_packages = openbb_root / ("Lib/site-packages" if os.name == "nt" else "lib")
-    required_markers = ["openbb_platform_api-", "openbb_equity-", "openbb_yfinance-"]
+    required_markers = [
+        "openbb_platform_api-", "openbb_equity-", "openbb_yfinance-", "openbb_fred-",
+        "openbb_fmp-", "openbb_intrinio-", "openbb_polygon-", "openbb_tiingo-",
+    ]
     marker_names = [path.name.lower() for path in site_packages.rglob("*.dist-info")] if site_packages.exists() else []
     if any(not any(name.startswith(marker) for name in marker_names) for marker in required_markers):
         req = runtime_root / "requirements-openbb.txt"

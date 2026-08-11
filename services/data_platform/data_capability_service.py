@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from services.data_source_definitions import OPENBB_PROVIDER_DEFINITIONS
+
 
 BINANCE_INTERVALS = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d"]
 POLYMARKET_INTERVALS = ["1m", "5m", "15m", "1h", "4h", "1d"]
@@ -67,20 +69,26 @@ class ResearchDataCapabilityService:
             },
         ]
 
-        for provider in list(dict.fromkeys([*allowed, "fred"])):
+        for provider in OPENBB_PROVIDER_DEFINITIONS:
+            definition = OPENBB_PROVIDER_DEFINITIONS[provider]
             extension_name = f"openbb-{provider}"
             installed = extension_name in installed_openbb
+            formal_equity = "EQUITY:1D:BARS" in definition["formal_capabilities"]
+            configured = openbb_enabled and (provider in allowed or provider == "fred")
+            prepare_supported = bool(configured and openbb_online and installed and formal_equity)
             providers.append({
-                "id": provider.upper(), "label": f"OpenBB · {provider}", "gateway": "OPENBB",
-                "configured": openbb_enabled and (provider in allowed or provider == "fred"),
+                "id": provider.upper(), "label": f"OpenBB · {definition['label']}", "gateway": "OPENBB",
+                "configured": configured,
                 "online": openbb_online, "installed": installed,
-                "discovery": False, "historical": provider != "fred",
+                "discovery": False, "historical": formal_equity,
+                "package": definition["package"],
+                "credential_keys": list(definition["credential_keys"]),
                 "description": (
                     "Configured but the OpenBB gateway is offline." if openbb_enabled and not openbb_online else
                     f"Provider extension is not installed ({extension_name})." if not installed else
                     "OpenBB upstream provider."
                 ),
-                "raw_query_frequencies": ["1m", "5m", "1d"] if provider != "fred" else ["1d"],
+                "raw_query_frequencies": ["1m", "5m", "1d"] if formal_equity else ["1d"],
                 "research_sessions": ([{
                     "id": "PREMARKET_0400_0930_ET",
                     "label": "US pre-market 04:00-09:30 ET",
@@ -88,20 +96,20 @@ class ResearchDataCapabilityService:
                     "raw_query_supported": bool(openbb_enabled and openbb_online and installed),
                     "canonical_prepare_supported": False,
                     "time_semantics": "BAR_END_AVAILABLE_TIME",
-                }] if provider != "fred" else []),
+                }] if formal_equity else []),
                 "markets": ([{
                     "id": "XNAS", "label": "US Equities · Nasdaq", "asset_type": "EQUITY",
                     "search_category": "equity", "dataset_types": ["BARS"], "frequencies": ["1d"],
-                    "prepare_supported": bool(openbb_enabled and openbb_online and installed), "search_defaults": {},
+                    "prepare_supported": prepare_supported, "search_defaults": {},
                 }, {
                     "id": "XNYS", "label": "US Equities · NYSE", "asset_type": "EQUITY",
                     "search_category": "equity", "dataset_types": ["BARS"], "frequencies": ["1d"],
-                    "prepare_supported": bool(openbb_enabled and openbb_online and installed), "search_defaults": {},
-                }] if provider != "fred" else [{
+                    "prepare_supported": prepare_supported, "search_defaults": {},
+                }] if formal_equity else [{
                     "id": "MACRO", "label": "FRED Series", "asset_type": "MACRO",
                     "search_category": "fred", "dataset_types": ["SERIES"], "frequencies": ["1d"],
                     "prepare_supported": False, "search_defaults": {},
-                }]),
+                }] if provider == "fred" else []),
             })
 
         providers.extend([

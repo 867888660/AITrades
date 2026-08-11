@@ -71,7 +71,7 @@ class ResearchAgentAutonomyTests(unittest.TestCase):
             json={"definition_type": "FACTOR", "spec": {"name": "blocked", "version": "1.0.0"}},
         )
         self.assertEqual(403, blocked.status_code)
-        self.assertEqual("RESEARCH_GRANT_REQUIRED", blocked.get_json()["code"])
+        self.assertEqual("RESEARCH_SESSION_REQUIRED", blocked.get_json()["code"])
 
         grant = self.grant_project(project_id)
         universe_response = self.client.post(

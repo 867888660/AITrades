@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .venv/
 .openbb-venv/
+.qlib-venv/
 .venv-offline/
 venv/
 env/

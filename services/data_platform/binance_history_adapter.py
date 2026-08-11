@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .canonical_bars import CANONICAL_BAR_SCHEMA_VERSION, CanonicalBarsCommitter
+from services.history_storage_service import get_data_platform_canonical_root, get_history_workspace_db_path
 from .instrument_registry import InstrumentRegistry, make_instrument_id
 from .models import Instrument
 from .store import BASE_DIR, DataPlatformStore, get_default_store
@@ -112,8 +113,8 @@ class BinanceHistoryAdapter:
         output_root: str | Path | None = None,
         store: DataPlatformStore | None = None,
     ):
-        self.history_db_path = Path(history_db_path or (BASE_DIR / "Data" / "history_workspace.db"))
-        self.output_root = Path(output_root or (BASE_DIR / "storage" / "canonical"))
+        self.history_db_path = Path(history_db_path or get_history_workspace_db_path())
+        self.output_root = Path(output_root or get_data_platform_canonical_root())
         self.store = store or get_default_store()
         self.committer = CanonicalBarsCommitter(self.store, self.output_root)
         self.catalog = self.committer.catalog

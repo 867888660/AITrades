@@ -22,6 +22,7 @@ from .backtest_contract import (
 )
 from .binance_history_adapter import BinanceHistoryAdapter
 from .canonical_bars import CanonicalBarsCommitter
+from .canonical_dataset import CanonicalDatasetCommitter
 from .polymarket_history import PolymarketHistoryPreparer
 from .polymarket_task_executor import (
     POLYMARKET_EXPORT_TASK_TYPE,
@@ -29,6 +30,18 @@ from .polymarket_task_executor import (
     PolymarketResearchWorker,
 )
 from .openbb_history_adapter import OpenBBEquityHistoryAdapter
+from .us_equity_archive import (
+    DailySnapshotEquityImporter,
+    scan_us_equity_archive,
+    write_archive_inventory,
+)
+from .equity_security_master import EquitySecurityMasterService
+from .crsp_ciz import CRSP_CIZ_NORMALIZER_VERSION, CrspCizNormalizer, EquityDataQualityGate
+from .crsp_bulk_import import BULK_IMPORT_VERSION, CrspBulkImportService, run_crsp_import_job
+from .sec_bulk_import import SEC_BULK_IMPORT_VERSION, SecBulkImportService, run_sec_bulk_import_job
+from .sec_pit import FundamentalPointInTimeView, SEC_PIT_NORMALIZER_VERSION, SecPointInTimeNormalizer
+from .equity_field_resolver import FIELD_CONTRACTS, EquityFieldResolver
+from .equity_universe import HistoricalEquityUniverseService
 from .openbb_task_executor import OPENBB_EXPORT_TASK_TYPE, OpenBBResearchTaskExecutor, OpenBBResearchWorker
 from .factor_alpha import AlphaComponent, AlphaEngine, AlphaSpec, FactorEngine, FactorSpec
 from .factor_formula import FactorFormulaCompilation, FactorFormulaCompiler, FormulaDiagnostic
@@ -176,11 +189,25 @@ __all__ = [
     "ExecutionSpec",
     "BinanceHistoryAdapter",
     "CanonicalBarsCommitter",
+    "CanonicalDatasetCommitter",
     "PolymarketHistoryPreparer",
     "POLYMARKET_EXPORT_TASK_TYPE",
     "PolymarketResearchTaskExecutor",
     "PolymarketResearchWorker",
     "OpenBBEquityHistoryAdapter",
+    "DailySnapshotEquityImporter",
+    "scan_us_equity_archive",
+    "write_archive_inventory",
+    "EquitySecurityMasterService",
+    "CRSP_CIZ_NORMALIZER_VERSION",
+    "CrspCizNormalizer",
+    "EquityDataQualityGate",
+    "SEC_PIT_NORMALIZER_VERSION",
+    "SecPointInTimeNormalizer",
+    "FundamentalPointInTimeView",
+    "FIELD_CONTRACTS",
+    "EquityFieldResolver",
+    "HistoricalEquityUniverseService",
     "OPENBB_EXPORT_TASK_TYPE",
     "OpenBBResearchTaskExecutor",
     "OpenBBResearchWorker",
@@ -201,6 +228,12 @@ __all__ = [
     "ResearchInputBundleService",
     "ResolvedDataPlanService",
     "DatasetCatalogService",
+    "BULK_IMPORT_VERSION",
+    "CrspBulkImportService",
+    "run_crsp_import_job",
+    "SEC_BULK_IMPORT_VERSION",
+    "SecBulkImportService",
+    "run_sec_bulk_import_job",
     "DatasetCatalogEntry",
     "DatasetManifest",
     "DatasetPartition",

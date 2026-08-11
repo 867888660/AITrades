@@ -1051,6 +1051,7 @@ class RequirementWorkspaceService:
                         ])[0]
                     ),
                     "requested_providers": provider_links.get(requirement.requirement_id, []),
+                    "source_selection_policy": dict(requirement.source_selection_policy or {}),
                     "resolved_source": binding.get("source") if binding else None,
                     "data_type": requirement.data_type,
                     "frequency": requirement.frequency,
@@ -1159,6 +1160,7 @@ class RequirementWorkspaceService:
                 "instrument_id": instrument_id,
                 "instrument_label": self._instrument_label(instrument_id),
                 "provider": normalized["scope"]["provider"],
+                "source_selection_policy": dict(context["source_selection_policy"]),
                 "data_type": context["data_type"],
                 "frequency": context["frequency"],
                 "adjustment": context["adjustment"],

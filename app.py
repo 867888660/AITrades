@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,6 +20,11 @@ from services import agent_interface_service as agent_service
 from services import inspection_service
 from services.binance_market_service import search_binance_markets
 from services.crypto_service import fetch_crypto_quotes
+from services.data_source_management_service import (
+    DataSourceManagementService,
+    DataSourceRoutingConflict,
+)
+from services.data_source_definitions import OPENBB_CREDENTIAL_KEYS
 from services.event_graph_service import build_event_graph, get_event_graph_categories
 from services.event_news_service import (
     deduplicate_derived_events,
@@ -58,6 +66,7 @@ from services.history_data_service import (
     rename_backtest_run as rename_history_backtest_run,
     rerun_backtest_run as rerun_history_backtest_run,
 )
+from services.history_storage_service import HistoryStorageService, get_history_storage_job
 from services.http_client import SESSION
 from services.data_platform.factor_run_result_service import (
     FACTOR_RUN_RESULT_SCHEMA_VERSION,
@@ -138,6 +147,8 @@ from services.data_platform import (
     ResearchContextResolver,
     ResearchAuthorizationError,
     get_default_store,
+    CrspBulkImportService,
+    SecBulkImportService,
 )
 from services.polymarket_dictionary_service import get_dictionary_status, start_dictionary_refresh
 from services.ledger_service import get_ledger_snapshot
@@ -191,10 +202,47 @@ _binance_backfill_worker_lock = threading.Lock()
 _binance_backfill_worker_thread: threading.Thread | None = None
 _openbb_export_worker_lock = threading.Lock()
 _openbb_export_worker_thread: threading.Thread | None = None
+_openbb_gateway_restart_lock = threading.Lock()
 _polymarket_export_worker_lock = threading.Lock()
 _polymarket_export_worker_thread: threading.Thread | None = None
 _requirement_maintenance_thread: threading.Thread | None = None
 _requirement_maintenance_lock = threading.Lock()
+
+
+def _spawn_crsp_import_worker(job_id: str, *, chunk_rows: int = 250_000) -> dict:
+    """Launch a durable process; the persisted checkpoint owns recovery."""
+    log_path = BASE_DIR / ".datatube" / f"crsp-import-{job_id}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable, "scripts/us_equity_archive.py", "run-crsp-import-job",
+        "--job-id", job_id, "--chunk-rows", str(max(10_000, int(chunk_rows))),
+    ]
+    kwargs = {"cwd": str(BASE_DIR), "stdin": subprocess.DEVNULL}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        kwargs["start_new_session"] = True
+    with log_path.open("ab", buffering=0) as log:
+        process = subprocess.Popen(command, stdout=log, stderr=log, **kwargs)
+    return {"started": True, "pid": process.pid, "log_path": str(log_path)}
+
+
+def _spawn_sec_import_worker(job_id: str, *, target_rows: int = 250_000) -> dict:
+    """Launch the resumable SEC bulk worker outside the HTTP process."""
+    log_path = BASE_DIR / ".datatube" / f"sec-import-{job_id}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable, "scripts/us_equity_archive.py", "run-sec-bulk-import-job",
+        "--job-id", job_id, "--target-rows", str(max(25_000, int(target_rows))),
+    ]
+    kwargs = {"cwd": str(BASE_DIR), "stdin": subprocess.DEVNULL}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    else:
+        kwargs["start_new_session"] = True
+    with log_path.open("ab", buffering=0) as log:
+        process = subprocess.Popen(command, stdout=log, stderr=log, **kwargs)
+    return {"started": True, "pid": process.pid, "log_path": str(log_path)}
 
 
 def _start_binance_backfill_worker() -> bool:
@@ -284,6 +332,64 @@ def _ensure_openbb_gateway(wait_seconds: int = 15) -> None:
             break
         time.sleep(0.5)
     raise RuntimeError(f"OpenBB gateway did not become ready; see {log_path}")
+
+
+def _restart_openbb_gateway(wait_seconds: int = 30) -> dict:
+    """Restart only the bootstrap-managed local OpenBB process and verify health."""
+
+    with _openbb_gateway_restart_lock:
+        settings = load_web_settings()
+        provider = OpenBBProviderService(settings)
+        if not provider.config.enabled:
+            raise ValueError("OpenBB is disabled in Settings")
+        pid_path = BASE_DIR / ".datatube" / "openbb.pid"
+        managed_pid = None
+        try:
+            managed_pid = int(pid_path.read_text(encoding="utf-8").strip())
+        except (FileNotFoundError, TypeError, ValueError, OSError):
+            managed_pid = None
+        if provider.health().get("ok") and not managed_pid:
+            raise RuntimeError(
+                "OpenBB is online but has no DataTube-managed process ID; stop it manually before reloading"
+            )
+        if managed_pid:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(managed_pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            else:
+                try:
+                    os.kill(managed_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            deadline = time.time() + 10
+            while time.time() < deadline and provider.health().get("ok"):
+                time.sleep(0.25)
+            if provider.health().get("ok"):
+                raise RuntimeError("Managed OpenBB process did not stop; reload was aborted safely")
+        try:
+            pid_path.unlink()
+        except FileNotFoundError:
+            pass
+        _ensure_openbb_gateway(wait_seconds=wait_seconds)
+        health = OpenBBProviderService(load_web_settings()).health()
+        if not health.get("ok"):
+            raise RuntimeError("OpenBB restarted but did not pass its health check")
+        marker_path = BASE_DIR / ".datatube" / "openbb-runtime.json"
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            if isinstance(marker, dict):
+                marker["state"] = "ready"
+                marker["verified_at"] = time.time()
+                marker_path.write_text(
+                    json.dumps(marker, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+        return health
 
 
 def _start_polymarket_export_worker() -> bool:
@@ -3747,6 +3853,293 @@ def get_settings():
         return _json_error(exc)
 
 
+@app.get("/api/research/data/equity/crsp/imports")
+@debug_timing("research_crsp_imports")
+def research_crsp_imports():
+    try:
+        return jsonify({
+            "ok": True,
+            "data": CrspBulkImportService(get_default_store()).list(
+                limit=int(request.args.get("limit") or 20)
+            ),
+        })
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/data/equity/crsp/imports/<job_id>")
+@debug_timing("research_crsp_import")
+def research_crsp_import(job_id: str):
+    try:
+        job = CrspBulkImportService(get_default_store()).get(job_id)
+        if job is None:
+            return jsonify({"ok": False, "error": "CRSP import job not found"}), 404
+        return jsonify({"ok": True, "data": job})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/data/equity/crsp/imports")
+@require_local_request
+@debug_timing("research_crsp_import_create")
+def research_crsp_import_create():
+    try:
+        payload = request.get_json(silent=True) or {}
+        source_path = str(payload.get("source_path") or "").strip()
+        if not source_path:
+            raise ValueError("source_path is required")
+        service = CrspBulkImportService(get_default_store())
+        job = service.create(
+            source_path=source_path,
+            source_entry=str(payload.get("source_entry") or ""),
+            dataset_prefix=str(payload.get("dataset_prefix") or "crsp:ciz:full"),
+            idempotency_key=str(payload.get("idempotency_key") or ""),
+        )
+        worker = {"started": False}
+        if job["status"] in {"QUEUED", "FAILED"}:
+            if job["status"] == "FAILED":
+                job = service.resume(job["job_id"])
+            worker = _spawn_crsp_import_worker(
+                job["job_id"], chunk_rows=int(payload.get("chunk_rows") or 250_000)
+            )
+        return jsonify({"ok": True, "data": {"job": job, "worker": worker}}), 202
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/data/equity/crsp/imports/<job_id>/resume")
+@require_local_request
+@debug_timing("research_crsp_import_resume")
+def research_crsp_import_resume(job_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        job = CrspBulkImportService(get_default_store()).resume(job_id)
+        worker = {"started": False} if job["status"] == "READY" else _spawn_crsp_import_worker(
+            job_id, chunk_rows=int(payload.get("chunk_rows") or 250_000)
+        )
+        return jsonify({"ok": True, "data": {"job": job, "worker": worker}}), 202
+    except ValueError as exc:
+        return _json_error(exc, 404)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/data/equity/sec/imports")
+@debug_timing("research_sec_imports")
+def research_sec_imports():
+    try:
+        return jsonify({
+            "ok": True,
+            "data": SecBulkImportService(get_default_store()).list(
+                limit=int(request.args.get("limit") or 20)
+            ),
+        })
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/research/data/equity/sec/imports/<job_id>")
+@debug_timing("research_sec_import")
+def research_sec_import(job_id: str):
+    try:
+        job = SecBulkImportService(get_default_store()).get(job_id)
+        if job is None:
+            return jsonify({"ok": False, "error": "SEC bulk import job not found"}), 404
+        return jsonify({"ok": True, "data": job})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/data/equity/sec/imports")
+@require_local_request
+@debug_timing("research_sec_import_create")
+def research_sec_import_create():
+    try:
+        payload = request.get_json(silent=True) or {}
+        service = SecBulkImportService(get_default_store())
+        job = service.create(
+            dataset_id=str(payload.get("dataset_id") or "sec:edgar:fundamentals_pit"),
+            idempotency_key=str(payload.get("idempotency_key") or ""),
+        )
+        worker = {"started": False}
+        if job["status"] in {"QUEUED", "FAILED"}:
+            if job["status"] == "FAILED":
+                job = service.resume(job["job_id"])
+            worker = _spawn_sec_import_worker(
+                job["job_id"], target_rows=int(payload.get("target_rows") or 250_000)
+            )
+        return jsonify({"ok": True, "data": {"job": job, "worker": worker}}), 202
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/data/equity/sec/imports/<job_id>/resume")
+@require_local_request
+@debug_timing("research_sec_import_resume")
+def research_sec_import_resume(job_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        job = SecBulkImportService(get_default_store()).resume(job_id)
+        worker = {"started": False} if job["status"] == "READY" else _spawn_sec_import_worker(
+            job_id, target_rows=int(payload.get("target_rows") or 250_000)
+        )
+        return jsonify({"ok": True, "data": {"job": job, "worker": worker}}), 202
+    except ValueError as exc:
+        return _json_error(exc, 404)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/data/equity/sec/imports/<job_id>/reuse-sources")
+@require_local_request
+@debug_timing("research_sec_import_reuse_sources")
+def research_sec_import_reuse_sources(job_id: str):
+    try:
+        payload = request.get_json(silent=True) or {}
+        source_job_id = str(payload.get("source_job_id") or "").strip()
+        if not source_job_id:
+            raise ValueError("source_job_id is required")
+        service = SecBulkImportService(get_default_store())
+        service.cancel_for_recovery(job_id)
+        job = service.reuse_verified_sources(job_id, source_job_id=source_job_id)
+        worker = _spawn_sec_import_worker(
+            job_id, target_rows=int(payload.get("target_rows") or 250_000)
+        )
+        return jsonify({"ok": True, "data": {"job": job, "worker": worker}}), 202
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/research/data/equity/sec/imports/<job_id>/cancel")
+@require_local_request
+@debug_timing("research_sec_import_cancel")
+def research_sec_import_cancel(job_id: str):
+    try:
+        job = SecBulkImportService(get_default_store()).cancel_for_recovery(job_id)
+        return jsonify({"ok": True, "data": job})
+    except ValueError as exc:
+        return _json_error(exc, 404)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+_REVEALABLE_SETTING_FIELDS = {
+    "finnhub_api_keys",
+    "active_finnhub_api_key",
+    "coingecko_api_key",
+    "llm_api_key",
+}
+
+
+def _revealable_setting_value(settings: dict, field: str):
+    if field in _REVEALABLE_SETTING_FIELDS:
+        return settings.get(field, [] if field == "finnhub_api_keys" else "")
+    prefix = "openbb_provider_credentials."
+    if field.startswith(prefix):
+        credential_key = field.removeprefix(prefix)
+        credentials = settings.get("openbb_provider_credentials")
+        if credential_key in OPENBB_CREDENTIAL_KEYS and isinstance(credentials, dict):
+            return credentials.get(credential_key, "")
+    raise ValueError("This setting cannot be revealed.")
+
+
+@app.post("/api/settings/secrets/reveal")
+@require_local_request
+def reveal_setting_secret():
+    try:
+        payload = request.get_json(silent=True) or {}
+        field = str(payload.get("field") or "").strip()
+        value = _revealable_setting_value(load_web_settings(), field)
+        response = jsonify({"ok": True, "data": {"field": field, "value": value}})
+        response.headers["Cache-Control"] = "no-store, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/data-sources")
+@require_local_request
+@debug_timing("data_sources_list")
+def data_sources_list():
+    try:
+        data = DataSourceManagementService(
+            load_web_settings(), base_dir=BASE_DIR
+        ).describe()
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.put("/api/data-sources/routing")
+@require_local_request
+@debug_timing("data_sources_routing_update")
+def data_sources_routing_update():
+    try:
+        payload = request.get_json(silent=True) or {}
+        data = DataSourceManagementService(
+            load_web_settings(), base_dir=BASE_DIR
+        ).update_routing(payload)
+        return jsonify({"ok": True, "data": data})
+    except DataSourceRoutingConflict as exc:
+        return jsonify({"ok": False, "error": str(exc), "code": "DATA_SOURCE_VERSION_CONFLICT"}), 409
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/data-sources/openbb/activate")
+@require_local_request
+@debug_timing("data_sources_openbb_activate")
+def data_sources_openbb_activate():
+    try:
+        payload = request.get_json(silent=True) or {}
+        provider_id = str(payload.get("provider_id") or "").strip()
+        DataSourceManagementService(
+            load_web_settings(), base_dir=BASE_DIR
+        ).activate_openbb_provider(provider_id)
+        health = _restart_openbb_gateway()
+        data_sources = DataSourceManagementService(
+            load_web_settings(), base_dir=BASE_DIR
+        ).describe()
+        return jsonify({"ok": True, "data": {
+            "provider_id": provider_id.lower().removeprefix("openbb:"),
+            "health": health,
+            "data_sources": data_sources,
+        }})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/data-sources/openbb/reload")
+@require_local_request
+@debug_timing("data_sources_openbb_reload")
+def data_sources_openbb_reload():
+    try:
+        health = _restart_openbb_gateway()
+        data_sources = DataSourceManagementService(
+            load_web_settings(), base_dir=BASE_DIR
+        ).describe()
+        return jsonify({"ok": True, "data": {
+            "health": health,
+            "data_sources": data_sources,
+        }})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
 @app.post("/api/settings")
 @require_local_request
 def update_settings():
@@ -4089,6 +4482,76 @@ def history_health():
         return jsonify(get_history_health())
     except Exception as exc:
         return _json_error(exc)
+
+
+@app.get("/api/history/storage")
+@require_local_request
+@debug_timing("history_storage_status")
+def history_storage_status():
+    try:
+        return jsonify({"ok": True, "data": HistoryStorageService(base_dir=BASE_DIR).status()})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/history/storage/coverage")
+@require_local_request
+@debug_timing("history_storage_coverage")
+def history_storage_coverage():
+    try:
+        return jsonify({"ok": True, "data": HistoryStorageService(base_dir=BASE_DIR).archive_coverage()})
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/history/storage/inspect")
+@require_local_request
+@debug_timing("history_storage_inspect")
+def history_storage_inspect():
+    try:
+        payload = request.get_json(silent=True) or {}
+        settings = load_web_settings()
+        root = payload.get("root") or settings.get("history_data_root")
+        source_roots = payload.get("source_roots")
+        if source_roots is None:
+            source_roots = settings.get("history_data_source_roots") or []
+        data = HistoryStorageService(base_dir=BASE_DIR, settings=settings).plan(root, source_roots)
+        return jsonify({"ok": True, "data": data})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.post("/api/history/storage/normalize")
+@require_local_request
+@debug_timing("history_storage_normalize")
+def history_storage_normalize():
+    try:
+        payload = request.get_json(silent=True) or {}
+        settings = load_web_settings()
+        root = payload.get("root") or settings.get("history_data_root")
+        source_roots = payload.get("source_roots")
+        if source_roots is None:
+            source_roots = settings.get("history_data_source_roots") or []
+        data = HistoryStorageService(base_dir=BASE_DIR, settings=settings).start(root, source_roots)
+        return jsonify({"ok": True, "data": data}), 202
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except RuntimeError as exc:
+        return _json_error(exc, 409)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/history/storage/jobs/<job_id>")
+@require_local_request
+@debug_timing("history_storage_job")
+def history_storage_job(job_id: str):
+    data = get_history_storage_job(job_id)
+    if data is None:
+        return jsonify({"ok": False, "error": "History Data normalization job not found"}), 404
+    return jsonify({"ok": True, "data": data})
 
 
 @app.get("/api/history/search")
@@ -4535,6 +4998,11 @@ def _agent_research_authorize(
     agent_service.require_agent_capability(capability, actor_type)
     grant_id = str(payload.get("grant_id") or "")
     session_id = str(payload.get("session_id") or "").strip()
+    if actor_type == "agent" and not session_id and not grant_id:
+        raise ResearchAuthorizationError(
+            "RESEARCH_SESSION_REQUIRED",
+            "Agent Research writes require the canonical session_id; implicit latest-Grant fallback is disabled",
+        )
     if session_id and not grant_id:
         session = ResearchAgentSessionService(get_default_store()).get(
             session_id, include_events=False, include_iterations=False
@@ -4659,7 +5127,8 @@ def agent_research_session_create():
             actor_type=actor_type, actor_id=actor_id, capability="research.session.create",
             target_type="research_session", target_id=result["session_id"], payload=payload, output=public,
         )
-        return jsonify({"ok": True, "data": public}), 201
+        status_code = 200 if bool(public.get("idempotency_reused")) else 201
+        return jsonify({"ok": True, "data": public}), status_code
     except Exception as exc:
         return _agent_research_error(exc)
 

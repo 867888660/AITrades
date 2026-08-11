@@ -8,6 +8,7 @@ from typing import Any, Optional
 from .catalog_service import DatasetCatalogService
 from .models import DatasetManifest, DatasetPartition
 from .store import BASE_DIR, DataPlatformStore
+from services.history_storage_service import resolve_managed_history_path
 
 
 class FrozenManifestData:
@@ -66,8 +67,7 @@ class FrozenManifestData:
 
     @staticmethod
     def _partition_path(partition: DatasetPartition) -> Path:
-        path = Path(partition.file_uri)
-        return path if path.is_absolute() else BASE_DIR / path
+        return resolve_managed_history_path(partition.file_uri, base_dir=BASE_DIR)
 
     @staticmethod
     def _sha256_file(path: Path) -> str:

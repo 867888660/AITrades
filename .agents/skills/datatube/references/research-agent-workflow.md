@@ -78,10 +78,39 @@ Run:
 python scripts/datatube_client.py research-start --data brief.json
 ```
 
+Put a stable `idempotency_key` in `brief.json` for retryable automation. Repeating
+the same START request must return the existing Project and Session; it must not
+create a second Project. Use a new key only when the user intentionally requests
+a separate study.
+
 Check `resolved_grant_scope` in the START response. It contains `allowed_instrument_ids`,
 `allowed_intervals`, and `allowed_providers` as they were actually granted — verify they
 match your intent before proceeding. A mismatch here is cheap to fix; discovering it at
 Preview or Run creation costs a full session.
+
+## Canonical Object Ledger
+
+After every START or RESUME, record and verify this ledger before any write:
+
+```text
+project_id
+session_id
+entry_mode
+brief.provider / brief.frequency / brief.instrument_scope
+resolved_grant_scope.allowed_providers / allowed_intervals / allowed_instrument_ids
+context.project_id
+current_plan_version
+```
+
+Hard invariants:
+
+- `session.project_id == context.project_id == target project_id`.
+- Brief Provider, frequency, and instruments must equal the resolved Grant scope.
+- RESUME without explicit scope changes must preserve the approved Project Brief.
+- Every Project write must carry the canonical `session_id`; never rely on an
+  implicit latest Grant or expose an internal Grant ID.
+- If any invariant fails, stop before writing and enter
+  `NEED_HUMAN(AMBIGUOUS_CONTEXT)` with the conflicting IDs and fields.
 
 Safe defaults are acceptable when the missing choice is routine and reversible.
 Ask only when different interpretations would create materially different
@@ -150,6 +179,10 @@ Never interpret RESUME as “read one ID and modify it.” The Context Resolver 
 restore the Project, Universe, definitions, Requirements, Preview, Bundle, Runs,
 artifacts, and experiment history. If one definition belongs to several
 Projects, enter `NEED_HUMAN(AMBIGUOUS_CONTEXT)` and present the candidates.
+
+Verify the returned `resolved_grant_scope` after RESUME exactly as after START.
+Do not accept default `BINANCE`, `1h`, or an empty instrument scope when the
+approved Project Brief is an equity or Polymarket study.
 
 Always keep these two fields distinct:
 
@@ -226,6 +259,12 @@ Treat `QUEUED`, `PREPARING`, and `CHECKING` as normal progress. Ask for human
 input only when a terminal `FAILED` or `UNAVAILABLE` result exposes a genuine
 contract choice or a material scope change; a missing percentage or an active
 download is not `NEED_HUMAN`.
+
+A direct Provider probe or shell exception is not Project data state. Report a
+Project as data-blocked only when it has a non-empty RequirementSet and its
+DataTube status rows or controlled task records contain concrete `FAILED` or
+`UNAVAILABLE` evidence. `queue_depth == 0` with zero Project tasks means data
+preparation has not started, not that downloads are rate-limited.
 
 ## NEED_HUMAN
 
@@ -412,6 +451,22 @@ Total Return, CAGR, Sharpe, fees, trades, equity, or drawdown from an
   Factor Evaluation input.
 
 ## Closeout
+
+### Completion Evidence Gates
+
+Use the narrowest truthful completion label:
+
+| Label | Required evidence |
+|---|---|
+| Definition layer complete | Validated and pinned Factor/Alpha IDs and counts. |
+| Research skeleton complete | Bound Universe ID, immutable Universe Snapshot ID, and non-empty RequirementSet ID in addition to definitions. |
+| Data preparation blocked | RequirementSet ID plus concrete DataTube row/task IDs in `FAILED` or `UNAVAILABLE`. |
+| Evaluation ready | A ready Preview ID with the intended Run type. |
+| Evaluation complete | Run ID, terminal status, schema, metrics, warnings, and Artifact IDs. |
+
+Never say “project setup complete” when only definitions exist. Never claim that
+a script or artifact was saved until its path has been verified in the current
+workspace. Separate intended next steps from persisted DataTube state.
 
 Report the Session, Project, original baseline, current branch head, accepted and
 rejected iterations, Run type and schema, final metrics, warnings, Benchmark

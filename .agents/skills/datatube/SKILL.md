@@ -1,19 +1,18 @@
 ---
 name: datatube
 description: >
-  Install, start, repair, operate, and automatically test DataTube v1.0, a local
-  Polymarket research/strategy workflow with Binance market data. Use for setup
-  and status; Research workspace UI/API and regression tests; Factor Evaluation,
-  Alpha Evaluation, formal Research Backtest, and legacy Hybrid Run inspection;
-  Polymarket/Binance research, controlled US-equity data preparation and
-  pre-market ranking snapshots, and Qlib Alpha158-compatible factor computation;
-  EventGraph inspection and change requests; strategy drafts, risk checks,
-  simulations, and human-approval handoff; historical backtests, batches,
-  optimization, and history; approval review, strategy status, and Agent audits.
-  Trigger examples include "test DataTube", "test the Research workspace",
-  "replace manual Research clicks", "research BTC markets", "create a strategy
-  draft", "run a backtest", "run Qlib Alpha158 on stocks", "test Alpha158
-  without VWAP", "review approvals", and "DataTube status".
+  Install, start, repair, operate, and test DataTube v1.0, a local Polymarket,
+  crypto, and US-equity research/strategy workflow. Use for setup and status;
+  managed history storage, archive coverage, migration, and sharing; Research
+  UI/API and regression tests; Factor Evaluation, Alpha Evaluation, formal
+  Research Backtest, and legacy Hybrid Run inspection; Polymarket/Binance
+  research, controlled US-equity preparation and pre-market snapshots, and Qlib
+  Alpha158-compatible factor computation; EventGraph changes; strategy drafts,
+  risk checks, simulations, and human-approval handoff; historical backtests,
+  optimization, history, approvals, status, and Agent audits. Trigger examples
+  include "test DataTube", "migrate/share history data", "research BTC markets",
+  "create a strategy draft", "run a backtest", "run Qlib Alpha158 on stocks",
+  "review approvals", and "DataTube status".
 ---
 
 # DataTube
@@ -89,6 +88,10 @@ Choose one workflow family from the user's request:
 
 - **Setup**: install, start, stop, status, repair, update, port conflicts, or
   broken dependencies. Use [references/setup.md](references/setup.md).
+- **History Storage**: configure or migrate the managed history root, distinguish
+  raw archive coverage from READY Catalog data, diagnose misleading coverage,
+  or prepare a privacy-safe share package. Use
+  [references/history-storage.md](references/history-storage.md).
 - **Research**: news/event research, Polymarket market discovery, Binance crypto
   context, BTC/ETH/SOL market scans, controlled US-equity pre-market market-cap
   ranking snapshots, or event-to-market analysis. Use
@@ -143,7 +146,9 @@ For research, strategy, backtest, and review:
 1. Confirm runtime health with `bootstrap.py status --json`.
 2. Read capabilities with `/api/agent/capabilities`.
 3. Check `enabled`, `allow`, `deny`, and `limits`.
-4. Create or reuse one `session_id`; pass it on every Research write.
+4. Create or reuse one canonical `session_id`; pass it on every Research write.
+   Never rely on an implicit latest Grant. Before each write, assert that the
+   Session `project_id` equals the target Project.
 5. Write an activity event before write workflows.
 6. Use the API paths described in the relevant reference file.
 
@@ -153,6 +158,7 @@ Always tell the user:
 
 - workflow goal and final state
 - important objects read or created
+- the verified Project/Session pair and the highest actually completed research phase
 - draft, approval, or handoff IDs if present
 - skipped steps and why
 - any item needing human confirmation

@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>DataTube Settings</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=llm-settings-20260628">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=history-coverage-20260810">
   </head>
   <body>
     <div class="app-shell">
@@ -33,30 +33,90 @@
 
         <section class="panel glass-tabs-shell settings-panel">
           <div class="glass-tabs">
-            <button type="button" class="tab-btn active" data-tab="api">API & 数据源</button>
+            <button type="button" class="tab-btn active" data-tab="data-source">Data Source</button>
+            <button type="button" class="tab-btn" data-tab="history-data">History Data</button>
+            <button type="button" class="tab-btn" data-tab="llm">模型 API</button>
             <button type="button" class="tab-btn" data-tab="wallet">钱包 & 策略</button>
             <button type="button" class="tab-btn" data-tab="agent">Agent 权限</button>
             <button type="button" class="tab-btn" data-tab="refresh">刷新 & 采集</button>
           </div>
           <form id="settingsForm" class="form">
-            <div class="tab-pane active" data-tab-content="api">
+            <div class="tab-pane active" data-tab-content="data-source">
+              <section class="settings-section data-source-overview">
+                <div class="settings-section-head">
+                  <span class="eyebrow">Provider Control Plane</span>
+                  <h2>Data Source</h2>
+                  <p>集中管理数据连接、加密凭据、能力范围和后端基础优先级。正式 Research 仍只读取通过校验的不可变 Manifest。</p>
+                </div>
+                <div id="dataSourceSummary" class="data-source-summary"></div>
+                <div id="dataSourceOperation" class="data-source-operation" aria-live="polite" hidden>
+                  <span class="data-source-spinner" aria-hidden="true"></span>
+                  <div class="data-source-operation-copy">
+                    <strong id="dataSourceOperationTitle">正在处理 Data Source</strong>
+                    <span id="dataSourceOperationDetail">请稍候...</span>
+                    <div class="data-source-progress"><i id="dataSourceOperationProgress"></i></div>
+                  </div>
+                </div>
+                <div class="grid two data-source-mode-row">
+                  <label>
+                    路由模式
+                    <select id="dataSourceMode">
+                      <option value="MANUAL">Manual · 固定人工顺序</option>
+                      <option value="HYBRID">Hybrid · 人工顺序 + 自动故障跳过</option>
+                      <option value="AUTO">Auto · 后端可按运行状态选择</option>
+                    </select>
+                  </label>
+                  <div class="data-source-save-wrap">
+                    <button id="saveDataSourceRouting" type="button">保存 Data Source 排序</button>
+                    <span id="dataSourceRoutingMessage" class="settings-note">正在读取后端策略...</span>
+                  </div>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-head">
+                  <h2>数据源连接</h2>
+                  <p>状态来自后端 Capability Registry；未安装、未启用和缺少凭据会分别标记。</p>
+                </div>
+                <div id="dataSourceCatalog" class="data-source-catalog"></div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-head">
+                  <h2>按能力排序</h2>
+                  <p>每个能力范围独立排序。可拖动，也可使用上下按钮；排序不会把不同交易场所静默混为同一数据。</p>
+                </div>
+                <div id="dataSourceRoutingPolicies" class="data-source-routing-policies"></div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-head">
+                  <h2>Finnhub</h2>
+                  <p>Finnhub 当前用于股票报价与标的信息发现；配置 Key 不会把它误标为正式历史数据源。</p>
+                </div>
               <div class="grid two">
               <label>
                 Finnhub API Keys
-                <textarea id="finnhubKeys" rows="6" placeholder="每行一个 API Key"></textarea>
+                <textarea id="finnhubKeys" rows="6" data-secret-field="finnhub_api_keys" placeholder="每行一个 API Key"></textarea>
                 <span id="finnhubKeyStatus" class="settings-note"></span>
                 <label class="checkbox"><input id="clearFinnhubKeys" type="checkbox"><span>清除已保存的 Finnhub Keys</span></label>
               </label>
               <label>
                 活动 Finnhub API Key
-                <input id="activeFinnhubKey" placeholder="默认取上面列表中的第一个">
+                <input id="activeFinnhubKey" type="password" autocomplete="off" data-secret-field="active_finnhub_api_key" placeholder="默认取上面列表中的第一个">
               </label>
               </div>
+              </section>
 
-              <div class="grid two">
+              <section class="settings-section">
+                <div class="settings-section-head">
+                  <h2>CoinGecko</h2>
+                  <p>用于 Crypto Context Snapshot，不作为 Binance 历史 Bar 的透明替代。</p>
+                </div>
+                <div class="grid two">
                 <label>
                   CoinGecko API Key
-                  <input id="coingeckoApiKey" placeholder="可留空">
+                  <input id="coingeckoApiKey" type="password" autocomplete="off" data-secret-field="coingecko_api_key" placeholder="可留空">
                   <span id="coingeckoKeyStatus" class="settings-note"></span>
                   <label class="checkbox"><input id="clearCoingeckoApiKey" type="checkbox"><span>清除已保存的 CoinGecko Key</span></label>
                 </label>
@@ -65,6 +125,7 @@
                   <input id="coingeckoApiHeader" placeholder="默认 x-cg-demo-api-key">
                 </label>
               </div>
+              </section>
 
               <section class="settings-section">
                 <div class="settings-section-head">
@@ -95,18 +156,66 @@
                     <input id="openbbTimeoutSec" type="number" min="2" max="120" step="1">
                   </label>
                 </div>
-                <div class="grid two">
-                  <label>
-                    FRED API Key
-                    <input id="openbbFredApiKey" type="password" autocomplete="off" placeholder="保存在本机加密 secrets">
-                    <span id="openbbFredKeyStatus" class="settings-note"></span>
-                    <label class="checkbox"><input id="clearOpenbbFredApiKey" type="checkbox"><span>清除已保存的 FRED Key</span></label>
-                  </label>
+                <div id="openbbCredentialGrid" class="openbb-credential-grid">
+                  <label>Polygon API Key<input type="password" autocomplete="off" data-secret-field="openbb_provider_credentials.polygon_api_key" data-openbb-credential="polygon_api_key" placeholder="输入 Polygon API Key"><span data-openbb-credential-status="polygon_api_key" class="settings-note"></span><label class="checkbox"><input type="checkbox" data-clear-openbb-credential="polygon_api_key"><span>清除</span></label></label>
+                  <label>Tiingo Token<input type="password" autocomplete="off" data-secret-field="openbb_provider_credentials.tiingo_token" data-openbb-credential="tiingo_token" placeholder="输入 Tiingo Token"><span data-openbb-credential-status="tiingo_token" class="settings-note"></span><label class="checkbox"><input type="checkbox" data-clear-openbb-credential="tiingo_token"><span>清除</span></label></label>
+                  <label>FMP API Key<input type="password" autocomplete="off" data-secret-field="openbb_provider_credentials.fmp_api_key" data-openbb-credential="fmp_api_key" placeholder="输入 FMP API Key"><span data-openbb-credential-status="fmp_api_key" class="settings-note"></span><label class="checkbox"><input type="checkbox" data-clear-openbb-credential="fmp_api_key"><span>清除</span></label></label>
+                  <label>Intrinio API Key<input type="password" autocomplete="off" data-secret-field="openbb_provider_credentials.intrinio_api_key" data-openbb-credential="intrinio_api_key" placeholder="输入 Intrinio API Key"><span data-openbb-credential-status="intrinio_api_key" class="settings-note"></span><label class="checkbox"><input type="checkbox" data-clear-openbb-credential="intrinio_api_key"><span>清除</span></label></label>
+                  <label>FRED API Key<input type="password" autocomplete="off" data-secret-field="openbb_provider_credentials.fred_api_key" data-openbb-credential="fred_api_key" placeholder="输入 FRED API Key"><span id="openbbFredKeyStatus" data-openbb-credential-status="fred_api_key" class="settings-note"></span><label class="checkbox"><input type="checkbox" data-clear-openbb-credential="fred_api_key"><span>清除</span></label></label>
                 </div>
-                <p class="settings-note">当前受控接口只开放股票日线读取；不会替换 Binance 或 Polymarket 原生数据，也不会直接写入回测。</p>
+                <p class="settings-note">股票日线包包含 YFinance、Polygon、Tiingo、FMP 与 Intrinio 的 OpenBB 扩展。输入新 Key 后保存会自动启用对应 Provider，并重新加载隔离 OpenBB 子进程。</p>
+                <div class="openbb-runtime-actions">
+                  <button id="reloadOpenbbGateway" type="button" class="secondary">重新加载 OpenBB</button>
+                  <span class="settings-note">不请求行情，只验证进程、扩展和凭据注入状态。</span>
+                </div>
                 <div id="openbbRuntimeStatus" class="status">正在检测 OpenBB 服务与数据任务...</div>
               </section>
 
+            </div>
+
+            <div class="tab-pane" data-tab-content="history-data">
+              <section class="settings-section history-storage-path-only">
+                <label>
+                  数据保存目录
+                  <input id="historyDataRoot" class="mono" placeholder="E:/DataTubeHistoricalData">
+                </label>
+                <div class="history-coverage-panel">
+                  <div class="history-coverage-head">
+                    <div>
+                      <span class="settings-kicker">HISTORY INVENTORY</span>
+                      <h3>历史数据概览</h3>
+                    </div>
+                    <span id="historyCoverageMeta" class="history-coverage-meta">正在读取…</span>
+                  </div>
+                  <div class="history-coverage-section">
+                    <div class="history-coverage-section-head">
+                      <div>
+                        <h4>原始档案</h4>
+                        <p>目录中实际保存的数据；尚未全部转换为可回测 Manifest。</p>
+                      </div>
+                      <span id="historyArchiveMeta" class="history-coverage-meta"></span>
+                    </div>
+                    <div id="historyArchiveGrid" class="history-coverage-grid">
+                      <p class="settings-note">正在读取原始档案清单…</p>
+                    </div>
+                  </div>
+                  <div class="history-coverage-section normalized">
+                    <div class="history-coverage-section-head">
+                      <div>
+                        <h4>已规范化 / 可回测</h4>
+                        <p>仅统计 Catalog 中 READY 的数据集；不代表原始档案总量。</p>
+                      </div>
+                      <span id="historyNormalizedMeta" class="history-coverage-meta"></span>
+                    </div>
+                    <div id="historyNormalizedGrid" class="history-coverage-grid">
+                      <p class="settings-note">正在读取 DataTube Catalog…</p>
+                    </div>
+                  </div>
+                </div>
+              </section>
+            </div>
+
+            <div class="tab-pane" data-tab-content="llm">
               <section class="settings-section">
                 <div class="settings-section-head">
                   <h2>LLM Provider</h2>
@@ -135,7 +244,7 @@
                   </label>
                   <label>
                     API Key
-                    <input id="llmApiKey" type="password" autocomplete="off" placeholder="sk-...">
+                    <input id="llmApiKey" type="password" autocomplete="off" data-secret-field="llm_api_key" placeholder="sk-...">
                     <span id="llmKeyStatus" class="settings-note"></span>
                     <label class="checkbox"><input id="clearLlmApiKey" type="checkbox"><span>清除已保存的 LLM Key</span></label>
                   </label>
@@ -411,7 +520,7 @@
             </div>
 
             <div class="actions">
-              <button type="submit">保存设置</button>
+              <button id="saveSettingsButton" type="submit">保存设置</button>
               <a class="button-link secondary-link" href="/">返回 Dashboard</a>
             </div>
           </form>
@@ -419,6 +528,6 @@
         </section>
       </main>
     </div>
-    <script src="{{ url_for('static', filename='settings.js') }}?v=openbb-worker-monitor-20260712"></script>
+    <script src="{{ url_for('static', filename='settings.js') }}?v=history-inventory-20260811"></script>
   </body>
 </html>

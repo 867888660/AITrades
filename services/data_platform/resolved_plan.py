@@ -11,6 +11,7 @@ from .artifact_service import ArtifactService
 from .requirement_compiler import RequirementCompiler
 from .research_control_plane import ResearchControlPlane
 from .store import BASE_DIR, DataPlatformStore, json_dumps
+from services.history_storage_service import get_data_platform_storage_root
 
 
 def _values(value: Any) -> set[str]:
@@ -27,7 +28,7 @@ class ResolvedDataPlanService:
         self.artifacts = ArtifactService(store)
         self.requirements = RequirementCompiler(store)
         self.control = ResearchControlPlane(store)
-        self.output_root = Path(output_root or BASE_DIR / "storage" / "research_artifacts" / "resolved_plans")
+        self.output_root = Path(output_root or get_data_platform_storage_root() / "research_artifacts" / "resolved_plans")
 
     def create(self, *, project_id: str, logical_name: str, requirement_set_id: str,
                route: dict[str, Any], source_policy: dict[str, Any], canonical: dict[str, Any],

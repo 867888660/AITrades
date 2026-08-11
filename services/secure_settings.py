@@ -15,6 +15,7 @@ SENSITIVE_SETTING_KEYS = (
     "coingecko_api_key",
     "llm_api_key",
     "openbb_fred_api_key",
+    "openbb_provider_credentials",
 )
 
 
@@ -157,4 +158,9 @@ def strip_sensitive(settings: Dict[str, Any]) -> Dict[str, Any]:
             public["has_llm_api_key"] = bool(value)
         elif key == "openbb_fred_api_key":
             public["has_openbb_fred_api_key"] = bool(value)
+        elif key == "openbb_provider_credentials":
+            credentials = value if isinstance(value, dict) else {}
+            public["openbb_provider_credential_status"] = {
+                str(name): bool(secret) for name, secret in credentials.items()
+            }
     return public

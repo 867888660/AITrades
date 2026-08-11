@@ -83,9 +83,9 @@ python .agents\skills\datatube\scripts\premarket_market_cap_research.py `
 
 设置沿用现有 `config_loader`，不创建独立配置文件。未来需要 API Key 的 OpenBB Provider 必须接入现有 encrypted secrets，不允许写入普通 `web_settings.json`、Manifest、日志或审计 payload。
 
-FRED API Key 使用现有 Settings 保存。Windows 上由当前用户 DPAPI 加密，启动隔离 OpenBB API 时由 `scripts/openbb_service.py` 解密并只注入子进程的 `FRED_API_KEY` 环境变量；不会生成包含凭据的 OpenBB `user_settings.json`。OpenBB 官方服务需要重启才能读取新的环境变量。
+FRED、Polygon、Tiingo、FMP 与 Intrinio API Key 使用现有 Settings 保存。Windows 上由当前用户 DPAPI 加密，启动隔离 OpenBB API 时由 `scripts/openbb_service.py` 解密并只注入子进程对应环境变量；不会生成包含凭据的 OpenBB `user_settings.json`。OpenBB 官方服务需要重启才能读取新的环境变量。
 
-最小隔离环境包含固定版本的 `openbb-core`、`openbb-platform-api`、`openbb-fred`、`openbb-economy` 和轻量 `openbb` interface，目录为 `.openbb-venv/` 且被 Git 忽略。
+隔离环境包含固定版本的 `openbb-platform-api`、`openbb-equity`、`openbb-yfinance`、`openbb-fred`、`openbb-polygon`、`openbb-tiingo`、`openbb-fmp` 与 `openbb-intrinio`，目录为 `.openbb-venv/` 且被 Git 忽略。
 
 ## 监控语义
 
@@ -240,5 +240,5 @@ Binance 和 OpenBB 现在共用 `CanonicalBarsCommitter`，统一完成：
 2. 为常驻 worker 增加进程级启动/停止控制和更细粒度运行审计；
 3. 从 OpenBB capabilities 中稳定提取 core/provider extension version；
 4. 完成五股票真实数据端到端回归；
-5. 增加 fallback/compare 的 UI 与运行审计视图；
+5. 增加 Provider attempt/failover 的运行审计视图；Data Source 基础排序 UI 已完成；
 6. 设计分区级 composite lineage；仍禁止逐行静默拼接。

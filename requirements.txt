@@ -7,5 +7,6 @@ tqdm
 websockets
 websockets-proxy
 pyarrow
+pandas
 duckdb
 PyYAML

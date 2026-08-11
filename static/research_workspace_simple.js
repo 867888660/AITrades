@@ -612,13 +612,19 @@ function alphaFormula(item) {
   }).join(' + ');
 }
 
+function researchRemovalAction(item, type) {
+  if (type === 'factor') return `<button type="button" class="danger-quiet" data-action="remove-research-factor" data-id="${esc(item.definition_id)}" data-slot="${esc(item.slot_key)}">Remove from Research</button>`;
+  if (type === 'alpha') return `<button type="button" class="danger-quiet" data-action="remove-research-alpha" data-id="${esc(item.definition_id)}" data-slot="${esc(item.slot_key)}">Remove from Research</button>`;
+  return '';
+}
+
 function componentActions(item, type) {
   const actions = [];
   if (item.origin === 'LIBRARY') {
     actions.push(`<button type="button" data-action="definition-details" data-id="${esc(item.definition_id)}">View</button>`);
     actions.push(`<button type="button" data-action="add-library-definition" data-kind="${esc(item.definition_type)}">Replace</button>`);
     actions.push(`<button type="button" class="primary" data-action="copy-library-definition" data-id="${esc(item.definition_id)}">Copy and Edit</button>`);
-    if (type === 'factor' || type === 'alpha') actions.push(`<button type="button" class="danger-quiet" data-action="remove-research-${type}" data-id="${esc(item.definition_id)}" data-slot="${esc(item.slot_key)}">Remove from Research</button>`);
+    if (type === 'factor' || type === 'alpha') actions.push(researchRemovalAction(item, type));
     return actions.join('');
   }
   actions.push(`<button type="button" data-action="edit-local-${type.toLowerCase()}" data-id="${esc(item.definition_id)}">Edit</button>`);
@@ -634,7 +640,7 @@ function componentActions(item, type) {
     actions.push(`<button type="button" data-action="test-${type.toLowerCase()}">Test</button>`);
   }
   actions.push(`<button type="button" data-action="definition-details" data-id="${esc(item.definition_id)}">Details</button>`);
-  if (type === 'factor' || type === 'alpha') actions.push(`<button type="button" class="danger-quiet" data-action="remove-research-${type}" data-id="${esc(item.definition_id)}" data-slot="${esc(item.slot_key)}">Remove from Research</button>`);
+  if (type === 'factor' || type === 'alpha') actions.push(researchRemovalAction(item, type));
   return actions.join('');
 }
 

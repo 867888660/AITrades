@@ -110,7 +110,7 @@ class AlphaDraftServiceTests(unittest.TestCase):
             version = conn.execute(
                 "SELECT MAX(migration_version) FROM schema_migrations"
             ).fetchone()[0]
-        self.assertEqual(21, version)
+        self.assertEqual(28, version)
         contract = DefinitionRegistry.engine_capabilities()[
             "alpha"
         ]["authoring_contract"]
