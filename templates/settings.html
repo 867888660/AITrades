@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>DataTube Settings</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}?v=history-coverage-20260810">
+    <link rel="stylesheet" href="{{ url_for('static', filename='resource_config.css') }}?v=resource-config-20260815">
   </head>
   <body>
     <div class="app-shell">
@@ -35,6 +36,7 @@
           <div class="glass-tabs">
             <button type="button" class="tab-btn active" data-tab="data-source">Data Source</button>
             <button type="button" class="tab-btn" data-tab="history-data">History Data</button>
+            <button type="button" class="tab-btn" data-tab="resource">资源配置</button>
             <button type="button" class="tab-btn" data-tab="llm">模型 API</button>
             <button type="button" class="tab-btn" data-tab="wallet">钱包 & 策略</button>
             <button type="button" class="tab-btn" data-tab="agent">Agent 权限</button>
@@ -225,6 +227,172 @@
                     </div>
                     <div id="historyNormalizedGrid" class="history-coverage-grid">
                       <p class="settings-note">正在读取 DataTube Catalog…</p>
+                    </div>
+                  </div>
+                </div>
+              </section>
+            </div>
+
+            <div class="tab-pane" data-tab-content="resource">
+              <section class="settings-section">
+                <div class="settings-section-head">
+                  <span class="eyebrow">RESOURCE MANAGEMENT</span>
+                  <h2>研究引擎资源配置</h2>
+                  <p>控制 DataTube 研究任务可以使用的内存预算。系统会自动检测硬件并设置安全上限，你可以根据使用场景灵活调整。</p>
+                </div>
+
+                <!-- Real-time Resource Status Card -->
+                <div class="resource-status-card">
+                  <div class="resource-status-header">
+                    <h3>💻 资源状态</h3>
+                    <button id="refreshResourceStatus" type="button" class="secondary small">刷新</button>
+                  </div>
+
+                  <div class="resource-overview-grid">
+                    <div class="resource-metric">
+                      <span class="resource-label">物理内存</span>
+                      <span id="resourcePhysicalMemory" class="resource-value">-- GB</span>
+                    </div>
+                    <div class="resource-metric">
+                      <span class="resource-label">系统可用</span>
+                      <span id="resourceAvailableMemory" class="resource-value">-- GB</span>
+                    </div>
+                    <div class="resource-metric">
+                      <span class="resource-label">研究上限</span>
+                      <span id="resourceMaxBudget" class="resource-value">-- GB</span>
+                    </div>
+                  </div>
+
+                  <div class="resource-bar-section">
+                    <div class="resource-bar-header">
+                      <span class="resource-label">内存分配</span>
+                      <span id="resourceUsagePercent" class="resource-percent">0%</span>
+                    </div>
+                    <div class="resource-bar">
+                      <div id="resourceSystemBar" class="resource-bar-segment system" style="width: 0%"></div>
+                      <div id="resourceFrontendBar" class="resource-bar-segment frontend" style="width: 0%"></div>
+                      <div id="resourceActiveBar" class="resource-bar-segment active" style="width: 0%"></div>
+                      <div id="resourceUserBar" class="resource-bar-segment user" style="width: 0%"></div>
+                      <div id="resourceEmergencyBar" class="resource-bar-segment emergency" style="width: 0%"></div>
+                    </div>
+                    <div class="resource-bar-legend">
+                      <span><i class="legend-dot system"></i> 系统保留</span>
+                      <span><i class="legend-dot frontend"></i> 前端/数据库</span>
+                      <span><i class="legend-dot active"></i> 研究占用</span>
+                      <span><i class="legend-dot user"></i> 研究可用</span>
+                      <span><i class="legend-dot emergency"></i> 安全缓冲</span>
+                    </div>
+                  </div>
+
+                  <div class="resource-research-section">
+                    <div class="resource-section-header">
+                      <h4>研究内存占用</h4>
+                      <span id="resourceActiveCount" class="resource-badge">0 个活跃任务</span>
+                    </div>
+                    <div id="resourceActiveWorkers" class="resource-worker-list">
+                      <p class="settings-note">当前没有运行中的研究任务</p>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Memory Configuration Panel -->
+                <div class="resource-config-panel">
+                  <div class="resource-config-header">
+                    <h3>⚙️ 内存配置</h3>
+                    <span class="settings-note">系统会在配置范围内智能分配资源</span>
+                  </div>
+
+                  <div class="resource-config-mode">
+                    <label>
+                      配置模式
+                      <select id="resourceConfigMode">
+                        <option value="AUTO">自动模式 (推荐) - 系统根据任务规模自动分配</option>
+                        <option value="MANUAL">手动模式 - 明确指定每种任务的内存上限</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  <div class="resource-budget-slider">
+                    <label>
+                      <div class="resource-slider-header">
+                        <span>研究内存总预算</span>
+                        <span id="resourceBudgetValue" class="resource-value-badge">12 GB</span>
+                      </div>
+                      <input id="resourceBudgetSlider" type="range" min="512" max="32768" step="512" value="12288">
+                      <div class="resource-slider-labels">
+                        <span id="resourceBudgetMin">0.5 GB</span>
+                        <span id="resourceBudgetMax">32 GB</span>
+                      </div>
+                    </label>
+                    <p class="settings-note">
+                      <span id="resourceBudgetHint">建议：根据你的使用场景调整</span>
+                    </p>
+                  </div>
+
+                  <!-- Manual Mode Settings -->
+                  <div id="resourceManualSettings" class="resource-manual-settings" style="display: none;">
+                    <h4>手动模式 - 任务类型限制</h4>
+                    <div class="grid three">
+                      <label>
+                        轻量研究 (Light)
+                        <input id="resourceLightWorkerMb" type="number" min="512" max="8192" step="256" placeholder="2048">
+                        <span class="settings-note">单任务最大 MB</span>
+                      </label>
+                      <label>
+                        重型研究 (Heavy)
+                        <input id="resourceHeavyWorkerMb" type="number" min="1024" max="16384" step="512" placeholder="8192">
+                        <span class="settings-note">单任务最大 MB</span>
+                      </label>
+                      <label>
+                        历史回测 (Backtest)
+                        <input id="resourceBacktestWorkerMb" type="number" min="512" max="8192" step="256" placeholder="4096">
+                        <span class="settings-note">单任务最大 MB</span>
+                      </label>
+                    </div>
+                    <label>
+                      标准任务并发数
+                      <input id="resourceStandardWorkerLimit" type="number" min="1" max="10" step="1" placeholder="2">
+                      <span class="settings-note">非 Heavy 任务的最大并发数</span>
+                    </label>
+                  </div>
+
+                  <div class="resource-config-actions">
+                    <button id="saveResourceConfig" type="button" class="primary">保存资源配置</button>
+                    <button id="resetResourceConfig" type="button" class="secondary">恢复默认</button>
+                  </div>
+                  <div id="resourceConfigMessage" class="status"></div>
+                </div>
+
+                <!-- Usage Scenarios Guide -->
+                <div class="resource-scenarios">
+                  <h3>💡 使用场景建议</h3>
+                  <div class="scenario-grid">
+                    <div class="scenario-card">
+                      <h4>🌅 白天保守模式</h4>
+                      <p>设置较低预算（如 4-6 GB），为其他应用预留资源</p>
+                      <ul>
+                        <li>只运行小型实验</li>
+                        <li>大型任务自动排队</li>
+                        <li>前端保持流畅</li>
+                      </ul>
+                    </div>
+                    <div class="scenario-card">
+                      <h4>🌙 夜间激进模式</h4>
+                      <p>设置较高预算（如 12-16 GB），充分利用硬件</p>
+                      <ul>
+                        <li>自动执行排队任务</li>
+                        <li>支持多个大型研究</li>
+                        <li>最大化计算效率</li>
+                      </ul>
+                    </div>
+                    <div class="scenario-card">
+                      <h4>🔧 手动模式</h4>
+                      <p>明确控制每种任务的资源分配</p>
+                      <ul>
+                        <li>精确控制内存</li>
+                        <li>适合高级用户</li>
+                        <li>避免单任务过载</li>
+                      </ul>
                     </div>
                   </div>
                 </div>
@@ -545,5 +713,6 @@
       </main>
     </div>
     <script src="{{ url_for('static', filename='settings.js') }}?v=equity-live-sources-20260813"></script>
+    <script src="{{ url_for('static', filename='resource_config.js') }}?v=resource-config-20260815"></script>
   </body>
 </html>

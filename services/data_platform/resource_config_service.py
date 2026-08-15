@@ -70,7 +70,15 @@ class ResourceConfigService:
         if not row:
             # First run: auto-detect hardware and initialize
             return self._initialize_default()
-        return ResourceConfig(**dict(row))
+
+        # Convert row to dict and remove fields not in ResourceConfig
+        data = dict(row)
+        data.pop("config_id", None)
+        data.pop("auto_detected_at", None)
+        data.pop("last_updated_by", None)
+        data.pop("last_updated_at", None)
+
+        return ResourceConfig(**data)
 
     def update_user_config(
         self,

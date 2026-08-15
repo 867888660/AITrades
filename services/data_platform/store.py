@@ -766,30 +766,6 @@ class DataPlatformStore:
                     ON research_runs_v2(project_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_research_run_outbox_status
                     ON research_run_outbox(status, created_at);
-
-                -- Resource configuration management (user-configurable memory budgets)
-                CREATE TABLE IF NOT EXISTS system_resource_config (
-                    config_id TEXT PRIMARY KEY DEFAULT 'singleton',
-                    -- Layer 1: System hard limits
-                    physical_memory_mb INTEGER NOT NULL,
-                    system_reserve_mb INTEGER NOT NULL,
-                    frontend_reserve_mb INTEGER NOT NULL,
-                    emergency_reserve_mb INTEGER NOT NULL,
-                    max_research_budget_mb INTEGER NOT NULL,
-                    -- Layer 2: User global configuration
-                    user_research_budget_mb INTEGER NOT NULL,
-                    user_config_mode TEXT NOT NULL DEFAULT 'AUTO',
-                    user_light_worker_mb INTEGER,
-                    user_heavy_worker_mb INTEGER,
-                    user_backtest_worker_mb INTEGER,
-                    user_standard_worker_limit INTEGER,
-                    -- Metadata
-                    auto_detected_at TEXT,
-                    last_updated_by TEXT,
-                    last_updated_at TEXT,
-                    CHECK (user_research_budget_mb <= max_research_budget_mb),
-                    CHECK (user_config_mode IN ('AUTO', 'MANUAL'))
-                );
                 """
             )
             conn.execute(
@@ -1895,6 +1871,38 @@ class DataPlatformStore:
             conn.execute(
                 "INSERT INTO schema_migrations(migration_version, migration_name, applied_at) VALUES (?, ?, ?)",
                 (30, "project_scoped_definition_identity", utc_now()),
+            )
+        if 31 not in applied:
+            # Add system_resource_config table for user-configurable memory budgets
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS system_resource_config (
+                    config_id TEXT PRIMARY KEY DEFAULT 'singleton',
+                    -- Layer 1: System hard limits
+                    physical_memory_mb INTEGER NOT NULL,
+                    system_reserve_mb INTEGER NOT NULL,
+                    frontend_reserve_mb INTEGER NOT NULL,
+                    emergency_reserve_mb INTEGER NOT NULL,
+                    max_research_budget_mb INTEGER NOT NULL,
+                    -- Layer 2: User global configuration
+                    user_research_budget_mb INTEGER NOT NULL,
+                    user_config_mode TEXT NOT NULL DEFAULT 'AUTO',
+                    user_light_worker_mb INTEGER,
+                    user_heavy_worker_mb INTEGER,
+                    user_backtest_worker_mb INTEGER,
+                    user_standard_worker_limit INTEGER,
+                    -- Metadata
+                    auto_detected_at TEXT,
+                    last_updated_by TEXT,
+                    last_updated_at TEXT,
+                    CHECK (user_research_budget_mb <= max_research_budget_mb),
+                    CHECK (user_config_mode IN ('AUTO', 'MANUAL'))
+                );
+                """
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations(migration_version, migration_name, applied_at) VALUES (?, ?, ?)",
+                (31, "user_configurable_resource_management", utc_now()),
             )
 
     @staticmethod
