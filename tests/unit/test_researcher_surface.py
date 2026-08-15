@@ -380,6 +380,7 @@ class ResearcherSurfaceApiTests(unittest.TestCase):
                 return_value=["experiment_slow", "experiment_fast"],
             ),
             patch.object(service, "advance", side_effect=advance),
+            patch.object(service._admission, "acquire", return_value=True),
         ):
             dispatched = service.advance_pending(limit=20)
             self.assertTrue(slow_started.wait(timeout=1))
@@ -419,6 +420,7 @@ class ResearcherSurfaceApiTests(unittest.TestCase):
             ),
             patch.object(service, "_resource_class", return_value="HEAVY"),
             patch.object(service, "advance", side_effect=advance),
+            patch.object(service._admission, "acquire", return_value=True),
         ):
             dispatched = service.advance_pending(limit=20)
             self.assertTrue(heavy_started.wait(timeout=1))
