@@ -820,14 +820,34 @@ class ResearchRunWorker:
                     idempotency_key=f"research-run:{run['run_id']}:attempt:{attempt}:routed",
                 )
             if workload_plan is not None and workload_plan.hard_limit_exceeded:
-                raise GuardedProcessError(
-                    "PROCESS_RESOURCE_LIMIT",
-                    "Research input requires partitioned execution before it can fit the "
-                    f"bounded worker: estimated={workload_plan.estimated_working_set_mb} MiB, "
-                    f"limit={workload_plan.worker_memory_mb} MiB, "
-                    f"source_rows={workload_plan.source_rows}.",
+                # 切换到分区执行模式
+                _emit_inspection_safely(
+                    **common,
+                    trace_status="running",
+                    event_id=f"evt_research_{run['run_id']}_attempt_{attempt}_partition_mode",
+                    parent_event_id=claim_event_id,
+                    dependency_event_ids=[claim_event_id],
+                    event_kind="agent_step",
+                    title="Switching to partitioned execution",
+                    status="succeeded",
+                    operation="research.run.partition_mode",
+                    output_data={
+                        "estimated_mb": workload_plan.estimated_working_set_mb,
+                        "worker_limit_mb": workload_plan.worker_memory_mb,
+                        "reason": "Estimated memory exceeds worker capacity",
+                    },
+                    idempotency_key=f"research-run:{run['run_id']}:attempt:{attempt}:partition_mode",
                 )
-            if isolate_execution and isinstance(self.store, DataPlatformStore):
+                # 执行分区研究
+                from .partition_planner import ResearchPartitionPlanner
+                from .checkpoint_manager import CheckpointManager
+                from .partition_executor import PartitionedResearchExecutor
+
+                output = self._execute_partitioned(
+                    run=run,
+                    timeout_seconds=self._runtime_timeout_seconds(run) * 3,  # 分区执行更慢
+                )
+            elif isolate_execution and isinstance(self.store, DataPlatformStore):
                 timeout_seconds = self._runtime_timeout_seconds(run)
                 self._extend_lease(run["run_id"], timeout_seconds + 60)
                 output = self._execute_isolated(
@@ -969,6 +989,191 @@ class ResearchRunWorker:
                 """,
                 (expires, now, _clean(run_id), self.worker_id),
             )
+
+    def _execute_partitioned(
+        self,
+        run: Mapping[str, Any],
+        *,
+        timeout_seconds: int,
+    ) -> dict[str, Any]:
+        """
+        分区执行研究任务
+
+        流程：
+        1. 生成分区计划
+        2. 逐个执行分区（带恢复机制）
+        3. 聚合所有分区结果
+        4. 返回最终输出
+
+        Args:
+            run: Research Run 记录
+            timeout_seconds: 总超时时间
+
+        Returns:
+            研究结果字典
+        """
+        from pathlib import Path
+        from .partition_planner import ResearchPartitionPlanner
+        from .checkpoint_manager import CheckpointManager
+        from .partition_executor import PartitionedResearchExecutor
+
+        frozen_input = run.get("frozen_input", {})
+        bundle_id = run.get("bundle_id", "")
+
+        # 获取 bundle_hash
+        with self.store.connection() as conn:
+            bundle_row = conn.execute(
+                "SELECT bundle_hash FROM frozen_research_bundles WHERE bundle_id=?",
+                (bundle_id,),
+            ).fetchone()
+            if not bundle_row:
+                raise ValueError(f"Bundle {bundle_id} not found")
+            bundle_hash = bundle_row["bundle_hash"]
+
+        # 确保 frozen_input 包含 bundle_hash（用于 checkpoint 路径）
+        frozen_input["_bundle_hash"] = bundle_hash
+
+        # 初始化组件
+        checkpoint_root = Path(self.store.db_path).parent / "research_checkpoints"
+        checkpoint_manager = CheckpointManager(self.store, checkpoint_root)
+        executor = PartitionedResearchExecutor(self.store, checkpoint_manager)
+        planner = ResearchPartitionPlanner(checkpoint_root)
+
+        # 生成分区策略
+        strategy = planner.plan(frozen_input, bundle_hash)
+
+        if strategy.execution_mode != "PARTITIONED":
+            # 不需要分区，回退到普通执行
+            return FormalResearchRunExecutor(self.store).execute(run)
+
+        # 执行分区研究
+        partitions = strategy.partitions
+        completed_checkpoints = []
+
+        # 获取 manifest_id
+        manifest_id = frozen_input.get("manifest_id", "")
+        if not manifest_id:
+            raise ValueError("分区执行需要 manifest_id")
+
+        for i, partition in enumerate(partitions):
+            # 更新进度
+            progress_percent = int((i / len(partitions)) * 100)
+            self._update_partition_progress(
+                run_id=run["run_id"],
+                partition_id=partition.partition_id,
+                partition_index=i + 1,
+                total_partitions=len(partitions),
+                progress_percent=progress_percent,
+            )
+
+            # 检查是否已有 Checkpoint（恢复场景）
+            existing_checkpoint = checkpoint_manager.load(
+                partition_id=partition.partition_id,
+                bundle_hash=bundle_hash,
+            )
+
+            if existing_checkpoint:
+                _emit_inspection_safely(
+                    subject_type="research_run",
+                    subject_id=str(run["run_id"]),
+                    event_kind="agent_step",
+                    title=f"Reusing checkpoint for {partition.partition_id}",
+                    status="succeeded",
+                    operation="research.partition.checkpoint_reused",
+                    output_data={
+                        "partition_id": partition.partition_id,
+                        "row_count": existing_checkpoint.row_count,
+                    },
+                )
+                completed_checkpoints.append(existing_checkpoint)
+                continue
+
+            # 执行分区
+            try:
+                checkpoint = executor.execute_partition(
+                    partition=partition,
+                    frozen_input=frozen_input,
+                    manifest_id=manifest_id,
+                )
+                completed_checkpoints.append(checkpoint)
+
+                _emit_inspection_safely(
+                    subject_type="research_run",
+                    subject_id=str(run["run_id"]),
+                    event_kind="agent_step",
+                    title=f"Completed {partition.partition_id}",
+                    status="succeeded",
+                    operation="research.partition.execute",
+                    output_data={
+                        "partition_id": partition.partition_id,
+                        "row_count": checkpoint.row_count,
+                        "estimated_mb": partition.estimated_mb,
+                    },
+                )
+
+            except Exception as e:
+                _emit_inspection_safely(
+                    subject_type="research_run",
+                    subject_id=str(run["run_id"]),
+                    event_kind="agent_step",
+                    title=f"Failed {partition.partition_id}",
+                    status="failed",
+                    operation="research.partition.execute",
+                    output_data={
+                        "partition_id": partition.partition_id,
+                        "error": str(e),
+                    },
+                )
+                raise RuntimeError(f"分区 {partition.partition_id} 执行失败: {e}") from e
+
+        # 更新进度：聚合阶段
+        self._update_partition_progress(
+            run_id=run["run_id"],
+            partition_id="AGGREGATING",
+            partition_index=len(partitions),
+            total_partitions=len(partitions),
+            progress_percent=95,
+        )
+
+        # 聚合所有分区结果
+        final_result = executor.aggregate_partitions(
+            checkpoints=completed_checkpoints,
+            frozen_input=frozen_input,
+        )
+
+        # 清理旧 Checkpoint（可选，保留 7 天）
+        # checkpoint_manager.cleanup(bundle_hash, keep_days=7)
+
+        return final_result
+
+    def _update_partition_progress(
+        self,
+        run_id: str,
+        partition_id: str,
+        partition_index: int,
+        total_partitions: int,
+        progress_percent: int,
+    ) -> None:
+        """更新分区执行进度"""
+        progress_data = {
+            "phase": partition_id,
+            "partition_index": partition_index,
+            "total_partitions": total_partitions,
+            "progress_percent": progress_percent,
+        }
+
+        # 持久化到数据库（可选）
+        # 目前只发送 event
+
+        _emit_inspection_safely(
+            subject_type="research_run",
+            subject_id=str(run_id),
+            event_kind="progress",
+            title=f"Partition {partition_index}/{total_partitions}",
+            status="running",
+            operation="research.partition.progress",
+            output_data=progress_data,
+        )
 
     def _execute_isolated(
         self,

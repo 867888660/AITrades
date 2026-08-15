@@ -226,6 +226,9 @@ from .research_experiment_service import (
     RESEARCH_DECISIONS,
     ResearchExperimentService,
 )
+from .partition_planner import ResearchPartitionPlanner, PartitionPlan, ResearchPartitionStrategy
+from .checkpoint_manager import CheckpointManager, PartitionCheckpoint
+from .partition_executor import PartitionedResearchExecutor
 
 __all__ = [
     "DataPlatformStore",
@@ -440,4 +443,10 @@ __all__ = [
     "EXPERIMENT_STATES",
     "RESEARCH_DECISIONS",
     "ResearchExperimentService",
+    "ResearchPartitionPlanner",
+    "PartitionPlan",
+    "ResearchPartitionStrategy",
+    "CheckpointManager",
+    "PartitionCheckpoint",
+    "PartitionedResearchExecutor",
 ]

@@ -288,6 +288,116 @@ class ResourceConfigService:
 - [ ] CheckpointManager（持久化中间结果）
 - [ ] 恢复机制（进程崩溃后继续）
 
+## 🎉 Week 2 开始：Level 2 分区执行引擎核心完成！
+
+### Day 8: 核心组件实现 ✅
+
+#### 1. PartitionPlanner - 自动年度切分
+**文件**: `services/data_platform/partition_planner.py` (300+ 行)
+
+**功能**:
+- 根据历史长度、Universe 大小自动切分年度分区
+- 为每个分区计算 Warmup 窗口（基于最大 Factor window）
+- 估算每个分区的内存需求
+- 决定是否需要分区执行
+
+**核心类**:
+- `PartitionPlan`: 单个年度分区的执行计划
+- `ResearchPartitionStrategy`: 完整的分区执行策略
+- `ResearchPartitionPlanner`: 分区规划器
+
+**内存估算公式**:
+```python
+原始数据 = universe_size × trading_days × 200 bytes
+Factor 结果 = universe_size × trading_days × factor_count × 150 bytes
+Alpha 结果 = universe_size × trading_days × alpha_count × 100 bytes
+峰值内存 = (原始 + Factor + Alpha) × 1.3 (overhead)
+```
+
+#### 2. CheckpointManager - 持久化和恢复
+**文件**: `services/data_platform/checkpoint_manager.py` (250+ 行)
+
+**功能**:
+- 将分区执行结果持久化到 Parquet（Zstandard 压缩）
+- 支持进程崩溃后从 Checkpoint 恢复
+- 验证 Checkpoint 完整性（SHA256）
+- 清理过期 Checkpoint
+
+**核心类**:
+- `PartitionCheckpoint`: 单个分区的 Checkpoint 元数据
+- `CheckpointManager`: Checkpoint 管理器
+
+**存储结构**:
+```
+research_checkpoints/
+  {bundle_hash[:8]}/
+    partition_2020_factors.parquet
+    partition_2020_alphas.parquet
+    partition_2021_factors.parquet
+    partition_2021_alphas.parquet
+    ...
+```
+
+#### 3. PartitionExecutor - 逐分区执行
+**文件**: `services/data_platform/partition_executor.py` (250+ 行)
+
+**功能**:
+- 加载 Warmup + Execution 窗口数据
+- 计算 Factors（只保留 execution 窗口结果）
+- 计算 Alphas（只保留 execution 窗口结果）
+- 写入 Checkpoint 并显式释放内存
+- 聚合所有分区结果
+
+**核心类**:
+- `PartitionedResearchExecutor`: 分区研究执行器
+- `AlphaCalculator`: Alpha 计算器（简化实现）
+
+**内存管理**:
+- 每个阶段后显式 `del` 和 `gc.collect()`
+- 只保留 execution 窗口的结果
+- Warmup 数据仅用于计算，不持久化
+
+#### 4. 集成到 ResearchRunService
+**文件**: `services/data_platform/research_run_service.py` (新增 150+ 行)
+
+**改动**:
+- 修改 `run_once` 方法：检测到 `hard_limit_exceeded` 时切换到分区执行
+- 新增 `_execute_partitioned` 方法：完整的分区执行流程
+- 新增 `_update_partition_progress` 方法：实时进度更新
+
+**执行流程**:
+```python
+if workload_plan.hard_limit_exceeded:
+    # 切换到分区执行模式
+    output = self._execute_partitioned(run, timeout_seconds)
+elif isolate_execution:
+    # 传统隔离执行
+    output = self._execute_isolated(run, timeout_seconds)
+else:
+    # 直接执行
+    output = FormalResearchRunExecutor(self.store).execute(run)
+```
+
+---
+
+### ⏳ 待完成 (Day 9-14)
+
+- [ ] **完整的数据库 Schema Migration**（添加 Checkpoint 表）
+- [ ] **FormalResearchRunExecutor 适配**（支持分区模式）
+- [ ] **进度追踪增强**（前端显示分区进度）
+- [ ] **恢复机制验证**（模拟进程崩溃）
+- [ ] **集成测试**（完整的 25 年全市场研究）
+- [ ] **性能基准测试**（内存占用、执行时间）
+
+---
+
+### Week 3-4: 集成和优化
+
+- [ ] PartitionPlanner（自动年度切分）（已完成 ✅）
+- [ ] PartitionExecutor（逐分区执行）（已完成 ✅）
+- [ ] CheckpointManager（持久化中间结果）（已完成 ✅）
+- [ ] 恢复机制（进程崩溃后继续）（核心完成 ✅，待测试）
+
 ### Week 5+: Level 3 流式计算（可选）
 - [ ] Universe Membership Timeline 预编译
 - [ ] 流式 Factor 计算（per-instrument）
