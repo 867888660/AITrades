@@ -51,29 +51,7 @@ class CheckpointManager:
     def __init__(self, store: DataPlatformStore, checkpoint_root: Path):
         self.store = store
         self.checkpoint_root = checkpoint_root
-        self._ensure_schema()
-
-    def _ensure_schema(self) -> None:
-        """确保 Checkpoint 表存在"""
-        with self.store.transaction() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS research_partition_checkpoints(
-                    checkpoint_id TEXT PRIMARY KEY DEFAULT ('checkpoint_' || lower(hex(randomblob(16)))),
-                    partition_id TEXT NOT NULL,
-                    bundle_hash TEXT NOT NULL,
-                    factor_artifact_id TEXT NOT NULL,
-                    alpha_artifact_id TEXT NOT NULL,
-                    row_count INTEGER NOT NULL,
-                    completed_at TEXT NOT NULL,
-                    verification_hash TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-                    UNIQUE(partition_id, bundle_hash)
-                )
-            """)
-            conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_checkpoint_bundle
-                ON research_partition_checkpoints(bundle_hash, partition_id)
-            """)
+        # Schema is created by Migration 32 in store.py
 
     def save(
         self,

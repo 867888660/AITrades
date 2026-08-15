@@ -1904,6 +1904,30 @@ class DataPlatformStore:
                 "INSERT INTO schema_migrations(migration_version, migration_name, applied_at) VALUES (?, ?, ?)",
                 (31, "user_configurable_resource_management", utc_now()),
             )
+        if 32 not in applied:
+            # Add research_partition_checkpoints table for Level 2 partition execution
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS research_partition_checkpoints(
+                    checkpoint_id TEXT PRIMARY KEY DEFAULT ('checkpoint_' || lower(hex(randomblob(16)))),
+                    partition_id TEXT NOT NULL,
+                    bundle_hash TEXT NOT NULL,
+                    factor_artifact_id TEXT NOT NULL,
+                    alpha_artifact_id TEXT NOT NULL,
+                    row_count INTEGER NOT NULL,
+                    completed_at TEXT NOT NULL,
+                    verification_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    UNIQUE(partition_id, bundle_hash)
+                );
+                CREATE INDEX IF NOT EXISTS idx_checkpoint_bundle
+                ON research_partition_checkpoints(bundle_hash, partition_id);
+                """
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations(migration_version, migration_name, applied_at) VALUES (?, ?, ?)",
+                (32, "partition_execution_checkpoints", utc_now()),
+            )
 
     @staticmethod
     def row_to_dict(row: Optional[sqlite3.Row]) -> Optional[dict[str, Any]]:
