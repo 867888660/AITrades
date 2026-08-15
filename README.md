@@ -1,5 +1,10 @@
 # DataTube
 
+后端计算采用“Web 控制面 + 持久队列 + 资源准入 + 隔离 worker”架构；Research 与
+历史回测不会在 HTTP 请求内同步执行。故障隔离、队列进度和运维参数见
+[后端分发与故障隔离](docs/BACKEND_DISPATCH_ARCHITECTURE.md)。
+[Backend Architecture v2：智能路由与自动资源调度](docs/BACKEND_ARCHITECTURE_V2.md)。
+
 量化研究入口：`http://127.0.0.1:5001/research`。英文 UI 以 `Research` 和 `Library` 为两个核心名称：Research 用于创建、修改、验证和测试工作卡片；Library 只保存已发布、带版本且可复用的正式资产。发布会生成独立的不可变 Library 版本，不会改变或持续同步原 Research 工作卡片；从 Library 添加时默认保存只读版本引用，只有 `Copy and Edit` 才创建新的 Research 草稿。单个 Research 提供 `Overview / Universe / Factor / Alpha / Data / Strategy / Runs`；Runs 已拆分为 Factor Evaluation、Alpha Evaluation 与 Research Backtest，分别负责因子评估、Signal 评估和组合/交易/成本/收益。这里 `Requirements` 是“研究需要什么数据”的可复用契约，`Data` 只展示这些需求的 Coverage、自动维护状态、实时下载进度与终态错误；实际数据资产仍由 `Data Catalog` 管理。后台每 30 秒扫描 Requirement Library 与活跃 Research，自动创建受限、幂等、可审计的数据维护任务，普通缺口不需要用户点击补数。Research Agent 支持从自然语言目标 `START`，也可以从 Project、Run、Preview、Bundle、Factor、Alpha 或 Session `RESUME`，并通过 AgentMonitor 查看可恢复的实验过程。详见 [Factor Run、Alpha Run 与 Research Backtest MVP](文档/03-features/factor-alpha-run-mvp.md)、[Requirement 数据自动维护](文档/04-operations/requirement-data-maintenance.md)、[Research Agent Skill](文档/03-features/research-agent-skill.md)、[Research Run 语义与实现基线](文档/03-features/research-run-semantics.md)、[Research 工作台操作说明](文档/04-operations/research-workspace-operation-guide.md) 和 [交付状态](文档/04-operations/research-baseline-delivery-status.md)。
 
 Local Flask dashboard and collectors for Polymarket market data, strategy monitoring, virtual execution, and related crypto/finance feeds.

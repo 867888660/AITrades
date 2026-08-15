@@ -7,6 +7,7 @@ from pathlib import Path
 
 from services.data_platform import (
     CanonicalBarsCommitter,
+    CanonicalDatasetCommitter,
     DataPlatformStore,
     FactorDraftService,
     FactorPreviewError,
@@ -287,6 +288,94 @@ class PolymarketFactorPreviewServiceTests(unittest.TestCase):
             self.assertGreater(
                 result["analysis"]["overall"]["valid_value_count"],
                 0,
+            )
+
+
+class CrspFactorPreviewServiceTests(unittest.TestCase):
+    def test_daily_collection_manifest_covers_its_last_observation_day(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = DataPlatformStore(root / "metadata.db")
+            project = ResearchControlPlane(store).create_project(
+                title="CRSP Factor Preview",
+                objective="verify CRSP daily endpoint and physical semantics",
+            )
+            instrument_id = "equity:CRSP:10001"
+            base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            rows = []
+            for index in range(4):
+                start = base + timedelta(days=index)
+                end = start + timedelta(days=1)
+                close = 100.0 + index
+                rows.append({
+                    "security_id": "crsp:permno:10001",
+                    "instrument_id": instrument_id,
+                    "frequency": "1d",
+                    "bar_start_time": start.isoformat(),
+                    "bar_end_time": end.isoformat(),
+                    "available_time": end.isoformat(),
+                    "open": close - 0.5,
+                    "high": close + 1.0,
+                    "low": close - 1.0,
+                    "close": close,
+                    "volume": 1000.0,
+                    "bar_status": "COMPLETE",
+                    "source": "CRSP/CIZ",
+                    "quality_status": "PASS",
+                })
+            committed = CanonicalDatasetCommitter(
+                store,
+                root / "canonical",
+            ).commit(
+                dataset_id="crsp:ciz:bars",
+                instrument_id="equity:CRSP:ALL",
+                data_type="bars",
+                frequency="1d",
+                source="CRSP/CIZ",
+                source_version="test",
+                schema_version="bars_daily.v2",
+                rows=rows,
+                event_time_field="bar_start_time",
+                adjustment="CRSP_FIELDS",
+            )
+            universe = UniverseService(store).create_definition(
+                name="CRSP member",
+                version="1.0.0",
+                universe_type="STATIC_LIST",
+                parameters={"instrument_ids": [instrument_id]},
+                owner_project_id=project["project_id"],
+                library_scope="PROJECT",
+            )
+            snapshot = UniverseService(store).resolve_snapshot(
+                universe_definition_id=universe.universe_definition_id,
+                as_of_time=(base + timedelta(days=5)).isoformat(),
+            )
+            UniverseService(store).set_research_ref(
+                project_id=project["project_id"],
+                universe_snapshot_id=snapshot.universe_snapshot_id,
+            )
+            document = factor_document(window=1)
+            document["inputs"][0]["frequency"] = "1d"
+            drafts = FactorDraftService(store)
+            draft = drafts.create(
+                document,
+                owner_project_id=project["project_id"],
+                library_scope="PROJECT",
+            )
+            preview = FactorPreviewService(store).create(
+                draft.draft_id,
+                {
+                    "expected_fingerprint": draft.draft_fingerprint,
+                    "universe_snapshot_id": snapshot.universe_snapshot_id,
+                    "start_time": (base + timedelta(days=1)).isoformat(),
+                    "end_time": (base + timedelta(days=3, hours=23, minutes=59)).isoformat(),
+                },
+            )
+
+            self.assertEqual("READY", preview["status"])
+            self.assertEqual(
+                [committed["manifest"].manifest_id],
+                preview["manifest_ids"],
             )
 
 

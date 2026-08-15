@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import importlib.util
 import math
+import os
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -23,7 +25,21 @@ CLOB_BASE_URL = "https://clob.polymarket.com"
 DEFAULT_BINANCE_INTERVAL = "1m"
 DEFAULT_BACKTEST_CASH = 10_000.0
 DEFAULT_BACKTEST_FEE_BPS = 2.0
-BACKTEST_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="history-backtest")
+BACKTEST_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="history-backtest")
+_BACKTEST_INFLIGHT: set[int] = set()
+_BACKTEST_INFLIGHT_LOCK = threading.Lock()
+_BACKTEST_ADMISSION: Any = None
+
+
+def _get_backtest_admission() -> Any:
+    global _BACKTEST_ADMISSION
+    if _BACKTEST_ADMISSION is None:
+        # Lazy import avoids a cycle through data_platform.__init__, whose
+        # Polymarket adapter imports this history module.
+        from services.data_platform.workload_scheduler import ResourceAdmissionController
+
+        _BACKTEST_ADMISSION = ResourceAdmissionController()
+    return _BACKTEST_ADMISSION
 
 
 def _interval_ms(interval: str) -> int:
@@ -1071,7 +1087,56 @@ def _mark_backtest_progress(
 
 def _execute_backtest_run_safe(run_id: int) -> None:
     try:
-        _execute_backtest_run(int(run_id))
+        from services.data_platform.process_guard import run_guarded_process
+        from services.data_platform.workload_scheduler import (
+            IntelligentWorkloadRouter,
+            worker_log_path,
+        )
+        run = get_backtest_run(int(run_id))
+        snapshot = run.get("case_snapshot") if isinstance(run, dict) else {}
+        legs = snapshot.get("legs") if isinstance(snapshot, dict) else []
+        route = IntelligentWorkloadRouter().route_backtest(
+            legs=len(legs) if isinstance(legs, list) else 0
+        )
+        token = f"history-backtest:{int(run_id)}"
+        admission = _get_backtest_admission()
+        allowed, _ = admission.can_dispatch(
+            route.resource_class, route.worker_memory_mb
+        )
+        if not allowed:
+            _mark_backtest_progress(
+                int(run_id),
+                3,
+                "waiting_resource",
+                "Backtest is waiting for a safe execution window; no action is required.",
+            )
+        while not admission.acquire(
+            token, route.resource_class, route.worker_memory_mb
+        ):
+            time.sleep(2.0)
+        try:
+            _mark_backtest_progress(
+                int(run_id), 5, "dispatched", "Backtest was automatically dispatched."
+            )
+            run_guarded_process(
+                [
+                    sys.executable,
+                    "-m",
+                    "services.history_backtest_child",
+                    "--run-id",
+                    str(int(run_id)),
+                ],
+                cwd=BASE_DIR,
+                log_path=worker_log_path(
+                    HISTORY_DB_PATH, "history_backtests", str(run_id), "latest.log"
+                ),
+                timeout_seconds=max(
+                    60, int(os.environ.get("DATATUBE_BACKTEST_TIMEOUT_SECONDS", "1800"))
+                ),
+                memory_limit_mb=route.worker_memory_mb,
+            )
+        finally:
+            admission.release(token)
     except Exception as exc:
         message = f"Backtest worker crashed: {type(exc).__name__}: {exc}"
         now = _now_iso()
@@ -1098,9 +1163,16 @@ def _execute_backtest_run_safe(run_id: int) -> None:
             conn.commit()
         finally:
             conn.close()
+    finally:
+        with _BACKTEST_INFLIGHT_LOCK:
+            _BACKTEST_INFLIGHT.discard(int(run_id))
 
 
 def _submit_backtest_run(run_id: int) -> None:
+    with _BACKTEST_INFLIGHT_LOCK:
+        if int(run_id) in _BACKTEST_INFLIGHT:
+            return
+        _BACKTEST_INFLIGHT.add(int(run_id))
     conn = _connect()
     try:
         conn.execute(
@@ -1112,6 +1184,54 @@ def _submit_backtest_run(run_id: int) -> None:
         conn.close()
     _mark_backtest_progress(run_id, 5, "queued", "Backtest task queued.")
     BACKTEST_EXECUTOR.submit(_execute_backtest_run_safe, int(run_id))
+
+
+def recover_backtest_queue() -> Dict[str, Any]:
+    """Recover durable queued work and quarantine interrupted computation."""
+
+    now = _now_iso()
+    conn = _connect()
+    try:
+        running = [
+            int(row[0])
+            for row in conn.execute(
+                "SELECT run_id FROM backtest_runs WHERE status='running' ORDER BY run_id"
+            ).fetchall()
+        ]
+        for run_id in running:
+            row = conn.execute(
+                "SELECT metrics_json FROM backtest_runs WHERE run_id=?", (run_id,)
+            ).fetchone()
+            metrics = _loads_json(row[0] if row else "{}", {})
+            metrics.update({
+                "progress_percent": 100.0,
+                "progress_stage": "interrupted",
+                "progress_message": "Backtest worker was interrupted by a service restart.",
+                "progress_updated_at": now,
+            })
+            conn.execute(
+                """UPDATE backtest_runs SET status='failed', error=?, metrics_json=?,
+                   finished_at_utc=?, updated_at_utc=? WHERE run_id=?""",
+                (
+                    "BACKTEST_PROCESS_INTERRUPTED",
+                    json.dumps(metrics, ensure_ascii=False, sort_keys=True),
+                    now,
+                    now,
+                    run_id,
+                ),
+            )
+        queued = [
+            int(row[0])
+            for row in conn.execute(
+                "SELECT run_id FROM backtest_runs WHERE status='queued' ORDER BY created_at_utc, run_id"
+            ).fetchall()
+        ]
+        conn.commit()
+    finally:
+        conn.close()
+    for run_id in queued:
+        _submit_backtest_run(run_id)
+    return {"queued": queued, "interrupted": running}
 
 
 def rerun_backtest_run(run_id: int, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -4117,6 +4237,50 @@ def get_backtest_run(
             "events_total": event_count,
             "events_returned": len(run["events"]),
             "events_truncated": event_count > len(run["events"]),
+        }
+        status = str(run.get("status") or "").strip().lower()
+        if status == "queued":
+            total = int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM backtest_runs WHERE status='queued'"
+                ).fetchone()[0]
+                or 0
+            )
+            created_at = str(run.get("created_at_utc") or "")
+            position = int(
+                conn.execute(
+                    """SELECT COUNT(*) FROM backtest_runs WHERE status='queued'
+                       AND (created_at_utc < ? OR (created_at_utc = ? AND run_id <= ?))""",
+                    (created_at, created_at, int(run_id)),
+                ).fetchone()[0]
+                or 0
+            )
+            queue_state = "WAITING"
+        else:
+            total = 0
+            position = 0
+            queue_state = "RUNNING" if status == "running" else "TERMINAL"
+        metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+        from services.data_platform.workload_scheduler import automatic_queue_status
+
+        run["queue"] = automatic_queue_status(
+            state=queue_state,
+            position=max(1, position) if status == "queued" else 0,
+            total=total,
+            queued_at=run.get("created_at_utc"),
+            reason=(
+                "FRONTEND_MEMORY_RESERVE"
+                if str(metrics.get("progress_stage") or "").lower() == "waiting_resource"
+                else ""
+            ),
+        )
+        run["progress"] = {
+            "percent": float(metrics.get("progress_percent") or 0.0),
+            "phase": str(metrics.get("progress_stage") or status or "queued"),
+            "message": str(metrics.get("progress_message") or ""),
+            "heartbeat_at": metrics.get("progress_updated_at") or run.get("updated_at_utc"),
+            "action_required": False,
+            "next_update_seconds": 5 if status in {"queued", "running"} else 0,
         }
         return run
     finally:

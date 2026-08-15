@@ -10,8 +10,19 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from .data_client import FrozenManifestData
+from .coverage_semantics import (
+    range_end_covers_requirement,
+    uses_daily_observation_endpoint,
+)
 from .factor_engine_v4 import FactorEngineV4, FactorGraphSpec
 from .input_candidate_resolver import FactorInputCandidateResolver
+from .equity_factor_bridge import (
+    dataset_contract,
+    field_is_available,
+    is_sparse_dataset,
+    physical_data_types,
+    project_factor_rows,
+)
 from .requirement_compiler import RequirementCompiler
 from .store import DataPlatformStore, json_dumps, utc_now
 from .universe_service import UniverseService
@@ -25,6 +36,7 @@ _CANONICAL_BAR_FIELDS = {
     "trade_count",
 }
 _FREQUENCY_SECONDS = {
+    "event": 0,
     "1m": 60,
     "5m": 5 * 60,
     "15m": 15 * 60,
@@ -630,9 +642,11 @@ class FactorPreviewService:
         frequency: str,
         field: str,
     ) -> list[Any]:
+        accepted_types = physical_data_types(dataset)
+        placeholders = ",".join("?" for _ in accepted_types)
         with self.store.connection() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT c.*,m.manifest_id,m.manifest_version,m.manifest_hash,
                        m.schema_version AS manifest_schema_version,
                        MIN(p.start_time) AS partition_start,
@@ -642,12 +656,13 @@ class FactorPreviewService:
                 FROM dataset_catalog c
                 JOIN dataset_manifests m ON m.dataset_id=c.dataset_id
                 JOIN dataset_partitions p ON p.manifest_id=m.manifest_id
-                WHERE c.instrument_id=? AND lower(c.data_type)=lower(?)
+                WHERE c.instrument_id IN (?, 'equity:CRSP:ALL')
+                  AND lower(c.data_type) IN ({placeholders})
                   AND lower(c.frequency)=lower(?)
                   AND c.status='READY' AND m.status='READY'
                 GROUP BY m.manifest_id
                 """,
-                (_clean(instrument_id), _clean(dataset), _clean(frequency)),
+                (_clean(instrument_id), *accepted_types, _clean(frequency)),
             ).fetchall()
         eligible = []
         for row in rows:
@@ -656,20 +671,42 @@ class FactorPreviewService:
                 fields = set(_CANONICAL_BAR_FIELDS)
             if not fields and str(row["manifest_schema_version"]).lower() == "polymarket_price.v1":
                 fields = {"price"}
-            if field not in fields:
+            if not field_is_available(
+                dataset,
+                field,
+                physical_data_type=str(row["data_type"]),
+                catalog_fields=fields,
+            ):
                 continue
-            expected_time_semantics = (
+            contract = dataset_contract(dataset) or {}
+            expected_time_semantics = str(contract.get("time_semantics") or (
                 "EVENT_TIME_AVAILABLE_TIME"
                 if _clean(dataset).lower() == "price_history"
                 else "BAR_END_AVAILABLE_TIME"
+            )).upper()
+            expected_pit_policy = str(contract.get("point_in_time_policy") or "AS_OF").upper()
+            daily_observation_contract = uses_daily_observation_endpoint(
+                data_type=row["data_type"],
+                frequency=row["frequency"],
+                source=row["source"],
+                schema_version=row["manifest_schema_version"],
+                time_semantics=row["time_semantics"],
+            )
+            canonical_bar_contract = (
+                str(row["adjustment"]).upper() == "NONE"
+                and str(row["time_semantics"]).upper() == expected_time_semantics
+            )
+            crsp_daily_contract = (
+                daily_observation_contract
+                and str(row["adjustment"]).upper() == "CRSP_FIELDS"
+                and str(row["time_semantics"]).upper() == "SOURCE_AVAILABLE_TIME"
             )
             if (
                 str(row["quality_status"]).upper() != "PASS"
                 or int(row["gap_count"] or 0) > 0
                 or int(row["bad_partitions"] or 0) > 0
-                or str(row["adjustment"]).upper() != "NONE"
-                or str(row["point_in_time_policy"]).upper() != "AS_OF"
-                or str(row["time_semantics"]).upper() != expected_time_semantics
+                or not (canonical_bar_contract or crsp_daily_contract)
+                or str(row["point_in_time_policy"]).upper() != expected_pit_policy
             ):
                 continue
             if not row["partition_start"] or not row["partition_end"]:
@@ -737,7 +774,15 @@ class FactorPreviewService:
                     (
                         row for row in candidates
                         if _parse_time(row["partition_start"]) <= required_start + event_tolerance
-                        and _parse_time(row["partition_end"]) >= end - event_tolerance
+                        and range_end_covers_requirement(
+                            actual_end=row["partition_end"],
+                            required_end=end - event_tolerance,
+                            data_type=row["data_type"],
+                            frequency=frequency,
+                            source=row["source"],
+                            schema_version=row["manifest_schema_version"],
+                            time_semantics=row["time_semantics"],
+                        )
                     ),
                     None,
                 )
@@ -792,11 +837,18 @@ class FactorPreviewService:
                 rows = manifest_rows[binding["manifest_id"]].get(
                     binding["instrument_id"], []
                 )
+                rows = project_factor_rows(
+                    _clean(input_spec.get("dataset") or "bars"),
+                    _clean(input_spec.get("field")),
+                    rows,
+                )
                 selected_rows = [
                     row for row in rows
                     if required_start <= _parse_time(row.get("available_time")) <= end
                 ]
-                if len(selected_rows) < history:
+                if len(selected_rows) < history and not is_sparse_dataset(
+                    _clean(input_spec.get("dataset") or "bars")
+                ):
                     raise FactorPreviewError(
                         "FACTOR_PREVIEW_HISTORY_NOT_COVERED",
                         (

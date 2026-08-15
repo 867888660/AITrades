@@ -1,0 +1,26 @@
+{
+  "idempotency_key": "us-smallcap-short-term-reversal-exp2",
+  "candidate": {
+    "hypothesis": {
+      "statement": "在市值1亿至50亿美元的美国普通股中，过去1个月（约21个交易日）收益对后续收益具有负向预测能力（短期反转效应）",
+      "expected_direction": "NEGATIVE"
+    },
+    "intervention_set": [
+      {"component": "factor", "change": "introduce short-term reversal (1-month past return)"}
+    ],
+    "controlled_variables": ["universe", "research_period", "frequency"],
+    "factor": {
+      "name": "short_term_reversal_1m",
+      "operator": "pct_change",
+      "input_field": "close",
+      "window": 21,
+      "frequency": "1d",
+      "output_direction": "LOWER_IS_BETTER"
+    },
+    "evaluation": {
+      "run_type": "FACTOR_EVALUATION",
+      "primary_metric": "rank_ic",
+      "horizons": [1, 5, 20]
+    }
+  }
+}

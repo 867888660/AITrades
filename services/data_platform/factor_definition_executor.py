@@ -9,6 +9,12 @@ from .factor_engine_v4 import (
     FactorEngineV4,
     FactorGraphSpec,
 )
+from .equity_factor_bridge import (
+    field_is_available,
+    is_sparse_dataset,
+    physical_data_types,
+    project_factor_rows,
+)
 
 
 class FactorDefinitionExecutor:
@@ -87,6 +93,7 @@ class FactorDefinitionExecutor:
             variable_name = str(input_spec.get("variable_name") or "")
             frequency = str(input_spec.get("frequency") or "").lower()
             field = str(input_spec.get("field") or "").lower()
+            dataset = str(input_spec.get("dataset") or "bars").lower()
             candidates: dict[
                 str,
                 list[tuple[str, list[dict[str, Any]]]],
@@ -94,25 +101,31 @@ class FactorDefinitionExecutor:
             for source in manifest_inputs:
                 if str(source["frequency"]).lower() != frequency:
                     continue
+                physical_type = str(source.get("data_type") or "").lower()
+                if physical_type and physical_type not in physical_data_types(dataset):
+                    continue
                 source_fields = {
                     str(item).lower() for item in source["fields"]
                 }
                 for instrument_id, rows in source["rows"].items():
                     if instrument_id not in allowed_instruments:
                         continue
-                    if (
-                        field not in source_fields
-                        and not any(field in row for row in rows[:1])
-                    ):
+                    if not field_is_available(
+                        dataset,
+                        field,
+                        physical_data_type=physical_type or dataset,
+                        catalog_fields=source_fields,
+                    ) and not any(field in row for row in rows[:1]):
                         continue
+                    projected = project_factor_rows(dataset, field, rows)
                     candidates.setdefault(instrument_id, []).append(
                         (
                             str(source["manifest_id"]),
-                            [dict(row) for row in rows],
+                            projected,
                         )
                     )
             missing = sorted(allowed_instruments - set(candidates))
-            if missing:
+            if missing and not is_sparse_dataset(dataset):
                 raise ValueError(
                     f"Frozen Manifests do not supply Input {variable_name} "
                     f"({field} @ {frequency}) for Universe members: {missing}"
@@ -128,7 +141,7 @@ class FactorDefinitionExecutor:
                     f"{variable_name}: {ambiguous}"
                 )
             bound[variable_name] = {
-                instrument_id: items[0][1]
-                for instrument_id, items in candidates.items()
+                instrument_id: candidates.get(instrument_id, [("", [])])[0][1]
+                for instrument_id in allowed_instruments
             }
         return bound

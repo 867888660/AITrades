@@ -70,6 +70,31 @@ class RequirementCompilerTest(unittest.TestCase):
         self.assertEqual("SUPERSEDED", self.compiler.get(first.requirement_set_id).status)
         self.assertEqual(second.requirement_set_id, self.compiler.get(first.requirement_set_id).superseded_by_id)
 
+    def test_recompile_reactivates_matching_superseded_requirement_set(self) -> None:
+        first = self.compiler.compile(
+            project_id="project_a",
+            factor_specs=[FactorSpec(name="momentum", version="1", operator="pct_change", window=20)],
+            context=self.context,
+        )
+        second = self.compiler.compile(
+            project_id="project_a",
+            factor_specs=[FactorSpec(name="momentum", version="2", operator="pct_change", window=60)],
+            context=self.context,
+        )
+
+        reactivated = self.compiler.compile(
+            project_id="project_a",
+            factor_specs=[FactorSpec(name="momentum", version="1", operator="pct_change", window=20)],
+            context=self.context,
+        )
+
+        self.assertEqual(first.requirement_set_id, reactivated.requirement_set_id)
+        self.assertEqual("RESOLVED", reactivated.status)
+        self.assertIsNone(reactivated.superseded_by_id)
+        refreshed_second = self.compiler.get(second.requirement_set_id)
+        self.assertEqual("SUPERSEDED", refreshed_second.status)
+        self.assertEqual(first.requirement_set_id, refreshed_second.superseded_by_id)
+
     def test_v4_graph_compiles_each_referenced_input_and_its_history(self) -> None:
         result = self.compiler.compile(
             project_id="project_v4",
@@ -204,6 +229,70 @@ class RequirementCompilerTest(unittest.TestCase):
         covered = self.compiler.coverage(result.requirement_set_id)
         self.assertEqual("SATISFIED", covered["status"])
         self.assertTrue(covered["checks"][0]["satisfied"])
+
+    def test_coverage_accepts_crsp_daily_observation_day_without_relaxing_intraday(self) -> None:
+        daily = self.compiler.compile(
+            project_id="project_crsp_daily_boundary",
+            manual_requirements=[{"id": "daily", "fields": ["close"]}],
+            context={
+                "instrument_ids": ["equity:CRSP:10001"],
+                "data_type": "bars",
+                "frequency": "1d",
+                "history_start": "2000-01-01T00:00:00+00:00",
+                "history_end": "2025-12-31T23:59:59+00:00",
+            },
+        )
+        DatasetCatalogService(self.store).upsert_catalog({
+            "dataset_id": "crsp:ciz:bars",
+            "instrument_id": "equity:CRSP:ALL",
+            "data_type": "bars",
+            "frequency": "1d",
+            "source": "CRSP/CIZ",
+            "status": "READY",
+            "quality_status": "PASS",
+            "schema_version": "bars_daily.v2",
+            "storage_path": "unused",
+            "start_time": "1925-12-31T00:00:00+00:00",
+            "end_time": "2025-12-31T00:00:00+00:00",
+            "last_complete_time": "2026-01-01T00:00:00+00:00",
+            "row_count": 1000,
+            "gap_count": 0,
+        })
+        self.assertEqual(
+            "SATISFIED",
+            self.compiler.coverage(daily.requirement_set_id)["status"],
+        )
+
+        intraday = self.compiler.compile(
+            project_id="project_intraday_boundary",
+            manual_requirements=[{"id": "hourly", "fields": ["close"]}],
+            context={
+                "instrument_ids": ["crypto_spot:BINANCE:BTCUSDT"],
+                "data_type": "bars",
+                "frequency": "1h",
+                "history_start": "2025-12-31T00:00:00+00:00",
+                "history_end": "2025-12-31T23:00:00+00:00",
+            },
+        )
+        DatasetCatalogService(self.store).upsert_catalog({
+            "dataset_id": "binance:BTCUSDT:partial-day",
+            "instrument_id": "crypto_spot:BINANCE:BTCUSDT",
+            "data_type": "bars",
+            "frequency": "1h",
+            "source": "BINANCE",
+            "status": "READY",
+            "quality_status": "PASS",
+            "schema_version": "bars.v1",
+            "storage_path": "unused",
+            "start_time": "2025-12-31T00:00:00+00:00",
+            "end_time": "2025-12-31T01:00:00+00:00",
+            "last_complete_time": "2025-12-31T01:00:00+00:00",
+            "row_count": 1,
+            "gap_count": 0,
+        })
+        hourly_coverage = self.compiler.coverage(intraday.requirement_set_id)
+        self.assertEqual("GAPS_FOUND", hourly_coverage["status"])
+        self.assertIn("END_NOT_COVERED", hourly_coverage["checks"][0]["reasons"])
 
 
 if __name__ == "__main__":

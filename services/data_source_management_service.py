@@ -20,6 +20,7 @@ _SOURCE_POLICY_KEYS = {
     "COINGECKO": ("CRYPTO:SNAPSHOT:SNAPSHOT",),
     "FINNHUB": ("EQUITY:SNAPSHOT:QUOTE",),
     "POLYMARKET": ("POLYMARKET_BINARY:*:PRICE_HISTORY",),
+    "SEC": ("EQUITY:FUNDAMENTALS:SNAPSHOT",),
 }
 _ROUTING_UPDATE_LOCK = threading.Lock()
 
@@ -79,6 +80,10 @@ class DataSourceManagementService:
             credentials = {**credentials, "fred_api_key": self.settings["openbb_fred_api_key"]}
         return required, all(bool(credentials.get(key)) for key in required)
 
+    def _configuration_state(self, provider: dict[str, Any]) -> tuple[list[str], bool]:
+        required = list(provider.get("configuration_keys") or [])
+        return required, all(bool(self.settings.get(key)) for key in required)
+
     def _openbb_runtime_snapshot(self) -> dict[str, Any]:
         marker = self.base_dir / ".datatube" / "openbb-runtime.json"
         try:
@@ -101,6 +106,7 @@ class DataSourceManagementService:
                 continue
             source_id = self._source_id(provider)
             credential_keys, credential_configured = self._credential_state(provider)
+            configuration_keys, configuration_configured = self._configuration_state(provider)
             configured = bool(provider.get("configured"))
             online = bool(provider.get("online"))
             installed = provider.get("installed")
@@ -109,7 +115,10 @@ class DataSourceManagementService:
                 all(key in loaded_credentials for key in credential_keys)
                 if is_openbb and credential_keys and runtime_snapshot else None
             )
-            if not configured and credential_keys and credential_configured:
+            if not configured and configuration_keys and not configuration_configured:
+                runtime_status = "configuration_required"
+                status_detail = "需要先保存必填连接配置。"
+            elif not configured and credential_keys and credential_configured:
                 runtime_status = "activation_required"
                 status_detail = "凭据已加密保存，尚未启用；点击“启用并加载”。"
             elif not configured:
@@ -126,7 +135,10 @@ class DataSourceManagementService:
                 status_detail = "OpenBB 网关当前不可用。"
             else:
                 runtime_status = "ready"
-                status_detail = "已启用，扩展可用，OpenBB 网关在线。"
+                status_detail = (
+                    "已启用，扩展可用，OpenBB 网关在线。"
+                    if is_openbb else "已配置，可通过后端连接测试验证上游。"
+                )
             sources.append({
                 "source_id": source_id,
                 "provider_id": str(provider.get("id") or "").upper(),
@@ -140,6 +152,13 @@ class DataSourceManagementService:
                 "credential_keys": credential_keys,
                 "credential_configured": credential_configured,
                 "credential_loaded": credential_loaded,
+                "configuration_keys": configuration_keys,
+                "configuration_configured": configuration_configured,
+                "test_supported": source_id in {"FINNHUB", "SEC"},
+                "query_operations": (
+                    ["quote"] if source_id == "FINNHUB" else
+                    ["company-facts"] if source_id == "SEC" else []
+                ),
                 "can_activate": bool(
                     is_openbb
                     and installed is not False

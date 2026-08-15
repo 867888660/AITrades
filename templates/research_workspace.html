@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>DataTube · Research</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='research_workspace_simple.css') }}?v=20260731-factor-alpha-runs-1">
+  <link rel="stylesheet" href="{{ url_for('static', filename='research_workspace_simple.css') }}?v=20260814-research-delete-1">
 </head>
 <body data-surface="{{ initial_surface|default('research') }}" data-project-id="{{ initial_project_id|default('') }}">
 <div class="research-app">
@@ -35,7 +35,31 @@
     </header>
     <main id="appMain" class="workspace">
       <div id="notice" class="notice" hidden></div>
-      <div id="appView" aria-live="polite"></div>
+      <div id="appView" aria-live="polite">
+        {% if initial_surface|default('research') == 'research' and initial_project_summaries is defined and initial_project_summaries is not none %}
+        <header class="page-heading"><div><span class="eyebrow">RESEARCH</span><h1>Research</h1><p>Create, combine, validate, and test a research idea.</p></div><button type="button" class="primary" data-action="new-research">New Research</button></header>
+        <div class="research-grid">
+          {% for item in initial_project_summaries %}
+          <article class="research-card">
+            <h2>{{ item.project.title }}</h2>
+            <p>{{ item.project.objective }}</p>
+            <div class="research-summary">
+              <div class="summary-line"><span>Universe</span><strong>{{ item.universeRef.name if item.universeRef else 'Not configured' }}</strong></div>
+              <div class="summary-line"><span>Factor</span><strong>{{ item.factors[0].name if item.factors else 'Not configured' }}</strong></div>
+              <div class="summary-line"><span>Alpha</span><strong>{{ item.alphas[0].name if item.alphas else 'Not configured' }}</strong></div>
+              <div class="summary-line"><span>Data</span><strong>{{ 'Configured' if item.dataConfigured else 'Not configured' }}</strong></div>
+              <div class="summary-line"><span>Strategy</span><strong>Not configured</strong></div>
+            </div>
+            <footer><button type="button" class="danger-quiet" data-action="delete-research" data-id="{{ item.project.project_id }}" data-name="{{ item.project.title }}">Delete Research</button><a class="button-link primary" href="{{ url_for('research_detail_page', project_id=item.project.project_id) }}">Open Research</a></footer>
+          </article>
+          {% else %}
+          <div class="empty-state"><h2>No Research yet</h2><p>Start with one hypothesis. Components can be published to Library after validation.</p><button type="button" class="primary" data-action="new-research">New Research</button></div>
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty-state compact"><h2>Loading workspace&hellip;</h2><p>Fetching the latest Research and Library metadata.</p></div>
+        {% endif %}
+      </div>
     </main>
   </div>
 </div>
@@ -59,6 +83,9 @@
 </aside>
 <div id="drawerScrim" class="drawer-scrim" hidden></div>
 
-<script src="{{ url_for('static', filename='research_workspace_simple.js') }}?v=20260807-library-archive-1"></script>
+{% if initial_surface|default('research') == 'research' and initial_project_summaries is defined and initial_project_summaries is not none %}
+<script id="researchBootstrap" type="application/json">{{ initial_project_summaries|tojson }}</script>
+{% endif %}
+<script src="{{ url_for('static', filename='research_workspace_simple.js') }}?v=20260814-research-delete-1"></script>
 </body>
 </html>

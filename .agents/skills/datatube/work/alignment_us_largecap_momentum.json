@@ -1,0 +1,39 @@
+{
+  "objective": "验证美国大盘股 12-1 动量因子在跨牛熊周期中是否具有稳定预测能力",
+  "aligned_research_intent": {
+    "asset_scope": {
+      "asset_class": "US_EQUITY",
+      "instrument_scope": []
+    },
+    "question": "在美国大盘股（历史时点市值≥50亿美元）中，过去12个月收益剔除最近1个月（12-1动量）是否对后续收益具有正向预测能力？该预测能力在1995年至今的多个牛熊周期中是否稳定？",
+    "decision_supported": "判断12-1动量因子是否值得进入 Alpha 研究",
+    "stop_at": "FACTOR",
+    "evidence_profile": "STANDARD",
+    "out_of_scope": ["Alpha construction", "portfolio backtest", "strategy creation"]
+  },
+  "frequency": "1d",
+  "research_period": {"start": "1995-01-01", "end": "2025-12-31"},
+  "universe_policy": {
+    "eligibility": {
+      "mode": "HISTORICAL_EQUITY_PIT",
+      "security_types": ["COMMON_STOCK"],
+      "point_in_time_filters": [
+        {"field": "market_cap_usd", "minimum": 5000000000}
+      ]
+    },
+    "selection": {"method": "ALL_ELIGIBLE"},
+    "exclusions": []
+  },
+  "base_refs": [
+    "library:library_factor_4faeb37fb2ce4012b89801897f8dba0a"
+  ],
+  "evidence_profile": "STANDARD",
+  "research_contract": {
+    "evaluation": {
+      "primary_metric": "rank_ic",
+      "decision_rule": {"minimum_rank_ic": 0.02},
+      "protocol": {"horizons": [1, 5, 20]}
+    }
+  },
+  "idempotency_key": "us-largecap-momentum-12-1-align-v1"
+}

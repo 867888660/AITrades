@@ -1,0 +1,10 @@
+{
+  "session_id": "research_session_a7e2aeda2b3c4260832ce3c497beced0",
+  "name": "CRSP CIZ all-market collection 80-year probe",
+  "version": "1.0.0",
+  "universe_type": "STATIC_LIST",
+  "providers": ["CRSP"],
+  "parameters": {
+    "instrument_ids": ["equity:CRSP:ALL"]
+  }
+}

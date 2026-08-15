@@ -1,0 +1,53 @@
+{
+  "session_id": "research_session_a7e2aeda2b3c4260832ce3c497beced0",
+  "providers": ["CRSP"],
+  "universe_snapshot_id": "universe_snapshot_04589014b0e5ff1d36f63645",
+  "context": {
+    "universe_snapshot_id": "universe_snapshot_04589014b0e5ff1d36f63645",
+    "instrument_ids": ["equity:CRSP:ALL"],
+    "data_type": "bars",
+    "frequency": "1d",
+    "history_start": "1946-01-01T00:00:00+00:00",
+    "history_end": "2025-12-31T00:00:00+00:00",
+    "adjustment": "CRSP_FIELDS",
+    "point_in_time_policy": "AS_OF",
+    "time_semantics": "SOURCE_AVAILABLE_TIME",
+    "quality_policy": "STRICT",
+    "source_selection_policy": {
+      "mode": "AUTO",
+      "preferred_sources": ["CRSP/CIZ"]
+    }
+  },
+  "manual_requirements": [
+    {
+      "id": "qlib_alpha158_without_vwap_crsp_ohlcv",
+      "version": "1.0.0",
+      "data_type": "bars",
+      "frequency": "1d",
+      "fields": ["open", "high", "low", "close", "volume"],
+      "history_start": "1946-01-01T00:00:00+00:00",
+      "history_end": "2025-12-31T00:00:00+00:00",
+      "adjustment": "CRSP_FIELDS",
+      "point_in_time_policy": "AS_OF",
+      "time_semantics": "SOURCE_AVAILABLE_TIME",
+      "quality_policy": "STRICT",
+      "auto_backfill": false,
+      "usage_level": "RESEARCH",
+      "priority": 100,
+      "dependency_path": ["Qlib Alpha158-compatible (VWAP excluded)", "CRSP/CIZ all-market collection"]
+    }
+  ],
+  "backtest_requirements": [
+    {
+      "id": "crsp_next_bar_open_execution",
+      "version": "1.0.0",
+      "data_type": "bars",
+      "frequency": "1d",
+      "fields": ["open", "close"],
+      "history_start": "1946-01-01T00:00:00+00:00",
+      "history_end": "2025-12-31T00:00:00+00:00",
+      "adjustment": "CRSP_FIELDS",
+      "time_semantics": "SOURCE_AVAILABLE_TIME"
+    }
+  ]
+}

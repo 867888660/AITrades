@@ -13,9 +13,15 @@ import yaml
 from .instrument_registry import InstrumentRegistry
 from .store import DataPlatformStore, json_dumps, utc_now
 from .universe_service import UniverseService
+from .universe_v2 import UniverseV2Compiler
 
 
-UNIVERSE_TYPES = {"instrument_set", "benchmark_set", "composite_set", "multi_leg_set"}
+UNIVERSE_TYPES = {
+    "instrument_set", "dynamic_set", "composite_set",
+    # Compatibility-only types. New Universe v2 authoring exposes three
+    # product types: STATIC, DYNAMIC, and COMPOSITE.
+    "benchmark_set", "multi_leg_set",
+}
 COMPOSITE_OPERATORS = {"union", "intersection", "difference"}
 COMBINATION_MODES = {"manual", "cartesian_product", "unordered_combination", "permutation"}
 HARD_MAX_COMBINATIONS = 100_000
@@ -68,6 +74,7 @@ class SharedUniverseService:
         self.store = store
         self.registry = InstrumentRegistry(store)
         self.legacy = UniverseService(store)
+        self.v2 = UniverseV2Compiler()
         self._bootstrap_legacy()
 
     # ------------------------------------------------------------------
@@ -83,6 +90,10 @@ class SharedUniverseService:
         universe_type = _clean(raw.get("type") or raw.get("universe_type") or "instrument_set").lower()
         legacy_type_map = {
             "static_list": "instrument_set",
+            "static": "instrument_set",
+            "dynamic": "dynamic_set",
+            "dynamic_rule": "dynamic_set",
+            "dynamic_rule_universe": "dynamic_set",
             "composite": "composite_set",
             "pair": "multi_leg_set",
             "multi_leg": "multi_leg_set",
@@ -107,6 +118,21 @@ class SharedUniverseService:
             if not normalized:
                 raise ValueError("Instrument Set requires at least one Instrument")
             result["members"] = normalized
+            result.pop("parameters", None)
+            result.pop("expression", None)
+            result.pop("legs", None)
+            result.pop("combination", None)
+            result.pop("manual_tuples", None)
+        elif universe_type == "dynamic_set":
+            canonical = self.v2.normalize({**raw, "type": "DYNAMIC"})
+            result = {
+                **canonical,
+                "name": name,
+                "description": _clean(raw.get("description")),
+                "tags": sorted({_clean(item) for item in raw.get("tags") or [] if _clean(item)}),
+                "type": "dynamic_set",
+            }
+            result.pop("members", None)
             result.pop("parameters", None)
             result.pop("expression", None)
             result.pop("legs", None)
@@ -498,8 +524,6 @@ class SharedUniverseService:
 
     def archive(self, universe_id: str) -> dict[str, Any]:
         usage = self.usage(universe_id)
-        if usage["active_research_count"]:
-            raise ValueError("Remove this Universe from active Research before archiving it")
         now = utc_now()
         with self.store.transaction(immediate=True) as conn:
             cursor = conn.execute(
@@ -508,7 +532,14 @@ class SharedUniverseService:
             )
             if cursor.rowcount != 1:
                 raise ValueError("Active Universe not found")
-        return self.get(universe_id)  # type: ignore[return-value]
+        result = self.get(universe_id)
+        if result is None:
+            raise RuntimeError("failed to archive Universe")
+        return {
+            **result,
+            "archived_research_count": usage["active_research_count"],
+            "references_preserved": True,
+        }
 
     # ------------------------------------------------------------------
     # Research bindings
@@ -739,6 +770,28 @@ class SharedUniverseService:
         stack: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         kind = str(definition["type"])
+        if kind == "dynamic_set":
+            compiled = self.v2.compile({**dict(definition), "type": "DYNAMIC"})
+            return {
+                "status": "REQUIRES_FROZEN_DATA",
+                "instrument_ids": [],
+                "instrument_tuples": [],
+                "instrument_weights": {},
+                "member_count": 0,
+                "combination_count": 0,
+                "estimated_combinations": 0,
+                "errors": [{
+                    "code": "DYNAMIC_UNIVERSE_REQUIRES_FROZEN_EVALUATION",
+                    "message": (
+                        "Dynamic Universe authoring is valid, but membership must be evaluated "
+                        "from frozen point-in-time Manifests before it can be persisted or bound."
+                    ),
+                }],
+                "metadata": {
+                    "universe_type": "dynamic_set",
+                    "compiled_contract": compiled,
+                },
+            }
         if kind == "instrument_set":
             instruments = sorted(set(str(item) for item in definition.get("members") or []))
             return {
@@ -913,8 +966,14 @@ class SharedUniverseService:
             resolved = self.registry.resolve_alias("binance", instrument_id.upper())
             if resolved:
                 instrument_id = resolved
-            else:
+            elif validate:
                 raise ValueError(f"Unknown Instrument or alias: {instrument_id}")
+            else:
+                # Legacy snapshots may contain provider-native identifiers
+                # (for example AAPL) that predate the Instrument Registry.
+                # Migration must preserve those immutable identifiers instead
+                # of making every Shared Universe read fail during bootstrap.
+                instrument_id = instrument_id.upper()
         parts = instrument_id.split(":")
         if len(parts) >= 3:
             instrument_id = ":".join([parts[0].lower(), parts[1].upper(), *parts[2:]])
@@ -925,6 +984,18 @@ class SharedUniverseService:
     def _create_legacy_snapshot(
         self, definition: Mapping[str, Any], revision_id: str, resolved: Mapping[str, Any]
     ) -> tuple[str, str]:
+        if str(definition.get("type")) == "dynamic_set":
+            raise UniverseResolutionError(
+                "DYNAMIC_UNIVERSE_REQUIRES_FROZEN_EVALUATION",
+                "Dynamic Universe membership must be evaluated from frozen point-in-time Manifests before persistence.",
+                details={
+                    "compiled_fingerprint": _clean(
+                        dict(resolved.get("metadata") or {})
+                        .get("compiled_contract", {})
+                        .get("fingerprint")
+                    )
+                },
+            )
         instrument_ids = list(resolved.get("instrument_ids") or [])
         if not instrument_ids:
             raise UniverseResolutionError("UNIVERSE_EMPTY", "Universe resolved to no Instruments")

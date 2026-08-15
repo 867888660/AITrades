@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .definition_registry import DefinitionRegistry
+from .factor_pack import FactorPackRegistry
 from .manifest_resolver import DeterministicManifestResolver
 from .run_contracts import (
     READINESS_RULE_VERSION,
@@ -214,7 +215,28 @@ class ResearchRunPreviewService:
                 ))
         factor_refs.sort(key=lambda item: (item["factor_definition_id"], item["version"]))
         alpha_refs.sort(key=lambda item: (item["alpha_definition_id"], item["version"]))
-        if run_type == "FACTOR_EVALUATION" and not factor_refs:
+        factor_pack_definitions: list[dict[str, Any]] = []
+        requested_pack = dict(request.get("factor_pack_definition") or {})
+        if requested_pack:
+            try:
+                pack = FactorPackRegistry.require(_clean(requested_pack.get("pack_id")))
+                if requested_pack.get("spec_hash") != pack.spec_hash:
+                    raise ValueError("Factor Pack spec_hash does not match the native registry")
+                if run_type != "FACTOR_EVALUATION":
+                    raise ValueError("Factor Pack execution currently requires FACTOR_EVALUATION")
+                factor_pack_definitions.append(pack.to_dict())
+            except ValueError as exc:
+                checks.append(self._check(
+                    ResearchReasonCode.DEFINITION_CLOSURE_INVALID,
+                    ReadinessDimension.DEFINITION,
+                    ReadinessStatus.BLOCKED,
+                    _clean(requested_pack.get("pack_id")),
+                    {"factor_pack": "registered immutable definition"},
+                    {"error": str(exc)},
+                    RemediationCode.OPEN_DEFINITION,
+                    "Factor Pack identity is invalid",
+                ))
+        if run_type == "FACTOR_EVALUATION" and not factor_refs and not factor_pack_definitions:
             checks.append(self._missing_definition("FACTOR"))
         if run_type in {"ALPHA_EVALUATION", "RESEARCH_BACKTEST"} and not alpha_refs:
             checks.append(self._missing_definition("ALPHA"))
@@ -230,6 +252,7 @@ class ResearchRunPreviewService:
             "universe_definition_id": str(snapshot["universe_definition_id"]) if snapshot else "",
             "universe_definition_version": str(snapshot["definition_version"]) if snapshot else "",
             "universe_snapshot_id": str(snapshot["universe_snapshot_id"]) if snapshot else "",
+            "actual_instrument_ids": json.loads(snapshot["actual_instrument_ids_json"] or "[]") if snapshot else [],
             "universe_id": str(snapshot["shared_universe_id"] or "") if snapshot else "",
             "universe_revision_id": str(snapshot["shared_universe_revision_id"] or "") if snapshot else "",
             "universe_resolution_id": str(snapshot["shared_universe_resolution_id"] or "") if snapshot else "",
@@ -237,6 +260,7 @@ class ResearchRunPreviewService:
             "resolved_instrument_weights": json.loads(snapshot["shared_instrument_weights_json"] or "{}") if snapshot else {},
             "universe_resolution_metadata": json.loads(snapshot["shared_resolution_metadata_json"] or "{}") if snapshot else {},
             "factor_definitions": factor_refs,
+            "factor_pack_definitions": factor_pack_definitions,
             "alpha_definitions": alpha_refs,
             "requirement_set_id": str(requirement_set["requirement_set_id"]) if requirement_set else _clean(request.get("requirement_set_id")),
         }
@@ -248,6 +272,10 @@ class ResearchRunPreviewService:
         from .evaluation import EVALUATION_CODE_HASH, EVALUATION_ENGINE_VERSION, EvaluationSpec
         from .portfolio import PORTFOLIO_CODE_HASH, PORTFOLIO_ENGINE_VERSION, PortfolioSpec
         from .research_backtest import RESEARCH_BACKTEST_CODE_HASH, RESEARCH_BACKTEST_ENGINE_VERSION, ResearchBacktestProvider
+        from .equity_monthly_research import (
+            EQUITY_MONTHLY_RESEARCH_CODE_HASH,
+            EQUITY_MONTHLY_RESEARCH_ENGINE_VERSION,
+        )
 
         checks: list[ReadinessCheck] = []
         if run_type not in SUPPORTED_RESEARCH_RUN_TYPES:
@@ -269,6 +297,21 @@ class ResearchRunPreviewService:
                 },
                 RemediationCode.REVIEW_EXECUTION_SPEC,
                 "This Run type does not yet define group-level Factor, Alpha, or portfolio semantics; execution is blocked instead of flattening the Universe",
+            ))
+        collection_ids = [
+            str(item) for item in definitions.get("actual_instrument_ids", [])
+            if str(item).upper().endswith(":ALL")
+        ]
+        if collection_ids:
+            checks.append(self._check(
+                ResearchReasonCode.COLLECTION_UNIVERSE_NOT_EXPANDED,
+                ReadinessDimension.EXECUTION,
+                ReadinessStatus.BLOCKED,
+                str(definitions.get("universe_snapshot_id") or ""),
+                {"universe_member_semantics": "ROW_LEVEL_INSTRUMENTS"},
+                {"collection_catalog_ids": collection_ids},
+                RemediationCode.REVIEW_EXECUTION_SPEC,
+                "Collection Catalog ids describe datasets, not tradable securities; resolve a row-level historical Universe before execution",
             ))
         if request.get("input_factor_artifact_ids") or request.get("input_alpha_artifact_ids"):
             checks.append(self._check(
@@ -333,6 +376,11 @@ class ResearchRunPreviewService:
         versions = sorted({
             item.get("spec_hash", "") for item in [*definitions["factor_definitions"], *definitions["alpha_definitions"]]
         })
+        versions.extend(
+            str(item.get("spec_hash") or "")
+            for item in definitions.get("factor_pack_definitions") or []
+        )
+        versions = sorted(set(versions))
         registry_rows = []
         for item in [*definitions["factor_definitions"], *definitions["alpha_definitions"]]:
             definition_id = item.get("factor_definition_id") or item.get("alpha_definition_id")
@@ -341,14 +389,25 @@ class ResearchRunPreviewService:
                 registry_rows.append(found)
         engine_versions = {item.engine_version for item in registry_rows}
         code_hashes = {item.code_hash for item in registry_rows}
+        for pack in definitions.get("factor_pack_definitions") or []:
+            engine_versions.add(f"factor-pack:{pack.get('engine')}:{pack.get('version')}")
+            code_hashes.add(str(pack.get("code_hash") or pack.get("spec_hash") or ""))
         engine_versions.add(FORMAL_RESEARCH_WORKER_VERSION)
         code_hashes.add(FORMAL_RESEARCH_WORKER_CODE_HASH)
         if run_type in {"FACTOR_EVALUATION", "ALPHA_EVALUATION"}:
             engine_versions.add(EVALUATION_ENGINE_VERSION)
             code_hashes.add(EVALUATION_CODE_HASH)
         if run_type == "RESEARCH_BACKTEST":
-            engine_versions.update({PORTFOLIO_ENGINE_VERSION, RESEARCH_BACKTEST_ENGINE_VERSION})
-            code_hashes.update({PORTFOLIO_CODE_HASH, RESEARCH_BACKTEST_CODE_HASH})
+            engine_versions.update({
+                PORTFOLIO_ENGINE_VERSION,
+                RESEARCH_BACKTEST_ENGINE_VERSION,
+                EQUITY_MONTHLY_RESEARCH_ENGINE_VERSION,
+            })
+            code_hashes.update({
+                PORTFOLIO_CODE_HASH,
+                RESEARCH_BACKTEST_CODE_HASH,
+                EQUITY_MONTHLY_RESEARCH_CODE_HASH,
+            })
         engine_version = "+".join(sorted(engine_versions)) or "research-engine.v2"
         code_hash = _hash_spec(sorted(code_hashes))
         if not any(item.status == ReadinessStatus.BLOCKED for item in checks):
@@ -363,6 +422,7 @@ class ResearchRunPreviewService:
             "portfolio_spec_hash": _hash_spec(portfolio),
             "execution_spec_hash": _hash_spec(execution),
             "benchmark_spec_hash": _hash_spec(benchmark),
+            "research_semantics_hash": _hash_spec(request.get("research_semantics") or {}),
             "engine_version": engine_version,
             "code_hash": code_hash,
             "readiness_rule_version": READINESS_RULE_VERSION,

@@ -347,6 +347,9 @@ function fillForm(settings) {
   setSecretFieldState("active_finnhub_api_key", settings.has_active_finnhub_api_key);
   getEl("finnhubKeyStatus").textContent = settings.finnhub_api_key_count ? `已加密保存 ${settings.finnhub_api_key_count} 个；留空会保留` : "未配置";
   setChecked("clearFinnhubKeys", false);
+  setSecretFieldState("sec_edgar_user_agent", settings.has_sec_edgar_user_agent);
+  getEl("secEdgarUserAgentStatus").textContent = settings.has_sec_edgar_user_agent ? "已加密保存；留空会保留" : "未配置";
+  setChecked("clearSecEdgarUserAgent", false);
   setValue("walletAddresses", (settings.wallet_addresses || []).join("\n"));
   setValue("sqliteDbPath", settings.sqlite_db_path || "");
   setValue("orderListDbPath", settings.order_list_db_path || "");
@@ -766,6 +769,7 @@ const DATA_SOURCE_STATUS_LABELS = {
   activation_required: "等待启用",
   not_installed: "Not installed",
   credential_required: "Credential required",
+  configuration_required: "Configuration required",
   unavailable: "Unavailable",
 };
 
@@ -816,9 +820,14 @@ function renderDataSourceCatalog(data) {
       ? (source.credential_loaded === true
         ? "Credential loaded"
         : (source.credential_configured ? "Credential encrypted" : "Credential missing"))
-      : "No credential required";
+      : (source.configuration_keys || []).length
+        ? (source.configuration_configured ? "Required configuration present" : "Required configuration missing")
+        : "No credential required";
     const action = source.can_activate
       ? `<button type="button" data-activate-openbb="${escapeHtml(source.provider_id.toLowerCase())}">启用并加载</button>`
+      : "";
+    const testAction = source.test_supported
+      ? `<button type="button" class="secondary" data-test-source="${escapeHtml(source.source_id)}" ${status === "ready" ? "" : "disabled"}>测试连接</button>`
       : "";
     return `
       <article class="data-source-card" data-source-id="${escapeHtml(source.source_id)}">
@@ -830,13 +839,48 @@ function renderDataSourceCatalog(data) {
         <p class="data-source-card-detail">${escapeHtml(source.status_detail || "")}</p>
         <div class="data-source-tags">${capabilities || "<span>Context only</span>"}</div>
         <div class="data-source-meta"><span>${escapeHtml(credentialText)}</span><span>${source.installed === false ? "Extension missing" : "Extension available"}</span></div>
-        ${action ? `<div class="data-source-card-actions">${action}</div>` : ""}
+        ${(action || testAction) ? `<div class="data-source-card-actions">${action}${testAction}</div>` : ""}
       </article>
     `;
   }).join("");
   target.querySelectorAll("[data-activate-openbb]").forEach((button) => {
     button.addEventListener("click", () => activateOpenbbProvider(button.dataset.activateOpenbb, button));
   });
+  target.querySelectorAll("[data-test-source]").forEach((button) => {
+    button.addEventListener("click", () => testDataSourceConnection(button.dataset.testSource, button));
+  });
+}
+
+async function testDataSourceConnection(sourceId, button) {
+  setBusy(button, true, "测试中...");
+  setDataSourceOperation({
+    title: `正在测试 ${sourceId}`,
+    detail: "后端正在使用已保存配置执行一个有界只读请求。",
+    progress: 45,
+  });
+  try {
+    const response = await fetchJson(`/api/data-sources/${encodeURIComponent(sourceId)}/test`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const result = response.data || {};
+    setDataSourceOperation({
+      title: `${sourceId} 连接正常`,
+      detail: `后端调用成功，耗时 ${result.latency_ms || 0} ms。`,
+      progress: 100,
+      state: "success",
+    });
+  } catch (error) {
+    setDataSourceOperation({
+      title: `${sourceId} 连接失败`,
+      detail: error.message,
+      progress: 100,
+      state: "error",
+    });
+  } finally {
+    setBusy(button, false);
+  }
 }
 
 async function activateOpenbbProvider(providerId, button) {
@@ -1051,6 +1095,8 @@ settingsForm.addEventListener("submit", async (event) => {
     finnhub_api_keys: linesToArray(getValue("finnhubKeys")),
     clear_finnhub_api_keys: getChecked("clearFinnhubKeys"),
     active_finnhub_api_key: getValue("activeFinnhubKey").trim(),
+    sec_edgar_user_agent: getValue("secEdgarUserAgent").trim(),
+    clear_sec_edgar_user_agent: getChecked("clearSecEdgarUserAgent"),
     wallet_addresses: linesToArray(getValue("walletAddresses")),
     sqlite_db_path: getValue("sqliteDbPath").trim(),
     order_list_db_path: getValue("orderListDbPath").trim(),

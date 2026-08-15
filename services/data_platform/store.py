@@ -766,6 +766,30 @@ class DataPlatformStore:
                     ON research_runs_v2(project_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_research_run_outbox_status
                     ON research_run_outbox(status, created_at);
+
+                -- Resource configuration management (user-configurable memory budgets)
+                CREATE TABLE IF NOT EXISTS system_resource_config (
+                    config_id TEXT PRIMARY KEY DEFAULT 'singleton',
+                    -- Layer 1: System hard limits
+                    physical_memory_mb INTEGER NOT NULL,
+                    system_reserve_mb INTEGER NOT NULL,
+                    frontend_reserve_mb INTEGER NOT NULL,
+                    emergency_reserve_mb INTEGER NOT NULL,
+                    max_research_budget_mb INTEGER NOT NULL,
+                    -- Layer 2: User global configuration
+                    user_research_budget_mb INTEGER NOT NULL,
+                    user_config_mode TEXT NOT NULL DEFAULT 'AUTO',
+                    user_light_worker_mb INTEGER,
+                    user_heavy_worker_mb INTEGER,
+                    user_backtest_worker_mb INTEGER,
+                    user_standard_worker_limit INTEGER,
+                    -- Metadata
+                    auto_detected_at TEXT,
+                    last_updated_by TEXT,
+                    last_updated_at TEXT,
+                    CHECK (user_research_budget_mb <= max_research_budget_mb),
+                    CHECK (user_config_mode IN ('AUTO', 'MANUAL'))
+                );
                 """
             )
             conn.execute(
@@ -1713,6 +1737,164 @@ class DataPlatformStore:
             conn.execute(
                 "INSERT INTO schema_migrations(migration_version, migration_name, applied_at) VALUES (?, ?, ?)",
                 (28, "sec_authoritative_mapping_and_bulk_pit", utc_now()),
+            )
+        if 29 not in applied:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS research_contracts (
+                    contract_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    contract_version INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    schema_version TEXT NOT NULL,
+                    contract_json TEXT NOT NULL,
+                    contract_hash TEXT NOT NULL,
+                    change_reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    activated_at TEXT,
+                    UNIQUE(session_id, contract_version),
+                    FOREIGN KEY(session_id) REFERENCES research_agent_sessions(session_id),
+                    FOREIGN KEY(project_id) REFERENCES research_projects(project_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS research_experiments (
+                    experiment_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    contract_id TEXT NOT NULL,
+                    iteration_id TEXT NOT NULL DEFAULT '',
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    candidate_json TEXT NOT NULL,
+                    candidate_hash TEXT NOT NULL,
+                    execution_plan_json TEXT NOT NULL DEFAULT '{}',
+                    run_id TEXT NOT NULL DEFAULT '',
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    system_block_json TEXT NOT NULL DEFAULT '{}',
+                    decision TEXT NOT NULL DEFAULT '',
+                    learning_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    FOREIGN KEY(session_id) REFERENCES research_agent_sessions(session_id),
+                    FOREIGN KEY(project_id) REFERENCES research_projects(project_id),
+                    FOREIGN KEY(contract_id) REFERENCES research_contracts(contract_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_research_contracts_session
+                    ON research_contracts(session_id, contract_version DESC);
+                CREATE INDEX IF NOT EXISTS idx_research_experiments_session
+                    ON research_experiments(session_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_research_experiments_pending
+                    ON research_experiments(status, updated_at);
+                """
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations(migration_version, migration_name, applied_at) VALUES (?, ?, ?)",
+                (29, "research_contracts_and_experiments", utc_now()),
+            )
+        if 30 not in applied:
+            # Definition identity follows its visibility boundary. The original
+            # table-level UNIQUE(definition_type,name,version) predated PROJECT
+            # ownership and made an identically-versioned private definition in
+            # a second Research impossible. Rebuild both the parent table and
+            # its FK child, preserving immutable ids and references.
+            conn.executescript(
+                """
+                ALTER TABLE project_definition_refs
+                    RENAME TO project_definition_refs_v29;
+                ALTER TABLE research_definitions
+                    RENAME TO research_definitions_v29;
+
+                CREATE TABLE research_definitions (
+                    definition_id TEXT PRIMARY KEY,
+                    definition_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'DRAFT',
+                    spec_json TEXT NOT NULL,
+                    spec_hash TEXT NOT NULL,
+                    engine_version TEXT NOT NULL,
+                    code_hash TEXT NOT NULL,
+                    created_by TEXT NOT NULL DEFAULT 'local_user',
+                    created_at TEXT NOT NULL,
+                    validated_at TEXT,
+                    superseded_by_id TEXT,
+                    archived_at TEXT,
+                    owner_project_id TEXT NOT NULL DEFAULT '',
+                    library_scope TEXT NOT NULL DEFAULT 'GLOBAL',
+                    UNIQUE(definition_type, definition_id, version)
+                );
+
+                INSERT INTO research_definitions(
+                    definition_id,definition_type,name,version,state,spec_json,
+                    spec_hash,engine_version,code_hash,created_by,created_at,
+                    validated_at,superseded_by_id,archived_at,owner_project_id,
+                    library_scope
+                )
+                SELECT
+                    definition_id,definition_type,name,version,state,spec_json,
+                    spec_hash,engine_version,code_hash,created_by,created_at,
+                    validated_at,superseded_by_id,archived_at,owner_project_id,
+                    library_scope
+                FROM research_definitions_v29;
+
+                CREATE TABLE project_definition_refs (
+                    project_id TEXT NOT NULL,
+                    slot_key TEXT NOT NULL,
+                    definition_type TEXT NOT NULL,
+                    definition_id TEXT NOT NULL,
+                    definition_version TEXT NOT NULL,
+                    reference_mode TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    library_asset_id TEXT,
+                    PRIMARY KEY(project_id, slot_key),
+                    FOREIGN KEY(project_id) REFERENCES research_projects(project_id),
+                    FOREIGN KEY(definition_id) REFERENCES research_definitions(definition_id)
+                );
+
+                INSERT INTO project_definition_refs(
+                    project_id,slot_key,definition_type,definition_id,
+                    definition_version,reference_mode,created_at,updated_at,
+                    library_asset_id
+                )
+                SELECT
+                    project_id,slot_key,definition_type,definition_id,
+                    definition_version,reference_mode,created_at,updated_at,
+                    library_asset_id
+                FROM project_definition_refs_v29;
+
+                DROP TABLE project_definition_refs_v29;
+                DROP TABLE research_definitions_v29;
+
+                CREATE UNIQUE INDEX uq_research_definitions_global_identity
+                    ON research_definitions(definition_type,name,version)
+                    WHERE library_scope='GLOBAL';
+                CREATE UNIQUE INDEX uq_research_definitions_project_identity
+                    ON research_definitions(
+                        owner_project_id,definition_type,name,version
+                    ) WHERE library_scope='PROJECT';
+                CREATE INDEX idx_research_definitions_library
+                    ON research_definitions(
+                        definition_type,state,name,created_at DESC
+                    );
+                CREATE INDEX idx_research_definitions_scope
+                    ON research_definitions(
+                        library_scope,owner_project_id,definition_type,
+                        created_at DESC
+                    );
+                CREATE INDEX idx_project_definition_refs
+                    ON project_definition_refs(
+                        project_id,definition_type,reference_mode
+                    );
+                """
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations(migration_version, migration_name, applied_at) VALUES (?, ?, ?)",
+                (30, "project_scoped_definition_identity", utc_now()),
             )
 
     @staticmethod

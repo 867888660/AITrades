@@ -4,7 +4,13 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
-from services.secure_settings import SENSITIVE_SETTING_KEYS, load_secrets, save_secrets, strip_sensitive
+from services.secure_settings import (
+    SENSITIVE_SETTING_KEYS,
+    SecureSettingsError,
+    load_secrets,
+    save_secrets,
+    strip_sensitive,
+)
 from services.data_source_definitions import (
     OPENBB_CREDENTIAL_KEYS,
     normalize_data_source_settings,
@@ -21,6 +27,7 @@ _settings_cache: Dict[str, Any] = {}
 _settings_cache_ts: float = 0.0
 _settings_cache_lock = threading.Lock()
 _SETTINGS_CACHE_TTL = 5.0
+_secrets_load_error: str = ""
 _db_files_ensured: bool = False
 DEFAULT_DB_FILES = {
     "sqlite_db_path": "market_data.db",
@@ -448,6 +455,7 @@ def get_default_web_settings() -> Dict[str, Any]:
         "wallet_addresses": get_default_wallets(),
         "finnhub_api_keys": [],
         "active_finnhub_api_key": "",
+        "sec_edgar_user_agent": "",
         "crypto_symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
         "finance_symbols": ["AAPL", "MSFT", "GLD", "SLV"],
         "crypto_refresh_sec": 15,
@@ -476,12 +484,26 @@ def get_default_web_settings() -> Dict[str, Any]:
 
 
 def _load_web_settings_uncached() -> Dict[str, Any]:
+    global _secrets_load_error
     defaults = get_default_web_settings()
     if WEB_SETTINGS_PATH.exists():
         with WEB_SETTINGS_PATH.open("r", encoding="utf-8") as f:
             stored = json.load(f)
         defaults.update(stored)
-    defaults.update(load_secrets(WEB_SETTINGS_SECRETS_PATH, WEB_SETTINGS_KEY_PATH))
+    try:
+        defaults.update(load_secrets(WEB_SETTINGS_SECRETS_PATH, WEB_SETTINGS_KEY_PATH))
+        _secrets_load_error = ""
+        defaults["secrets_status"] = {"status": "ready"}
+    except SecureSettingsError:
+        # Secret loss must never be silent, but read-only/public functionality
+        # can safely start with empty credentials. The encrypted file is left
+        # untouched and settings writes are guarded below.
+        _secrets_load_error = "Encrypted settings are unavailable for this Windows user context."
+        defaults["_secrets_unavailable"] = True
+        defaults["secrets_status"] = {
+            "status": "unavailable",
+            "message": _secrets_load_error,
+        }
     defaults["wallet_addresses"] = _to_clean_list(defaults.get("wallet_addresses", []))
     defaults["finnhub_api_keys"] = _to_clean_list(defaults.get("finnhub_api_keys", []))
     defaults["crypto_symbols"] = _to_clean_list(defaults.get("crypto_symbols", []), uppercase=True)
@@ -531,11 +553,13 @@ def load_web_settings_for_ui() -> Dict[str, Any]:
 
 def load_public_web_settings() -> Dict[str, Any]:
     settings = load_web_settings_for_ui()
+    settings.pop("_secrets_unavailable", None)
     return strip_sensitive(settings)
 
 
 def save_web_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     current = load_web_settings()
+    secrets_unavailable = bool(current.get("_secrets_unavailable"))
     current["wallet_addresses"] = _to_clean_list(payload.get("wallet_addresses", current.get("wallet_addresses", [])))
     incoming_finnhub_keys = _to_clean_list(payload.get("finnhub_api_keys", []))
     if payload.get("clear_finnhub_api_keys"):
@@ -551,6 +575,12 @@ def save_web_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not active_key and current["finnhub_api_keys"]:
         active_key = current["finnhub_api_keys"][0]
     current["active_finnhub_api_key"] = active_key
+
+    incoming_sec_user_agent = str(payload.get("sec_edgar_user_agent") or "").strip()
+    if payload.get("clear_sec_edgar_user_agent"):
+        current["sec_edgar_user_agent"] = ""
+    elif incoming_sec_user_agent:
+        current["sec_edgar_user_agent"] = incoming_sec_user_agent
 
     current["sqlite_db_path"] = str(payload.get("sqlite_db_path", current.get("sqlite_db_path", ""))).strip() or str(BASE_DIR / "market_data.db")
     current["order_list_db_path"] = str(
@@ -638,8 +668,43 @@ def save_web_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
             current[key] = default_value
 
     secrets = {key: current.get(key) for key in SENSITIVE_SETTING_KEYS}
-    save_secrets(WEB_SETTINGS_SECRETS_PATH, WEB_SETTINGS_KEY_PATH, secrets)
-    stored = {key: value for key, value in current.items() if key not in SENSITIVE_SETTING_KEYS}
+    def has_secret_input(key: str) -> bool:
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return any(str(item or "").strip() for item in value.values())
+        if isinstance(value, (list, tuple, set)):
+            return any(str(item or "").strip() for item in value)
+        return bool(str(value or "").strip())
+
+    secret_mutation_requested = any(
+        has_secret_input(key) for key in SENSITIVE_SETTING_KEYS
+    ) or any(
+        bool(payload.get(key))
+        for key in (
+            "clear_finnhub_api_keys",
+            "clear_sec_edgar_user_agent",
+            "clear_coingecko_api_key",
+            "clear_llm_api_key",
+            "clear_openbb_fred_api_key",
+            "clear_openbb_provider_credentials",
+        )
+    )
+    if secrets_unavailable:
+        if payload.get("reset_unavailable_secrets"):
+            save_secrets(WEB_SETTINGS_SECRETS_PATH, WEB_SETTINGS_KEY_PATH, secrets)
+            secrets_unavailable = False
+        elif secret_mutation_requested:
+            raise SecureSettingsError(
+                "Encrypted settings are unavailable. Re-enter every required secret and explicitly reset unavailable secrets."
+            )
+    else:
+        save_secrets(WEB_SETTINGS_SECRETS_PATH, WEB_SETTINGS_KEY_PATH, secrets)
+    stored = {
+        key: value
+        for key, value in current.items()
+        if key not in SENSITIVE_SETTING_KEYS
+        and key not in {"_secrets_unavailable", "secrets_status"}
+    }
     with WEB_SETTINGS_PATH.open("w", encoding="utf-8") as f:
         json.dump(stored, f, ensure_ascii=False, indent=2)
 
@@ -649,6 +714,15 @@ def save_web_settings(payload: Dict[str, Any]) -> Dict[str, Any]:
     save_config(config)
     # Invalidate settings cache so next read picks up the new values
     global _settings_cache, _settings_cache_ts
+    if secrets_unavailable:
+        current["_secrets_unavailable"] = True
+        current["secrets_status"] = {
+            "status": "unavailable",
+            "message": _secrets_load_error,
+        }
+    else:
+        current.pop("_secrets_unavailable", None)
+        current["secrets_status"] = {"status": "ready"}
     _settings_cache = dict(current)
     _settings_cache_ts = time.monotonic()
     return current

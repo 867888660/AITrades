@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from services.config_loader import load_web_settings
+from services.data_platform.universe_v2 import universe_v2_capabilities
 from services.event_graph_logic import (
     CAUSAL_RELATIONS,
     EVIDENCE_RELATIONS,
@@ -173,9 +174,52 @@ BACKTEST_CAPABILITIES: Dict[str, Any] = {
 }
 
 RESEARCH_SESSION_CAPABILITIES: Dict[str, Any] = {
+    "researcher_surface": {
+        "alignment_endpoint": "/api/agent/researcher/align",
+        "library_endpoint": "/api/agent/researcher/library",
+        "start_endpoint": "/api/agent/researcher/start",
+        "resume_endpoint": "/api/agent/researcher/resume",
+        "sessions_endpoint": "/api/agent/researcher/sessions",
+        "status_endpoint": "/api/agent/researcher/sessions/{session_id}",
+        "experiment_endpoint": "/api/agent/researcher/sessions/{session_id}/experiments",
+        "result_endpoint": "/api/agent/researcher/experiments/{experiment_id}",
+        "decision_endpoint": "/api/agent/researcher/experiments/{experiment_id}/decide",
+        "supported_products": [
+            "UNIVERSE_DESIGN", "FACTOR_EVALUATION", "ALPHA_EVALUATION", "RESEARCH_BACKTEST"
+        ],
+        "supported_stop_at": ["UNIVERSE", "FACTOR", "ALPHA", "PORTFOLIO_EVIDENCE"],
+        "unavailable_stop_at": [],
+        "alignment_schema": "aligned-research-intent.v1",
+        "research_contract_schema": "research-contract.v2",
+        "evidence_profiles": ["QUICK", "STANDARD", "DEEP"],
+        "product_boundaries": {
+            "UNIVERSE_DESIGN": "identity-based point-in-time membership evidence; dynamic field rules require a frozen formal evaluation",
+            "FACTOR_EVALUATION": "feature evidence",
+            "ALPHA_EVALUATION": "predictive signal evidence; no portfolio performance",
+            "RESEARCH_BACKTEST": "cost-adjusted portfolio evidence; no strategy creation or trading",
+        },
+        "visible_objects": [
+            "AlignedResearchIntent", "ResearchContract", "CandidateSpec",
+            "ResearchResult", "Learning",
+        ],
+        "internal_objects_hidden": ["RequirementSet", "Manifest", "Preview", "Bundle", "ProviderTask"],
+        "status_semantics": {
+            "INVALID": "Candidate semantics rejected; no research conclusion",
+            "SYSTEM_BLOCKED": "Experiment produced no result because the system could not finish",
+            "BLOCKED": "recoverable Session container state; continue only after the condition is fixed",
+            "NEED_HUMAN": "a material research meaning requires a user decision",
+            "FAILED": "terminal execution failure; no research conclusion",
+        },
+        "universe_capabilities": universe_v2_capabilities(),
+    },
     "sessions_endpoint": "/api/agent/research/sessions",
     "session_detail_endpoint": "/api/agent/research/sessions/{session_id}",
     "context_resolver_endpoint": "/api/agent/research/context",
+    "legacy_surface": {
+        "status": "DEPRECATED",
+        "replacement": "/api/agent/researcher/*",
+        "removal_policy": "compatibility-only; no new clients",
+    },
     "entry_modes": ["START", "RESUME"],
     "resume_anchor_types": [
         "SESSION", "PROJECT", "RUN", "PREVIEW", "BUNDLE",
@@ -309,6 +353,8 @@ DEFAULT_POLICY: Dict[str, Any] = {
         "event.graph.change_request",
         "research.read",
         "research.project.create",
+        "research.experiment.submit",
+        "research.experiment.decide",
         "research.universe.create",
         "research.universe.snapshot.create",
         "research.definition.create",
@@ -387,6 +433,10 @@ PERMISSION_CAPABILITIES: Dict[str, List[str]] = {
     "event_graph_change_request": ["event.graph.change_request", "event.graph.patch.validate"],
     "research_read": ["research.read"],
     "research_project_create": ["research.project.create"],
+    "research_semantic_write": [
+        "research.experiment.submit",
+        "research.experiment.decide",
+    ],
     "research_autonomous_write": [
         "research.universe.create",
         "research.universe.snapshot.create",
@@ -1483,12 +1533,36 @@ def _build_research_asset_matrix() -> dict:
     return {"asset_matrix": matrix, "research_backtest_asset_classes": rb_classes}
 
 
+def _factor_pack_capabilities() -> dict:
+    from .data_platform.factor_pack import FactorPackRegistry
+
+    return {
+        "available": [
+            {
+                "pack_id": item.pack_id,
+                "version": item.version,
+                "display_name": item.display_name,
+                "engine": item.engine,
+                "factor_count": item.factor_count,
+                "asset_class": item.asset_class,
+                "frequency": item.frequency,
+                "compatibility_mode": item.compatibility_mode,
+                "excluded_factors": list(item.excluded_factors),
+                "is_standard_alpha158": item.is_standard_alpha158,
+            }
+            for item in FactorPackRegistry.list()
+        ],
+        "agent_selects_pack_id_only": True,
+        "execution_details_hidden": True,
+    }
+
+
 def get_capabilities(section: str = "") -> Dict[str, Any]:
     """Return agent capabilities.
 
     Pass ``section`` (comma-separated) to receive only the relevant slice and
     avoid loading large irrelevant blocks.  Recognised section names:
-    ``research``, ``strategy``, ``backtest``, ``eventgraph``, ``market``,
+    ``researcher``, ``research``, ``strategy``, ``backtest``, ``eventgraph``, ``market``,
     ``inspection``.
     Omit or pass ``all`` to receive the full payload.
     """
@@ -1508,6 +1582,7 @@ def get_capabilities(section: str = "") -> Dict[str, Any]:
     policy["backtest_capabilities"] = BACKTEST_CAPABILITIES
     policy["research_session_capabilities"] = RESEARCH_SESSION_CAPABILITIES
     policy["research_asset_matrix"] = _build_research_asset_matrix()
+    policy["factor_pack_capabilities"] = _factor_pack_capabilities()
     policy["inspection_capabilities"] = INSPECTION_CAPABILITIES
     event_graph_capabilities = json.loads(json.dumps(EVENT_GRAPH_CAPABILITIES, ensure_ascii=False))
     event_graph_capabilities["approval_policy"] = _event_graph_approval_policy()
@@ -1516,11 +1591,39 @@ def get_capabilities(section: str = "") -> Dict[str, Any]:
     sections = {s.strip().lower() for s in section.split(",") if s.strip()} if section else set()
     if not sections or "all" in sections:
         return policy
+    if "researcher" in sections:
+        return {
+            "enabled": policy.get("enabled", True),
+            "allow": [
+                "research.read",
+                "research.project.create",
+                "research.experiment.submit",
+                "research.experiment.decide",
+            ],
+            "deny": sorted(set(list(policy.get("deny") or []) + [
+                "research.universe.create",
+                "research.universe.snapshot.create",
+                "research.definition.create",
+                "research.definition.validate",
+                "research.requirement.compile",
+                "research.backfill.create",
+                "research.preview.create",
+                "research.run.create",
+                "research.run.execute",
+                "audit.read",
+                "admin.repair",
+            ])),
+            "limits": policy.get("limits") or {},
+            "research_session_capabilities": RESEARCH_SESSION_CAPABILITIES,
+            "research_asset_matrix": _build_research_asset_matrix(),
+            "factor_pack_capabilities": _factor_pack_capabilities(),
+        }
 
     SECTION_KEYS: Dict[str, list] = {
         "research": [
             "enabled", "allow", "deny", "limits",
             "research_session_capabilities", "research_asset_matrix",
+            "factor_pack_capabilities",
         ],
         "strategy": [
             "enabled", "allow", "deny", "limits",
@@ -2015,6 +2118,9 @@ def agent_create_backtest_run(case_id: int, payload: Optional[Dict[str, Any]] = 
     payload = payload or {}
     actor_type, actor_id = _actor(payload)
     _require_agent_capability("backtest.run.create", actor_type)
+    # Agent requests are submissions to the durable queue.  A caller cannot
+    # opt back into synchronous execution inside its HTTP request.
+    payload = {**payload, "run_mode": "async"}
     run = history_create_backtest_run(int(case_id), payload)
     data = _maybe_strip_pnl(run, actor_type)
     result = {
@@ -2063,6 +2169,7 @@ def agent_create_backtest_batch(payload: Optional[Dict[str, Any]] = None) -> Dic
     payload = payload or {}
     actor_type, actor_id = _actor(payload)
     _require_agent_capability("backtest.batch.create", actor_type)
+    payload = {**payload, "run_mode": "async"}
     batch = history_create_backtest_batch(payload)
     data = _maybe_strip_pnl(batch, actor_type)
     result = {

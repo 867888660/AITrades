@@ -1,0 +1,37 @@
+﻿{
+    "candidate":  {
+                      "hypothesis":  {
+                                         "statement":  "在市值1亿至50亿美元的美国普通股中，过去1个月（约21个交易日）收益对后续收益具有负向预测能力（短期反转效应）",
+                                         "expected_direction":  "NEGATIVE"
+                                     },
+                      "controlled_variables":  [
+                                                   "universe",
+                                                   "research_period",
+                                                   "frequency"
+                                               ],
+                      "factor":  {
+                                     "name":  "short_term_reversal_1m",
+                                     "input_field":  "close",
+                                     "output_direction":  "LOWER_IS_BETTER",
+                                     "frequency":  "1d",
+                                     "operator":  "pct_change",
+                                     "window":  21
+                                 },
+                      "evaluation":  {
+                                         "horizons":  [
+                                                          1,
+                                                          5,
+                                                          20
+                                                      ],
+                                         "run_type":  "FACTOR_EVALUATION",
+                                         "primary_metric":  "rank_ic"
+                                     },
+                      "intervention_set":  [
+                                               {
+                                                   "component":  "factor",
+                                                   "change":  "introduce short-term reversal (1-month past return)"
+                                               }
+                                           ]
+                  },
+    "idempotency_key":  "us-smallcap-short-term-reversal-exp3"
+}

@@ -1,480 +1,325 @@
 # Research Agent Workflow
 
-Use one persistent Research Session for both building a study from scratch and
-modifying an existing study through repeated, explainable experiments.
+Read [RESEARCH_PROGRAM.md](RESEARCH_PROGRAM.md) first. This workflow exposes
+research meaning only. Internal DataTube IR and engineering operations are not
+part of the Research Agent's tool surface.
 
-## Contents
-
-- User contract, START, and formal Run products
-- RESUME and controlled iteration
-- Invalidation and automatic data maintenance
-- Human-input boundaries and monitoring
-- Downstream calls, hard boundaries, and closeout
-
-## User Contract
-
-The interface is deliberately small:
+## Interface
 
 ```text
-START(goal or partial Research Brief)
-RESUME(anchor_type, anchor_id, optional new goal)
+ALIGN(goal)
+REVIEW_AND_CONFIRM(AlignedResearchIntent)
+START(AlignedResearchIntent)
+RESUME(anchor + AlignedResearchIntent)
 STATUS(session_id)
-PAUSE(session_id)
-CONTINUE(session_id)
-ANSWER(session_id, answer)          # only when NEED_HUMAN
+EXPERIMENT(session_id, CandidateSpec)
+RESULT(experiment_id)
+DECIDE(experiment_id, KEEP | REJECT | INCONCLUSIVE, Learning)
 ```
 
-The user's research request authorizes research-only work. Do not ask them to
-create a Grant or configure budgets. The backend creates a fixed Session policy
-with Run, runtime, and download limits. The Agent cannot enlarge that policy.
-
-## START
-
-Convert the user's language into a Research Brief before building definitions:
-
-```yaml
-objective: evaluate a BTC trend signal and one cost-aware portfolio rule
-instrument_scope: BTCUSDT spot         # single instrument
-# instrument_scope: "BTCUSDT, ETHUSDT" # comma-separated for multiple
-# instrument_scope:                     # JSON array also accepted
-#   - BTCUSDT spot
-#   - ETHUSDT spot
-provider: BINANCE
-frequency: 1h
-research_period:
-  start: 2021-01-01
-  end: current_date
-evaluation_plan:
-  factor:
-    - coverage
-    - rank_ic
-    - quantile_return
-  alpha:
-    - rank_ic
-    - decay
-    - membership_turnover
-    - regime_stability
-  research_backtest:
-    - annualized_return
-    - max_drawdown
-    - sharpe_ratio
-    - trade_turnover
-    - cost_adjusted_return
-constraints:
-  long_only: true
-  leverage: false
-  max_turnover: null
-benchmark: buy_and_hold
-```
-
-**`instrument_scope` rules:**
-- Single instrument: `"BTCUSDT spot"` (trailing asset-class qualifier is stripped automatically).
-- Multiple instruments: comma-separated string `"AAPL, MSFT, NVDA"` **or** a JSON array `["AAPL", "MSFT"]`. Do not space-separate multiple tickers in a plain string — only the first token is used.
-- Equity requires `frequency: 1d`; any other value is rejected at START with `RESEARCH_FREQUENCY_MISMATCH`.
-
-Run:
+Use only these commands for a normal research project:
 
 ```powershell
-python scripts/datatube_client.py research-start --data brief.json
+python scripts/datatube_client.py researcher-align --data alignment.json
+python scripts/datatube_client.py researcher-start --data start.json
+python scripts/datatube_client.py researcher-resume RUN run_123 --data alignment.json
+python scripts/datatube_client.py researcher-status <session_id>
+python scripts/datatube_client.py researcher-pause <session_id>
+python scripts/datatube_client.py researcher-continue <session_id>
+python scripts/datatube_client.py researcher-answer <session_id> "answer"
+python scripts/datatube_client.py researcher-experiment <session_id> --data candidate.json
+python scripts/datatube_client.py researcher-result <experiment_id>
+python scripts/datatube_client.py researcher-decide <experiment_id> --data decision.json
 ```
 
-Put a stable `idempotency_key` in `brief.json` for retryable automation. Repeating
-the same START request must return the existing Project and Session; it must not
-create a second Project. Use a new key only when the user intentionally requests
-a separate study.
+Preflight only with:
 
-Check `resolved_grant_scope` in the START response. It contains `allowed_instrument_ids`,
-`allowed_intervals`, and `allowed_providers` as they were actually granted — verify they
-match your intent before proceeding. A mismatch here is cheap to fix; discovering it at
-Preview or Run creation costs a full session.
+```powershell
+python scripts/datatube_client.py capabilities --section researcher
+```
 
-## Canonical Object Ledger
+RESUME accepts only an existing anchor. `RESEARCH_RESUME_ANCHOR_NOT_FOUND` is a
+terminal request error and must not create a Session. Ask the user only when the
+response contains multiple concrete Project candidates. A zero-candidate
+`NEED_HUMAN` state is stale/invalid and must not be answered.
 
-After every START or RESUME, record and verify this ledger before any write:
+When browsing Library candidates with requested asset-class or frequency,
+select only `COMPATIBLE` items. `UNKNOWN` means required metadata is missing;
+do not treat it as compatible or select it automatically.
+
+Do not use the legacy Project, Universe, Requirement, Preview, Run, worker, or
+inspection commands from this workflow. They are internal/engineering surfaces.
+
+After START, load only the experiment reference selected by the Contract:
 
 ```text
-project_id
-session_id
-entry_mode
-brief.provider / brief.frequency / brief.instrument_scope
-resolved_grant_scope.allowed_providers / allowed_intervals / allowed_instrument_ids
-context.project_id
-current_plan_version
+stop_at=FACTOR → research-factor-experiment.md
+stop_at=ALPHA  → research-alpha-experiment.md
+stop_at=UNIVERSE → research-universe-experiment.md
+stop_at=PORTFOLIO_EVIDENCE → research-portfolio-evidence.md
+Result exists  → research-iterate.md
+explicit strategy request → research-strategy-handoff.md, then Strategy workflow
 ```
 
-Hard invariants:
+## ALIGN, Review, Confirm, Then START
 
-- `session.project_id == context.project_id == target project_id`.
-- Brief Provider, frequency, and instruments must equal the resolved Grant scope.
-- RESUME without explicit scope changes must preserve the approved Project Brief.
-- Every Project write must carry the canonical `session_id`; never rely on an
-  implicit latest Grant or expose an internal Grant ID.
-- If any invariant fails, stop before writing and enter
-  `NEED_HUMAN(AMBIGUOUS_CONTEXT)` with the conflicting IDs and fields.
+The user's first sentence may be a goal rather than a complete research design.
+Before START, resolve material ambiguity as a researcher and submit the semantic
+plan to `researcher-align`. Keep inference and recommendations efficient: ask
+only about material ambiguity and ask one concise question at a time.
 
-Safe defaults are acceptable when the missing choice is routine and reversible.
-Ask only when different interpretations would create materially different
-research.
+When ALIGN returns `status=READY`, do not START yet. `READY` means that the plan
+is semantically complete enough for review; it is not user authorization.
+Before START or RESUME:
 
-Execution sequence:
+1. Show the complete normalized Alignment and every additional semantic value
+   that will be frozen into the Research Contract.
+2. Clearly label user-provided, researcher-recommended, system-fixed, and
+   inherited values where known.
+3. Give the user a direct opportunity to change any item.
+4. Ask for explicit confirmation of that exact plan.
+5. Preserve and send the reviewed `alignment_hash` only after confirmation.
+
+The original research request, backend `READY`, silence, or agreement given
+before the complete review is not confirmation. If the user changes any value,
+rerun ALIGN, show the revised complete plan, and request confirmation again.
+
+For example, if the user says “研究美股中期动量”, recommend a research boundary:
+
+> 建议先研究 2000 年至今的美国普通股，使用历史时点有效的股票资格，
+> 排除上市不足 12 个月的股票；第一阶段先评价 12-1 动量因子的预测能力。
+> 你希望研究广泛市场，还是只研究大盘股？
+
+Do not ask for Provider, Manifest, Requirement, warmup, or worker choices.
+
+Example START payload, sent only after the user confirms the complete reviewed
+plan:
+
+```json
+{
+  "objective": "验证美国股票中期动量是否具有稳定预测能力",
+  "aligned_research_intent": {
+    "question": "验证美国股票中期动量是否具有稳定预测能力",
+    "decision_supported": "判断该因子是否值得进入 Alpha 研究",
+    "stop_at": "FACTOR",
+    "evidence_profile": "STANDARD",
+    "out_of_scope": ["Alpha construction", "portfolio backtest", "strategy creation"]
+  },
+  "instrument_scope": ["AAPL", "MSFT", "NVDA"],
+  "frequency": "1d",
+  "research_period": {"start": "2000-01-01", "end": "2025-12-31"},
+  "universe_policy": {
+    "eligibility": {
+      "mode": "STATIC_LIST",
+      "instrument_scope": ["AAPL", "MSFT", "NVDA"]
+    },
+    "selection": {"method": "ALL_ELIGIBLE"},
+    "exclusions": []
+  },
+  "evidence_profile": "STANDARD",
+  "research_contract": {
+    "evaluation": {"primary_metric": "rank_ic", "decision_rule": {"minimum_rank_ic": 0.02}}
+  },
+  "idempotency_key": "us-medium-term-momentum-v1"
+}
+```
+
+If ALIGN returns `NEEDS_INPUT`, discuss only its one material question and then
+rerun ALIGN. If it returns `UNSUPPORTED`, stop; never substitute another
+research product. If it returns `READY`, perform the review-and-confirm gate;
+never interpret `READY` itself as permission to run.
+
+## Research Contract
+
+The active Contract freezes:
+
+- objective and asset scope
+- research period and frequency
+- Universe eligibility/selection meaning
+- constraints
+- product type, primary metric, baseline, and decision rule
+- experiment budget and validation protocol
+
+Do not silently change it after a disappointing result. A material change starts
+a new Contract version and comparison lane.
+
+## CandidateSpec
+
+Each Experiment must contain one falsifiable hypothesis, an intervention set,
+and controlled variables. A Factor Evaluation declares one Factor. An Alpha or
+Portfolio Evidence Experiment may declare multiple Factors plus an explicit
+component mapping; DataTube binds the internal definition identities.
+
+```json
+{
+  "idempotency_key": "momentum-12-1-v1",
+  "candidate": {
+    "hypothesis": {
+      "statement": "过去 12 个月收益剔除最近 1 个月后，对下个月收益具有正向预测能力",
+      "expected_direction": "POSITIVE"
+    },
+    "intervention_set": [
+      {"component": "factor", "change": "introduce 12-1 momentum"}
+    ],
+    "controlled_variables": ["universe", "research_period", "frequency"],
+    "factor": {
+      "name": "momentum_12_1",
+      "operator": "pct_change",
+      "input_field": "close",
+      "window": 252,
+      "frequency": "1d",
+      "output_direction": "HIGHER_IS_BETTER"
+    },
+    "evaluation": {
+      "run_type": "FACTOR_EVALUATION",
+      "primary_metric": "rank_ic",
+      "horizons": [1, 5, 20]
+    }
+  }
+}
+```
+
+CandidateSpec must never contain Provider, Manifest, RequirementSet, Preview,
+Bundle, worker, PIT implementation, or data-source fields. DataTube rejects such
+fields before execution.
+
+Alpha example:
+
+```json
+{
+  "hypothesis": "Ranking medium-term momentum predicts next-period returns",
+  "intervention_set": [{"component": "alpha", "change": "rank momentum"}],
+  "controlled_variables": ["universe", "research_period", "frequency"],
+  "factor": {
+    "name": "momentum_12_1",
+    "operator": "pct_change",
+    "input_field": "close",
+    "window": 252
+  },
+  "alpha": {
+    "name": "momentum_rank_alpha",
+    "weight": 1.0,
+    "transform": "CS_RANK"
+  },
+  "evaluation": {
+    "run_type": "ALPHA_EVALUATION",
+    "primary_metric": "rank_ic"
+  }
+}
+```
+
+The Candidate run type and primary metric must match the active Contract. A
+Candidate cannot silently turn Factor research into Alpha research or select a
+new primary metric after results are observed.
+
+## Native Factor Packs
+
+A Factor Pack is one named research object, not 157 hand-authored Candidate
+fields. The current native pack is:
 
 ```text
-Research Brief → Project Draft → Universe → Factor / Alpha
-→ Requirements → Data Preparation → Preview → Frozen Bundle
-→ Run → Evaluation → Iteration
+pack_id: qlib.alpha158_without_vwap
+display_name: Qlib Alpha158-compatible (VWAP excluded)
+factor_count: 157
+is_standard_alpha158: false
 ```
 
-## Formal Research Run Products
+Mentioning Alpha158 in the START objective freezes this exact identity into the
+Contract. Submit only its semantic identity in the Candidate:
 
-Choose the Run type from the question being answered. Always send an explicit
-`run_type`; never infer a portfolio backtest from an Alpha Evaluation request.
+```json
+{
+  "hypothesis": "The no-VWAP Alpha158 pack contains stable predictive factors",
+  "intervention_set": [{"component": "factor_pack", "change": "evaluate the native pack"}],
+  "controlled_variables": ["universe", "research_period", "frequency"],
+  "factor_pack": {"pack_id": "qlib.alpha158_without_vwap"},
+  "evaluation": {
+    "run_type": "FACTOR_EVALUATION",
+    "primary_metric": "rank_ic",
+    "horizons": [1, 5, 20]
+  }
+}
+```
 
-| Run type | Question | Required run specs | Result contract |
-|---|---|---|---|
-| `FACTOR_EVALUATION` | Is one feature valid and predictive? | `evaluation_spec` | Coverage, distribution, IC/Rank IC, quantile returns, diagnostics. No portfolio or return curve. |
-| `ALPHA_EVALUATION` | Is the combined signal predictive and stable? | `evaluation_spec` | Signal observations, IC/Rank IC, decay, membership turnover, regime analysis, diagnostics. No positions, trades, equity, Sharpe, or drawdown. |
-| `RESEARCH_BACKTEST` | What happens after converting one Alpha into an executable research portfolio? | `portfolio_spec`, `execution_spec`; `benchmark_spec` is strongly recommended | Portfolio targets, positions, trades, fees/slippage, equity, performance, drawdown, diagnostics. |
+Do not ask for Qlib runtime, cache, Manifest, OHLCV fields, or warmup. DataTube
+derives and freezes those details. The Result reports pack-level metric
+distribution and leading/lagging members; it does not return 157 infrastructure
+objects. A single Factor cannot replace a Contract-frozen Factor Pack.
 
-Research Backtest v1 requires exactly one Alpha definition. Freeze Factor and
-Alpha lineage, Universe Snapshot, Manifest IDs, execution assumptions,
-portfolio rules, and Benchmark identity in the Bundle.
+## Experiment Lifecycle
 
-Do not call a formal `RESEARCH_BACKTEST` a Strategy Backtest. It is a
-Manifest-pinned Research product and does not require a registered Strategy.
-History/Strategy Backtests use [backtest.md](backtest.md), a History Case, and a
-registered Strategy signal source.
-
-### Benchmark Semantics
-
-Freeze `benchmark_spec` with the Research Backtest. If the benchmark comparison
-series is not materialized, report only absolute strategy metrics. Do not infer
-or display excess return, tracking error, or Information Ratio from the
-strategy equity curve alone. A missing benchmark is a warning, not permission
-to fabricate relative metrics.
-
-### Historical Alpha Hybrid Results
-
-Older immutable `ALPHA_EVALUATION` Runs may contain `PORTFOLIO_TARGETS`,
-positions, trades, equity, `BACKTEST_RESULT`, or drawdown artifacts. Label them
-`Legacy Hybrid Run`, retain schema `alpha-run-result.v1`, and explain that new
-Alpha Evaluations stop at predictive-signal evaluation. Never rewrite history
-or present a Legacy Hybrid result as the current Alpha Evaluation contract
-(`alpha-evaluation-result.v2`).
-
-## RESUME
-
-Supported anchor types are:
+Public states are:
 
 ```text
-SESSION | PROJECT | RUN | PREVIEW | BUNDLE | FACTOR_DEFINITION | ALPHA_DEFINITION
+ACCEPTED | COMPILING | PREPARING_DATA | QUEUED | RUNNING | EVALUATING
+| COMPLETE | INVALID | SYSTEM_BLOCKED | FAILED | CANCELLED
 ```
 
-Run:
+`PREPARING_DATA` is normal backend progress. Do not inspect queues or start a
+worker. Poll STATUS/RESULT while DataTube compiles, prepares, validates, freezes,
+and runs the Experiment automatically.
 
-```powershell
-python scripts/datatube_client.py research-resume RUN run_123 --data resume_goal.json
-```
+For an explicit engineering diagnosis, every persisted `PREPARING_DATA` state
+must correspond to active scoped preparation or a short post-commit readiness
+check. Provider workers must drain independently of global Requirement scans,
+and Experiment advancement must be isolated so a large universe cannot block
+unrelated Experiments.
 
-Never interpret RESUME as “read one ID and modify it.” The Context Resolver must
-restore the Project, Universe, definitions, Requirements, Preview, Bundle, Runs,
-artifacts, and experiment history. If one definition belongs to several
-Projects, enter `NEED_HUMAN(AMBIGUOUS_CONTEXT)` and present the candidates.
+`INVALID` means the Candidate did not satisfy the research contract or supported
+research language. Revise the research hypothesis/specification.
 
-Verify the returned `resolved_grant_scope` after RESUME exactly as after START.
-Do not accept default `BINANCE`, `1h`, or an empty instrument scope when the
-approved Project Brief is an equity or Polymarket study.
+`SYSTEM_BLOCKED` means no valid research result exists. Report the public issue
+and stop; do not diagnose or repair infrastructure. It does not prove a global
+outage. If the user separately requests engineering diagnosis, inspect the
+reported issue and verify that maintenance is scoped to the affected Research
+or Session before making any system-wide claim.
 
-Always keep these two fields distinct:
+## ResearchResult
+
+The stable envelope contains:
 
 ```text
-original_baseline_run_id   # the Run selected at entry
-current_branch_head_run_id # latest candidate accepted with KEEP
+status
+product_type
+goal_conformance
+decision_metrics
+research_diagnostics
+gates
+comparison
+warnings
+provenance.reproducible
 ```
 
-## Iteration Unit
+Product evidence remains typed. Factor Evaluation contains Factor evidence;
+Alpha Evaluation must never claim portfolio returns; Research Backtest owns
+positions, costs, equity, Sharpe, and drawdown.
 
-One iteration tests one major hypothesis, not necessarily one field:
+The researcher facade supports `UNIVERSE_DESIGN`, `FACTOR_EVALUATION`,
+`ALPHA_EVALUATION`, and `RESEARCH_BACKTEST`. Portfolio Evidence requires
+explicit portfolio, execution-cost, and benchmark assumptions and stops before
+Strategy creation.
 
-```yaml
-hypothesis:
-  statement: lowering concentration should reduce tail risk
-intervention_set:
-  - top_k: 2 -> 5
-  - max_position_weight: 0.5 -> 0.2
-controlled_variables:
-  - universe
-  - factor
-  - rebalance_frequency
-  - transaction_cost
+## Decision and Learning
+
+Only a `COMPLETE` Experiment can receive a research decision:
+
+```json
+{
+  "decision": "KEEP",
+  "learning": {
+    "summary": "12-1 momentum passes the primary Rank IC rule but weakens in the latest regime.",
+    "next_hypothesis": "Test whether excluding the highest-volatility names improves regime stability."
+  }
+}
 ```
 
-Multiple linked fields are valid when they implement one hypothesis. Do not mix
-unrelated factor, frequency, cost, and Universe changes in one iteration.
-
-Create and complete iterations with:
-
-```powershell
-python scripts/datatube_client.py research-iteration-create <session_id> --data iteration.json
-python scripts/datatube_client.py research-iteration-complete <iteration_id> --data result.json
-```
-
-Each result uses `KEEP`, `REJECT`, `INCONCLUSIVE`, or `NEED_HUMAN`. `KEEP` moves
-the current branch head; `REJECT` does not. Compare every candidate to both the
-current control Run and, when available, the original baseline.
-
-## Invalidation Routing
-
-Calculate the earliest invalid node and rerun only the necessary downstream
-work:
-
-```text
-Universe Definition → Universe Snapshot → Factor Definitions
-→ Alpha Definition → Requirements → Prepared Data → Preview
-→ Frozen Bundle → Run → Metrics / Artifacts
-```
-
-Examples:
-
-| Change | Earliest restart |
-|---|---|
-| explanation or display only | none |
-| transaction cost, portfolio rule, or rebalance frequency | Research Backtest Preview |
-| research period or Provider | Requirements / data readiness |
-| Alpha weight | Alpha definition, then Alpha Evaluation or Research Backtest |
-| Factor formula | Factor validation, then affected Factor/Alpha Runs |
-| Universe rule | Universe Snapshot |
-
-Requirements must be recompiled when dependencies change, but already prepared
-data may be reused when it still covers the new Requirement Set.
-
-## Automatic Requirement Data Maintenance
-
-Do not ask the user to click a preparation button or manually start a normal
-Requirement download. The backend scans all Requirement Library assets and
-active Research RequirementSets, then creates bounded idempotent provider tasks
-for supported gaps. Research and Library pages are read-only monitors for this
-maintenance path.
-
-Treat `QUEUED`, `PREPARING`, and `CHECKING` as normal progress. Ask for human
-input only when a terminal `FAILED` or `UNAVAILABLE` result exposes a genuine
-contract choice or a material scope change; a missing percentage or an active
-download is not `NEED_HUMAN`.
-
-A direct Provider probe or shell exception is not Project data state. Report a
-Project as data-blocked only when it has a non-empty RequirementSet and its
-DataTube status rows or controlled task records contain concrete `FAILED` or
-`UNAVAILABLE` evidence. `queue_depth == 0` with zero Project tasks means data
-preparation has not started, not that downloads are rate-limited.
-
-## NEED_HUMAN
-
-Do not ask for routine choices, confirmation of an Agent proposal, or permission
-to run another in-scope backtest. Pause only for one of these stable reasons:
-
-```text
-AMBIGUOUS_INTENT
-AMBIGUOUS_CONTEXT
-MATERIAL_SCOPE_CHANGE
-LIMIT_EXTENSION_REQUIRED
-CROSS_RESEARCH_BOUNDARY
-```
-
-The question must explain the blocked decision in plain language and be
-answerable in one short response. Persist it in the Session; do not store it
-only in chat.
-
-## Monitoring
-
-Update the Session state before each material phase:
-
-```text
-BRIEFING | PLANNING | BUILDING | PREPARING_DATA | PREVIEWING
-| RUNNING | EVALUATING | ITERATING | NEED_HUMAN | PAUSED
-| BLOCKED | COMPLETED | FAILED | CANCELLED
-```
-
-AgentMonitor must make visible:
-
-- what the Agent is doing now and why
-- the active hypothesis and intervention set
-- original baseline and current branch head
-- Run/runtime usage and limits
-- completed iteration decisions and warnings
-- the exact question when human input is genuinely required
-
-## Data Preparation Stall Detection
-
-Treat `QUEUED`, `PREPARING`, and `CHECKING` as normal progress — do not enter
-`NEED_HUMAN` for an active download or a missing percentage.
-
-However, a worker can become permanently IDLE if its task queue is saturated
-with historical non-READY tasks. Use the worker-status endpoint to distinguish
-normal progress from a genuine stall:
-
-```powershell
-# Check OpenBB (equity) worker
-python scripts/datatube_client.py get /api/research/data/providers/openbb/worker-status
-# Check Binance backfill worker
-python scripts/datatube_client.py get /api/research/data/backfill/binance/worker-status
-```
-
-Response fields that matter:
-
-| Field | Meaning |
-|---|---|
-| `queue_depth` | Tasks currently in READY state waiting for this worker |
-| `oldest_ready_age_seconds` | Age of the oldest READY task; helps identify stuck tasks |
-| `counts.READY` | Should be 0 when the worker has recently run |
-| `counts.RUNNING` | Should be 1 while the worker is active |
-
-**Stall thresholds:**
-- `oldest_ready_age_seconds > 600` (10 min) with `counts.RUNNING == 0` → worker is stalled.
-- `queue_depth == 0` and no RUNNING task → worker has no work; preparation may already be complete or tasks not yet created.
-- `queue_depth > 0` but no change for 10 min → call the worker-start endpoint once:
-
-```powershell
-python scripts/datatube_client.py post /api/research/data/providers/openbb/worker/start
-python scripts/datatube_client.py post /api/research/data/backfill/binance/worker/start
-```
-
-If after one restart the queue does not drain within 15 min, enter
-`NEED_HUMAN(BLOCKED)` with the `queue_depth`, `oldest_ready_age_seconds`, and
-`counts` values visible in the session state. Do not invent other workarounds.
-
-## Asset Class Capability Matrix
-
-Check the live matrix before starting a new study; it is generated from backend
-code and reflects actual provider availability:
-
-```powershell
-python scripts/datatube_client.py get /api/agent/capabilities?section=research
-```
-
-Key constraints from the current matrix:
-
-| Provider | Asset class | Supported frequencies | FACTOR_EVALUATION | ALPHA_EVALUATION | RESEARCH_BACKTEST |
-|---|---|---|---|---|---|
-| BINANCE | crypto_spot | 1m … 1d | ✓ | ✓ | ✓ |
-| POLYMARKET | polymarket_binary | 1m … 1d | ✓ | ✓ | ✗ |
-| OPENBB | equity | **1d only** | ✓ | ✓ | ✗ |
-
-`RESEARCH_BACKTEST` supports `crypto_spot` only in v1. Attempting it with equity
-or Polymarket instruments raises an error at Preview creation time.
-
-## Downstream Research Calls
-
-> **Do not call `research-project-create` directly.** That CLI command calls
-> `POST /api/agent/research/projects`, which creates a bare project and returns
-> `next_required_action: HUMAN_CREATE_PROJECT_RESEARCH_GRANT`. A human must
-> then create a Grant before any write can proceed — the agent cannot do this.
-> Use `research-start` instead: it atomically creates the project, plan, and
-> a fully-authorized `FULL_RESEARCH` Grant in one call.
-
-Pass `session_id` on every Project write. The server resolves its internal
-research capacity; do not pass or expose a Grant ID.
-
-```powershell
-python scripts/datatube_client.py research-universe-create <project_id> --data universe.json
-python scripts/datatube_client.py research-definition-create <project_id> --data factor.json
-python scripts/datatube_client.py research-requirements-compile <project_id> --data requirements.json
-python scripts/datatube_client.py research-preview-create <project_id> --data preview.json
-python scripts/datatube_client.py research-run-create <project_id> --data run.json
-python scripts/datatube_client.py research-run-execute <project_id> --data session.json
-```
-
-### Removing a Component from a Project
-
-These commands unbind/unpin a Universe, Factor, Alpha, or Requirement from the
-current Project. They mirror the human UI's "Remove from Research" action —
-the underlying definition or Library asset is never deleted, and history
-(previous Runs, Previews, artifacts) is preserved unchanged.
-
-```powershell
-python scripts/datatube_client.py research-unpin <project_id> <slot_key> --data '{"expected_definition_id": "<factor_or_alpha_definition_id>"}'
-python scripts/datatube_client.py research-universe-unbind <project_id> <universe_id>
-python scripts/datatube_client.py research-universe-ref-remove <project_id>
-python scripts/datatube_client.py research-requirement-remove <project_id> <ref_id>
-```
-
-- `research-unpin` removes a Factor or Alpha `project_definition_ref` by
-  `slot_key` (e.g. `factor:MyFactor`, `alpha:MyAlpha`). `expected_definition_id`
-  is required and must match the currently pinned definition, or the call
-  fails with `RESEARCH_REFERENCE_STALE`. Removing a Factor that a pinned Alpha
-  still depends on fails with `FACTOR_REFERENCE_IN_USE`; unpin or replace the
-  Alpha first.
-- `research-universe-unbind` removes a shared-Universe binding (multi-binding
-  Research). If the removed binding was `PRIMARY`, another bound Universe is
-  promoted automatically; if none remain, the Project has no Universe.
-- `research-universe-ref-remove` clears the legacy single-Universe reference
-  used by Projects that predate shared-Universe bindings. It has no arguments
-  beyond `project_id`.
-- `research-requirement-remove` removes one Requirement item from the Project.
-  It only works on Requirements sourced from the Library; a Project-derived
-  Requirement without a `library_asset_id` must be changed at its source
-  instead — the call raises an error if attempted.
-
-### Archiving a Library Asset
-
-```powershell
-python scripts/datatube_client.py research-library-archive <project_id> <library_asset_id>
-```
-
-Soft-archives a published Universe, Factor, or Alpha asset in the Global
-Library (Requirements use `research-requirement-remove`/the library
-Requirements endpoints instead). This is the reverse of publishing, not a
-hard delete: history, lineage, and every immutable Run/Bundle that already
-used the asset are preserved unchanged. `project_id` only names the Grant
-that authorizes the call — the asset itself is not owned by that Project.
-Archiving fails if the asset is still referenced by any active Research
-(`research_count > 0`); unbind or unpin it from every Project first with
-`research-unpin` / `research-universe-unbind` / `research-universe-ref-remove`.
-
-Before creating a Preview, verify that its payload matches the selected Run
-product. Reject an Alpha Evaluation payload that depends on portfolio or
-execution specs for its meaning; use `RESEARCH_BACKTEST` instead. Never report
-Total Return, CAGR, Sharpe, fees, trades, equity, or drawdown from an
-`ALPHA_EVALUATION` result.
-
-## Hard Boundaries
-
-- Never enlarge the server-created Session policy.
-- Never publish a Project definition to the Global Library.
-- Never delete Manifest, Artifact, Bundle, Run, audit, or lineage history.
-- Never overwrite a validated definition; create a new immutable version.
-- Never bypass point-in-time, availability-time, quality, Provider, or range checks.
-- Never enable Paper, Live, or real trading.
-- Do not auto-chain research into strategy creation without an explicit current
-  user request.
-- For US pre-market market-cap research, do not freeze a formal Factor Bundle
-  when shares outstanding or market cap is only a current snapshot. A current
-  shares proxy may be reported as exploratory evidence, never as PIT-valid
-  Factor Evaluation input.
+`SYSTEM_BLOCKED`, `FAILED`, and `INVALID` are statuses, not research decisions.
 
 ## Closeout
 
-### Completion Evidence Gates
-
-Use the narrowest truthful completion label:
-
-| Label | Required evidence |
-|---|---|
-| Definition layer complete | Validated and pinned Factor/Alpha IDs and counts. |
-| Research skeleton complete | Bound Universe ID, immutable Universe Snapshot ID, and non-empty RequirementSet ID in addition to definitions. |
-| Data preparation blocked | RequirementSet ID plus concrete DataTube row/task IDs in `FAILED` or `UNAVAILABLE`. |
-| Evaluation ready | A ready Preview ID with the intended Run type. |
-| Evaluation complete | Run ID, terminal status, schema, metrics, warnings, and Artifact IDs. |
-
-Never say “project setup complete” when only definitions exist. Never claim that
-a script or artifact was saved until its path has been verified in the current
-workspace. Separate intended next steps from persisted DataTube state.
-
-Report the Session, Project, original baseline, current branch head, accepted and
-rejected iterations, Run type and schema, final metrics, warnings, Benchmark
-materialization status, and remaining research capacity. Group metrics by their
-owning product; never mix signal-evaluation statistics with portfolio-backtest
-statistics under one Alpha result.
-
-Always close research-only work with:
+Report the research goal, Contract version, completed Experiments, decisions,
+primary evidence, research warnings, remaining experiment capacity, and next
+hypothesis. For research-only work always state:
 
 ```text
 No strategy was created or submitted. No virtual or live trade was executed.

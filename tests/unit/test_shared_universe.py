@@ -128,6 +128,9 @@ class SharedUniverseServiceTests(unittest.TestCase):
         )
         self.assertEqual([], SharedUniverseService(self.store).list_project(self.first["project_id"]))
 
+    def test_legacy_bare_instrument_is_preserved_without_registry_validation(self) -> None:
+        self.assertEqual("AAPL", self.service._normalize_instrument("AAPL", validate=False))
+
     def test_composite_and_multi_leg_resolution(self) -> None:
         first = self.service.create({
             "name": "Set A", "type": "instrument_set", "members": self.instruments[:3],

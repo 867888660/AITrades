@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
+import itertools
 import json
 import math
 import statistics
+from array import array
 from bisect import bisect_left
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,6 +42,14 @@ def _percentile(values: Sequence[float], probability: float) -> float | None:
     if not values:
         return None
     ordered = sorted(values)
+    return _percentile_sorted(ordered, probability)
+
+
+def _percentile_sorted(
+    ordered: Sequence[float], probability: float
+) -> float | None:
+    if not ordered:
+        return None
     position = max(0.0, min(1.0, probability)) * (len(ordered) - 1)
     lower = int(math.floor(position))
     upper = int(math.ceil(position))
@@ -136,6 +147,7 @@ class EvaluationSpec:
     fee_bps: float = 0.0
     slippage_bps: float = 0.0
     return_definition: str = "NEXT_BAR_OPEN_TO_HORIZON_CLOSE"
+    retain_observations: bool = True
     engine_version: str = EVALUATION_ENGINE_VERSION
     code_hash: str = EVALUATION_CODE_HASH
 
@@ -179,6 +191,7 @@ class EvaluationSpec:
             "fee_bps": self.fee_bps,
             "slippage_bps": self.slippage_bps,
             "return_definition": self.return_definition,
+            "retain_observations": self.retain_observations,
             "engine_version": self.engine_version,
             "code_hash": self.code_hash,
         }
@@ -214,29 +227,45 @@ class EvaluationResult:
 
 class FutureReturnBuilder:
     def __init__(self, bars_by_instrument: Mapping[str, Sequence[Mapping[str, Any]]]):
-        self._bars: dict[str, list[dict[str, Any]]] = {}
-        self._times: dict[str, list[datetime]] = {}
+        self._bars: dict[str, list[Mapping[str, Any]]] = {}
         for instrument_id, raw_rows in bars_by_instrument.items():
-            rows = sorted((dict(item) for item in raw_rows), key=lambda item: _parse_time(item.get("bar_start_time") or item.get("event_time")))
+            rows = raw_rows if isinstance(raw_rows, list) else list(raw_rows)
+            rows.sort(key=lambda item: str(item.get("bar_start_time") or item.get("event_time")))
             seen: set[datetime] = set()
+            write_index = 0
             for row in rows:
                 start = _parse_time(row.get("bar_start_time") or row.get("event_time"))
                 if start in seen:
                     raise ValueError(f"duplicate bar for future returns: {instrument_id} {start.isoformat()}")
                 seen.add(start)
-                if _finite(row.get("open")) is None or _finite(row.get("close")) is None:
-                    raise ValueError(f"future-return bar requires finite open and close: {instrument_id}")
-                if float(row["open"]) <= 0 or float(row["close"]) <= 0:
-                    raise ValueError(f"future-return prices must be positive: {instrument_id}")
+                open_price = _finite(row.get("open"))
+                close_price = _finite(row.get("close"))
+                if (
+                    open_price is None
+                    or close_price is None
+                    or open_price <= 0
+                    or close_price <= 0
+                ):
+                    # Archive datasets legitimately contain non-tradable rows
+                    # (for example a CRSP security/date without a quoted
+                    # open/close).  They cannot define a forward return, but
+                    # they must not invalidate every other security in a
+                    # cross-sectional evaluation.  Excluding the row keeps
+                    # horizons expressed in valid tradable bars and causes an
+                    # observation with no future path to be omitted naturally.
+                    continue
+                rows[write_index] = row
+                write_index += 1
+            del rows[write_index:]
             self._bars[str(instrument_id)] = rows
-            self._times[str(instrument_id)] = [
-                _parse_time(row.get("bar_start_time") or row.get("event_time")) for row in rows
-            ]
 
     def build(self, instrument_id: str, available_time: str, horizon: int) -> dict[str, Any] | None:
         rows = self._bars.get(str(instrument_id), [])
-        times = self._times.get(str(instrument_id), [])
-        entry_index = bisect_left(times, _parse_time(available_time))
+        entry_index = bisect_left(
+            rows,
+            str(available_time),
+            key=lambda row: str(row.get("bar_start_time") or row.get("event_time")),
+        )
         exit_index = entry_index + int(horizon) - 1
         if entry_index >= len(rows) or exit_index >= len(rows):
             return None
@@ -244,8 +273,16 @@ class FutureReturnBuilder:
         exit_price = float(rows[exit_index]["close"])
         return {
             "future_return": exit_price / entry_price - 1.0,
-            "return_start_time": times[entry_index].isoformat(),
-            "return_end_time": str(rows[exit_index].get("bar_end_time") or rows[exit_index].get("available_time") or times[exit_index].isoformat()),
+            "return_start_time": str(
+                rows[entry_index].get("bar_start_time")
+                or rows[entry_index].get("event_time")
+            ),
+            "return_end_time": str(
+                rows[exit_index].get("bar_end_time")
+                or rows[exit_index].get("available_time")
+                or rows[exit_index].get("bar_start_time")
+                or rows[exit_index].get("event_time")
+            ),
             "entry_price": entry_price,
             "exit_price": exit_price,
         }
@@ -262,8 +299,11 @@ class FactorEvaluator:
     ) -> EvaluationResult:
         members = set(getattr(universe_snapshot, "actual_instrument_ids", ()) or factor_values_by_instrument.keys())
         universe_snapshot_id = str(getattr(universe_snapshot, "universe_snapshot_id", "") or "")
+        from .universe_service import UniverseMembershipIndex
+
+        membership_index = UniverseMembershipIndex(universe_snapshot)
         future = FutureReturnBuilder(bars_by_instrument)
-        values: list[float] = []
+        values: list[float] | array[float] = [] if spec.retain_observations else array("d")
         total_rows = 0
         total_rows_by_instrument: dict[str, int] = {}
         valid_rows_by_instrument: dict[str, int] = {}
@@ -271,21 +311,74 @@ class FactorEvaluator:
         available_by_time: dict[str, str] = {}
         for instrument_id in sorted(members):
             for row in factor_values_by_instrument.get(instrument_id, []):
+                as_of = str(row.get("factor_as_of_time") or row.get("available_time") or row.get("event_time") or "").strip()
+                if membership_index.dynamic and (
+                    not as_of or not membership_index.contains(instrument_id, as_of)
+                ):
+                    continue
                 total_rows += 1
                 total_rows_by_instrument[instrument_id] = total_rows_by_instrument.get(instrument_id, 0) + 1
                 value = _finite(row.get("value"))
                 if value is None:
                     continue
-                as_of = str(row.get("factor_as_of_time") or row.get("available_time") or row.get("event_time") or "").strip()
                 available = str(row.get("available_time") or as_of).strip()
                 if not as_of or not available:
                     continue
                 valid_rows_by_instrument[instrument_id] = valid_rows_by_instrument.get(instrument_id, 0) + 1
-                factor_by_time.setdefault(as_of, {})[instrument_id] = value
-                previous = available_by_time.get(as_of)
-                if previous is None or _parse_time(available) > _parse_time(previous):
-                    available_by_time[as_of] = available
+                if spec.retain_observations:
+                    factor_by_time.setdefault(as_of, {})[instrument_id] = value
+                    previous = available_by_time.get(as_of)
+                    if previous is None or _parse_time(available) > _parse_time(previous):
+                        available_by_time[as_of] = available
                 values.append(value)
+
+        if spec.retain_observations:
+            cross_sections: Iterable[tuple[str, dict[str, float], str]] = (
+                (as_of, factor_by_time[as_of], available_by_time[as_of])
+                for as_of in sorted(factor_by_time, key=_parse_time)
+            )
+            cross_section_count = len(factor_by_time)
+        else:
+            def instrument_values(
+                instrument_id: str,
+            ) -> Iterable[tuple[str, str, float, str]]:
+                for row in factor_values_by_instrument.get(instrument_id, []):
+                    value = _finite(row.get("value"))
+                    if value is None:
+                        continue
+                    as_of = str(
+                        row.get("factor_as_of_time")
+                        or row.get("available_time")
+                        or row.get("event_time")
+                        or ""
+                    ).strip()
+                    available = str(row.get("available_time") or as_of).strip()
+                    if (
+                        as_of and available
+                        and (
+                            not membership_index.dynamic
+                            or membership_index.contains(instrument_id, as_of)
+                        )
+                    ):
+                        yield as_of, instrument_id, value, available
+
+            merged = heapq.merge(*(
+                instrument_values(instrument_id)
+                for instrument_id in sorted(members)
+            ))
+
+            def streaming_cross_sections() -> Iterable[tuple[str, dict[str, float], str]]:
+                for as_of, items in itertools.groupby(merged, key=lambda item: item[0]):
+                    cross_section: dict[str, float] = {}
+                    available = ""
+                    for _, instrument_id, value, item_available in items:
+                        cross_section[instrument_id] = value
+                        if not available or item_available > available:
+                            available = item_available
+                    yield as_of, cross_section, available
+
+            cross_sections = streaming_cross_sections()
+            cross_section_count = 0
 
         observations: list[dict[str, Any]] = []
         ic_series: list[dict[str, Any]] = []
@@ -293,8 +386,17 @@ class FactorEvaluator:
         stability_series: list[dict[str, Any]] = []
         rank_turnovers: list[float] = []
         previous_percentiles: dict[str, float] | None = None
-        for as_of in sorted(factor_by_time, key=_parse_time):
-            cross_section = factor_by_time[as_of]
+        for as_of, cross_section, available_time in cross_sections:
+            if not spec.retain_observations:
+                cross_section_count += 1
+            active_members = members
+            if membership_index.dynamic:
+                active_members = membership_index.active_at(as_of)
+                cross_section = {
+                    instrument_id: value
+                    for instrument_id, value in cross_section.items()
+                    if instrument_id in active_members
+                }
             if len(cross_section) < spec.minimum_cross_section_size:
                 continue
             ranks = _average_ranks(cross_section)
@@ -305,7 +407,7 @@ class FactorEvaluator:
                 "cross_section_mean": statistics.fmean(cross_values),
                 "cross_section_std": statistics.pstdev(cross_values) if len(cross_values) > 1 else 0.0,
                 "instrument_count": len(cross_values),
-                "universe_coverage": len(cross_values) / max(1, len(members)),
+                "universe_coverage": len(cross_values) / max(1, len(active_members)),
             })
             if previous_percentiles is not None:
                 common = set(previous_percentiles) & set(percentiles)
@@ -317,14 +419,14 @@ class FactorEvaluator:
                 returns: dict[str, float] = {}
                 rows_for_time: list[dict[str, Any]] = []
                 for instrument_id, factor_value in cross_section.items():
-                    future_row = future.build(instrument_id, available_by_time[as_of], horizon)
+                    future_row = future.build(instrument_id, available_time, horizon)
                     if future_row is None:
                         continue
                     returns[instrument_id] = float(future_row["future_return"])
                     observation = {
                         "instrument_id": instrument_id,
                         "as_of_time": as_of,
-                        "available_time": available_by_time[as_of],
+                        "available_time": available_time,
                         "horizon_bars": horizon,
                         "factor_value": factor_value,
                         "factor_percentile": percentiles[instrument_id],
@@ -332,7 +434,8 @@ class FactorEvaluator:
                         "universe_snapshot_id": universe_snapshot_id,
                         **future_row,
                     }
-                    observations.append(observation)
+                    if spec.retain_observations:
+                        observations.append(observation)
                     rows_for_time.append(observation)
                 instruments = sorted(set(cross_section) & set(returns))
                 pearson_ic = (
@@ -377,7 +480,7 @@ class FactorEvaluator:
             rank_turnovers,
             total_rows_by_instrument,
             valid_rows_by_instrument,
-            len(factor_by_time),
+            cross_section_count,
         )
         summary.update({
             "evaluation_type": "FACTOR_EVALUATION",
@@ -397,7 +500,7 @@ class FactorEvaluator:
     @staticmethod
     def _factor_summary(
         spec: EvaluationSpec,
-        values: list[float],
+        values: Sequence[float],
         total_rows: int,
         ic_series: list[dict[str, Any]],
         group_series: list[dict[str, Any]],
@@ -412,6 +515,7 @@ class FactorEvaluator:
         outlier_ratio = 0.0
         if values and std and std > 0 and mean is not None:
             outlier_ratio = sum(abs(item - mean) > 5 * std for item in values) / len(values)
+        ordered_values = sorted(values)
         ic_summary, rank_ic_summary = _summarize_ic(spec, ic_series)
         group_summary: dict[str, Any] = {}
         for horizon in spec.horizons:
@@ -488,7 +592,10 @@ class FactorEvaluator:
             "missing_rate": 1.0 - len(values) / total_rows if total_rows else 1.0,
             "mean": mean,
             "std": std,
-            "quantiles": {str(int(p * 100)): _percentile(values, p) for p in (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99)},
+            "quantiles": {
+                str(int(p * 100)): _percentile_sorted(ordered_values, p)
+                for p in (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99)
+            },
             "outlier_ratio_5sigma": outlier_ratio,
             "average_rank_turnover": statistics.fmean(rank_turnovers) if rank_turnovers else None,
             "time_stability": {
@@ -521,7 +628,12 @@ class AlphaEvaluator:
         ic_series: list[dict[str, Any]] = []
         group_series: list[dict[str, Any]] = []
         stability_series: list[dict[str, Any]] = []
-        all_scores: list[float] = []
+        # Large cross-sectional Alpha studies can contain tens of millions of
+        # scores. Keep aggregate inputs compact when row-level observations are
+        # disabled instead of retaining one Python float object per score.
+        all_scores: list[float] | array[float] = (
+            [] if spec.retain_observations else array("d")
+        )
         membership_turnovers: list[float] = []
         previous_scores: dict[str, float] | None = None
         previous_top: set[str] | None = None
@@ -551,12 +663,18 @@ class AlphaEvaluator:
             previous_top = top
             for horizon in spec.horizons:
                 returns: dict[str, float] = {}
-                future_rows: dict[str, dict[str, Any]] = {}
+                # Future-return payloads are only required for the optional
+                # row-level artifact. Aggregate-only evaluation must not keep
+                # a second dict per instrument and horizon.
+                future_rows: dict[str, dict[str, Any]] | None = (
+                    {} if spec.retain_observations else None
+                )
                 for instrument_id in scores:
                     future_row = future.build(instrument_id, available, horizon)
                     if future_row is not None:
                         returns[instrument_id] = float(future_row["future_return"])
-                        future_rows[instrument_id] = future_row
+                        if future_rows is not None:
+                            future_rows[instrument_id] = future_row
                 if len(returns) < spec.minimum_cross_section_size:
                     continue
                 instruments = sorted(set(scores) & set(returns))
@@ -599,22 +717,23 @@ class AlphaEvaluator:
                     "market_return": market_return,
                     "market_regime": regime,
                 })
-                ranks = _average_ranks(scores, descending=True)
-                for instrument_id, score in scores.items():
-                    if instrument_id not in future_rows:
-                        continue
-                    observations.append({
-                        "instrument_id": instrument_id,
-                        "as_of_time": as_of,
-                        "available_time": available,
-                        "horizon_bars": horizon,
-                        "score": score,
-                        "rank": ranks[instrument_id],
-                        "selected_top": instrument_id in top,
-                        "selected_bottom": instrument_id in bottom,
-                        "universe_snapshot_id": universe_snapshot_id,
-                        **future_rows[instrument_id],
-                    })
+                if future_rows is not None:
+                    ranks = _average_ranks(scores, descending=True)
+                    for instrument_id, score in scores.items():
+                        if instrument_id not in future_rows:
+                            continue
+                        observations.append({
+                            "instrument_id": instrument_id,
+                            "as_of_time": as_of,
+                            "available_time": available,
+                            "horizon_bars": horizon,
+                            "score": score,
+                            "rank": ranks[instrument_id],
+                            "selected_top": instrument_id in top,
+                            "selected_bottom": instrument_id in bottom,
+                            "universe_snapshot_id": universe_snapshot_id,
+                            **future_rows[instrument_id],
+                        })
 
         summary = self._alpha_summary(
             spec, all_scores, ic_series, group_series, stability_series, membership_turnovers
@@ -637,7 +756,7 @@ class AlphaEvaluator:
     @staticmethod
     def _alpha_summary(
         spec: EvaluationSpec,
-        scores: list[float],
+        scores: Sequence[float],
         ic_series: list[dict[str, Any]],
         group_series: list[dict[str, Any]],
         stability_series: list[dict[str, Any]],
@@ -686,12 +805,18 @@ class AlphaEvaluator:
                 "severity": "WARNING",
                 "message": "Eligible Alpha timestamps exist, but cross-sectional IC is unavailable.",
             })
+        # Sort once for every reported percentile. The previous implementation
+        # sorted the complete score vector five times.
+        ordered_scores = sorted(scores)
         return {
             "product_run_type": "ALPHA_RUN",
             "score_count": len(scores),
             "score_mean": statistics.fmean(scores) if scores else None,
             "score_std": statistics.pstdev(scores) if len(scores) > 1 else 0.0 if scores else None,
-            "score_quantiles": {str(int(p * 100)): _percentile(scores, p) for p in (0.05, 0.25, 0.5, 0.75, 0.95)},
+            "score_quantiles": {
+                str(int(p * 100)): _percentile_sorted(ordered_scores, p)
+                for p in (0.05, 0.25, 0.5, 0.75, 0.95)
+            },
             "average_rank_stability": statistics.fmean(stability) if stability else None,
             "average_membership_turnover": statistics.fmean(membership_turnovers) if membership_turnovers else None,
             "ic": ic_summary,

@@ -1857,41 +1857,56 @@ function researchScopeText(scope) {
 
 function renderResearchSessionDetail(session = {}) {
   if (!agentResearchSessionDetail) return;
-  const brief = session.brief || {};
-  const policy = session.session_policy || {};
-  const usage = session.usage || {};
-  const iterations = session.iterations || [];
+  const plan = session.research_plan || {};
+  const scope = plan.scope || {};
+  const assetScope = scope.asset_scope || {};
+  const evidence = plan.evidence || {};
+  const limits = session.limits || {};
+  const experiments = session.experiments || [];
   const question = session.pending_question || {};
-  const iterationHtml = iterations.length
-    ? iterations.map((item) => `
+  const experimentHtml = experiments.length
+    ? experiments.map((item, index) => {
+      const hypothesis = (item.candidate || {}).hypothesis || {};
+      const result = item.result || {};
+      const learning = item.learning || {};
+      const systemBlock = item.system_block || {};
+      return `
       <div class="agent-item">
         <div class="agent-item-main">
-          <div class="agent-item-title">第 ${escapeHtml(item.sequence)} 轮 · ${escapeHtml(item.decision || item.status)}</div>
-          <div class="agent-item-note">${escapeHtml((item.hypothesis || {}).statement || JSON.stringify(item.hypothesis || {}))}</div>
+          <div class="agent-item-title">Experiment ${escapeHtml(experiments.length - index)} · ${escapeHtml(item.decision || item.status)}</div>
+          <div class="agent-item-note"><strong>Hypothesis：</strong>${escapeHtml(hypothesis.statement || JSON.stringify(hypothesis))}</div>
           <div class="agent-item-meta">
-            <span>Control ${escapeHtml(item.control_run_id || "尚无")}</span>
-            <span>Candidate ${escapeHtml(item.candidate_run_id || "尚无")}</span>
+            <span>${escapeHtml(result.product_type || "等待证据")}</span>
+            <span>${escapeHtml(result.goal_conformance || "-")}</span>
           </div>
+          ${Object.keys(result.decision_metrics || {}).length ? `<div class="agent-item-note"><strong>Evidence：</strong>${escapeHtml(JSON.stringify(result.decision_metrics))}</div>` : ""}
+          ${learning.summary ? `<div class="agent-item-note"><strong>Learning：</strong>${escapeHtml(learning.summary)}</div>` : ""}
+          ${learning.next_hypothesis ? `<div class="agent-item-note"><strong>Next：</strong>${escapeHtml(learning.next_hypothesis)}</div>` : ""}
+          ${systemBlock.code ? `<div class="agent-item-note warning"><strong>System block:</strong> ${escapeHtml(systemBlock.code)}${systemBlock.issue_id ? ` · issue ${escapeHtml(systemBlock.issue_id)}` : ""}${systemBlock.message ? `<br>${escapeHtml(systemBlock.message)}` : ""}</div>` : ""}
         </div>
       </div>
-    `).join("")
-    : `<div class="empty-state">尚未开始迭代。</div>`;
+    `;
+    }).join("")
+    : `<div class="empty-state">Research Plan 已就绪，尚未提交 Experiment。</div>`;
   agentResearchSessionDetail.innerHTML = `
     <div class="agent-item">
       <div class="agent-item-main">
-        <div class="agent-item-title">${escapeHtml(session.objective || "Research Session")}</div>
+        <div class="agent-item-title">${escapeHtml(plan.question || session.goal || "Research Session")}</div>
         <div class="agent-item-meta">
           ${agentStateChip(session.status)}
-          <span>${escapeHtml(session.entry_mode)}</span>
-          <span>${escapeHtml(brief.frequency || "-")}</span>
-          <span>${escapeHtml(researchScopeText(brief.instrument_scope))}</span>
+          <span>STOP_AT ${escapeHtml(plan.stop_at || "-")}</span>
+          <span>${escapeHtml(evidence.profile || "STANDARD")}</span>
+          <span>Contract v${escapeHtml((session.research_contract || {}).version || "-")}</span>
         </div>
-        <div class="agent-item-note">原始基线：${escapeHtml(session.original_baseline_run_id || "尚无")} · 当前分支头：${escapeHtml(session.current_branch_head_run_id || "尚无")}</div>
-        <div class="agent-item-note">运行额度：${escapeHtml(usage.runs || 0)} / ${escapeHtml(policy.max_runs || 0)}；运行时间：${escapeHtml(Math.ceil((usage.runtime_seconds || 0) / 60))} / ${escapeHtml(Math.ceil((policy.max_runtime_seconds || 0) / 60))} 分钟</div>
-        ${question.question ? `<div class="agent-item-note warning">需要你判断：${escapeHtml(question.question)}</div>` : ""}
+        <div class="agent-item-note"><strong>支持决策：</strong>${escapeHtml(plan.decision_supported || "-")}</div>
+        <div class="agent-item-note"><strong>范围：</strong>${escapeHtml(assetScope.asset_class || "-")} · ${escapeHtml(researchScopeText(assetScope.instrument_scope))} · ${escapeHtml(scope.frequency || "-")} · ${escapeHtml(JSON.stringify(scope.research_period || {}))}</div>
+        <div class="agent-item-note"><strong>主要证据：</strong>${escapeHtml(evidence.primary_metric || "-")} · ${escapeHtml(evidence.run_type || "-")}</div>
+        <div class="agent-item-note"><strong>本轮不做：</strong>${escapeHtml((plan.out_of_scope || []).join("、") || "-")}</div>
+        <div class="agent-item-note">实验容量：${escapeHtml(limits.used ?? "Unavailable")} / ${escapeHtml(limits.max_experiments ?? "Unavailable")}</div>
+        ${question.question ? `<div class="agent-item-note warning">${question.reason_code === "AMBIGUOUS_CONTEXT" && !(question.candidates || []).length ? "Resume anchor unavailable: " : "需要你判断："}${escapeHtml(question.question)}</div>` : ""}
       </div>
     </div>
-    ${iterationHtml}
+    ${experimentHtml}
   `;
 }
 
@@ -1904,28 +1919,34 @@ function renderResearchSessions(rows = []) {
     return;
   }
   agentResearchSessionList.innerHTML = rows.map((session) => {
-    const usage = session.usage || {};
-    const policy = session.session_policy || {};
-    const paused = session.status === "PAUSED";
-    const needsHuman = session.status === "NEED_HUMAN";
-    const terminal = ["COMPLETED", "FAILED", "CANCELLED"].includes(session.status);
+    const limits = session.limits || {};
+    const plan = session.research_plan || {};
+    const actions = session.actions || {};
+    const paused = Boolean(actions.can_continue);
+    const pendingQuestion = session.pending_question || {};
+    const staleMissingAnchor = pendingQuestion.reason_code === "AMBIGUOUS_CONTEXT"
+      && !(pendingQuestion.candidates || []).length;
+    const needsHuman = Boolean(actions.needs_human) && !staleMissingAnchor;
+    const terminal = Boolean(actions.terminal);
     return `
       <div class="agent-item">
         <div class="agent-item-main">
-          <div class="agent-item-title">${escapeHtml(session.objective || session.session_id)}</div>
+          <div class="agent-item-title">${escapeHtml(plan.question || session.goal || session.session_id)}</div>
           <div class="agent-item-meta">
             ${agentStateChip(session.status)}
-            <span>${escapeHtml(session.entry_mode)}</span>
-            <span>Runs ${escapeHtml(usage.runs || 0)}/${escapeHtml(policy.max_runs || 0)}</span>
+            <span>${escapeHtml(plan.entry_mode || session.entry_mode || "START")}</span>
+            <span>STOP_AT ${escapeHtml(plan.stop_at || "-")}</span>
+            <span>Experiments ${escapeHtml(limits.used ?? "Unavailable")}/${escapeHtml(limits.max_experiments ?? "Unavailable")}</span>
             <span>更新 ${formatShortTime(session.updated_at)}</span>
           </div>
-          <div class="agent-item-note">${escapeHtml(session.session_id)} · Project ${escapeHtml(session.project_id || "待选择")}</div>
+          <div class="agent-item-note">${escapeHtml(plan.decision_supported || "尚未声明研究结论支持的决策")}</div>
+          ${staleMissingAnchor ? `<div class="agent-item-note warning">Resume anchor unavailable; start a new Research Session or use an existing anchor.</div>` : ""}
         </div>
         <div class="agent-actions">
           <button class="mini ghost" type="button" data-research-session-view="${escapeHtml(session.session_id)}">查看</button>
           ${needsHuman ? `<button class="mini primary" type="button" data-research-session-answer="${escapeHtml(session.session_id)}">回答</button>` : ""}
           ${paused ? `<button class="mini" type="button" data-research-session-continue="${escapeHtml(session.session_id)}">继续</button>` : ""}
-          ${!paused && !needsHuman && !terminal ? `<button class="mini ghost" type="button" data-research-session-pause="${escapeHtml(session.session_id)}">暂停</button>` : ""}
+          ${actions.can_pause && !terminal ? `<button class="mini ghost" type="button" data-research-session-pause="${escapeHtml(session.session_id)}">暂停</button>` : ""}
         </div>
       </div>
     `;
@@ -1933,7 +1954,7 @@ function renderResearchSessions(rows = []) {
 }
 
 async function openResearchSession(sessionId) {
-  const payload = await fetchJson(`/api/agent/research/sessions/${encodeURIComponent(sessionId)}?actor_type=human&actor_id=local_user`);
+  const payload = await fetchJson(`/api/agent/researcher/sessions/${encodeURIComponent(sessionId)}?actor_type=human&actor_id=local_user`);
   renderResearchSessionDetail(payload.data || {});
 }
 
@@ -2106,7 +2127,7 @@ async function loadAgentDashboard(options = {}) {
     fetchJson("/api/agent/dashboard?limit=50"),
     fetchJson("/api/agent/audit?limit=300&actor_type=human&actor_id=local_user"),
     fetchJson("/api/agent/event-graph/change-requests?limit=80&actor_type=agent&actor_id=agent_strategy_assistant"),
-    fetchJson("/api/agent/research/sessions?limit=100&actor_type=human&actor_id=local_user"),
+    fetchJson("/api/agent/researcher/sessions?limit=100&actor_type=human&actor_id=local_user"),
     fetchJson("/api/agent/inspection/traces?limit=100&actor_type=human&actor_id=local_user"),
   ]);
   renderAgentDashboard(
@@ -2165,7 +2186,7 @@ document.querySelector(".agent-workbench")?.addEventListener("click", async (eve
     }
     if (researchSessionPause) {
       button.disabled = true;
-      await postAgentAction(`/api/agent/research/sessions/${encodeURIComponent(researchSessionPause)}/status`, {
+      await postAgentAction(`/api/agent/researcher/sessions/${encodeURIComponent(researchSessionPause)}/status`, {
         actor_type: "human", actor_id: "local_user", status: "PAUSED", message: "用户从 AgentMonitor 暂停研究",
       });
       await loadAgentDashboard({ silent: true });
@@ -2173,7 +2194,7 @@ document.querySelector(".agent-workbench")?.addEventListener("click", async (eve
     }
     if (researchSessionContinue) {
       button.disabled = true;
-      await postAgentAction(`/api/agent/research/sessions/${encodeURIComponent(researchSessionContinue)}/continue`, {
+      await postAgentAction(`/api/agent/researcher/sessions/${encodeURIComponent(researchSessionContinue)}/continue`, {
         actor_type: "human", actor_id: "local_user",
       });
       await loadAgentDashboard({ silent: true });
@@ -2183,7 +2204,7 @@ document.querySelector(".agent-workbench")?.addEventListener("click", async (eve
       const answer = prompt("补充信息", "");
       if (answer === null || !answer.trim()) return;
       button.disabled = true;
-      await postAgentAction(`/api/agent/research/sessions/${encodeURIComponent(researchSessionAnswer)}/answer`, {
+      await postAgentAction(`/api/agent/researcher/sessions/${encodeURIComponent(researchSessionAnswer)}/answer`, {
         actor_type: "human", actor_id: "local_user", answer,
       });
       await loadAgentDashboard({ silent: true });

@@ -59,6 +59,7 @@ OPENBB_EQUITY_DAILY_PROVIDERS = tuple(
 DATA_SOURCE_POLICY_LABELS = {
     "EQUITY:1D:BARS": "US Equity · Daily OHLCV",
     "EQUITY:SNAPSHOT:QUOTE": "US Equity · Quote Snapshot",
+    "EQUITY:FUNDAMENTALS:SNAPSHOT": "US Equity · Latest SEC Fundamentals",
     "CRYPTO_SPOT:*:BARS": "Crypto Spot · Historical Bars",
     "CRYPTO:SNAPSHOT:SNAPSHOT": "Crypto · Context Snapshot",
     "POLYMARKET_BINARY:*:PRICE_HISTORY": "Polymarket · Price History",
@@ -77,6 +78,7 @@ DEFAULT_DATA_SOURCE_SETTINGS: dict[str, Any] = {
             "OPENBB:INTRINIO",
         ],
         "EQUITY:SNAPSHOT:QUOTE": ["FINNHUB"],
+        "EQUITY:FUNDAMENTALS:SNAPSHOT": ["SEC"],
         "CRYPTO_SPOT:*:BARS": ["BINANCE"],
         "CRYPTO:SNAPSHOT:SNAPSHOT": ["COINGECKO"],
         "POLYMARKET_BINARY:*:PRICE_HISTORY": ["POLYMARKET"],

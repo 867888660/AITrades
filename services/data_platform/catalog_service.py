@@ -488,7 +488,11 @@ class DatasetCatalogService:
             if row is None:
                 return None
             partition_rows = conn.execute(
-                "SELECT * FROM dataset_partitions WHERE manifest_id = ? ORDER BY partition_id",
+                """
+                SELECT * FROM dataset_partitions
+                WHERE manifest_id = ?
+                ORDER BY partition_key, start_time, partition_id
+                """,
                 (_clean(manifest_id),),
             ).fetchall()
         partitions = tuple(

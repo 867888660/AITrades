@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 from .factor_alpha import FactorSpec
+from .coverage_semantics import range_end_covers_requirement
+from .equity_factor_bridge import dataset_contract, field_is_available, physical_data_types
 from .models import DataRequirement, RequirementDependencyLink, RequirementSet
 from .requirement_service import DataRequirementService, normalize_source_selection_policy
 from .store import DataPlatformStore, json_dumps
@@ -126,7 +128,9 @@ class RequirementCompiler:
                 for item in graph_inputs:
                     variable_name = _clean(item.get("variable_name"))
                     field = _clean(item.get("field") or "close")
-                    dataset = _clean(item.get("dataset") or "bars").lower()
+                    logical_dataset = _clean(item.get("dataset") or "bars").lower()
+                    dataset = self._physical_input_dataset(logical_dataset, field)
+                    contract = dataset_contract(logical_dataset) or {}
                     observations = int(required_history.get(variable_name) or source.get("minimum_observations") or 1)
                     declaration = self._declaration(
                         normalized_context,
@@ -136,9 +140,15 @@ class RequirementCompiler:
                             "data_type": dataset,
                             "frequency": _clean(item.get("frequency") or normalized_context["frequency"]),
                             "time_semantics": (
-                                "EVENT_TIME_AVAILABLE_TIME"
-                                if dataset == "price_history"
-                                else normalized_context["time_semantics"]
+                                str(contract.get("time_semantics") or (
+                                    "EVENT_TIME_AVAILABLE_TIME"
+                                    if dataset == "price_history"
+                                    else normalized_context["time_semantics"]
+                                ))
+                            ),
+                            "point_in_time_policy": str(
+                                contract.get("point_in_time_policy")
+                                or normalized_context["point_in_time_policy"]
                             ),
                             "history_start": _warmup_start(
                                 normalized_context["history_start"],
@@ -224,10 +234,45 @@ class RequirementCompiler:
 
         with self.store.transaction(immediate=True) as conn:
             existing = conn.execute(
-                "SELECT requirement_set_id FROM requirement_sets WHERE fingerprint = ?", (fingerprint,)
+                "SELECT requirement_set_id, status FROM requirement_sets WHERE fingerprint = ?",
+                (fingerprint,),
             ).fetchone()
             if existing:
-                return self.get(str(existing[0]))  # type: ignore[return-value]
+                existing_id = str(existing["requirement_set_id"])
+                existing_result = self.get(existing_id)
+                if existing_result is None:
+                    raise RuntimeError("existing RequirementSet could not be loaded")
+                if str(existing["status"]) == "SUPERSEDED":
+                    current = conn.execute(
+                        """
+                        SELECT requirement_set_id FROM requirement_sets
+                        WHERE project_id = ? AND requirement_set_id <> ?
+                          AND superseded_by_id IS NULL AND status <> 'SUPERSEDED'
+                        ORDER BY set_version DESC LIMIT 1
+                        """,
+                        (project_id, existing_id),
+                    ).fetchone()
+                    if current:
+                        conn.execute(
+                            """
+                            UPDATE requirement_sets
+                            SET status='SUPERSEDED', superseded_by_id=?
+                            WHERE requirement_set_id=?
+                            """,
+                            (existing_id, str(current["requirement_set_id"])),
+                        )
+                    conn.execute(
+                        """
+                        UPDATE requirement_sets
+                        SET status='RESOLVED', superseded_by_id=NULL
+                        WHERE requirement_set_id=?
+                        """,
+                        (existing_id,),
+                    )
+                    return replace(
+                        existing_result, status="RESOLVED", superseded_by_id=None
+                    )
+                return existing_result
             version = int(conn.execute(
                 "SELECT COALESCE(MAX(set_version), 0) + 1 FROM requirement_sets WHERE project_id = ?", (project_id,)
             ).fetchone()[0])
@@ -267,6 +312,29 @@ class RequirementCompiler:
                     (requirement_set_id, str(previous[0])),
                 )
         return self.get(requirement_set_id)  # type: ignore[return-value]
+
+    def _physical_input_dataset(self, logical_dataset: str, field: str) -> str:
+        accepted = physical_data_types(logical_dataset)
+        placeholders = ",".join("?" for _ in accepted)
+        with self.store.connection() as conn:
+            rows = conn.execute(
+                f"""SELECT data_type,fields_json,updated_at
+                    FROM dataset_catalog
+                    WHERE lower(data_type) IN ({placeholders})
+                      AND status='READY' AND quality_status!='FAIL'
+                    ORDER BY updated_at DESC""",
+                accepted,
+            ).fetchall()
+        for row in rows:
+            fields = json.loads(row["fields_json"] or "[]")
+            if field_is_available(
+                logical_dataset,
+                field,
+                physical_data_type=str(row["data_type"]),
+                catalog_fields=fields,
+            ):
+                return str(row["data_type"]).lower()
+        return accepted[0]
 
     @staticmethod
     def _normalize_context(context: Mapping[str, Any]) -> dict[str, Any]:
@@ -422,7 +490,9 @@ class RequirementCompiler:
             for requirement in requirement_set.requirements:
                 for instrument_id in requirement.instrument_ids:
                     row = conn.execute(
-                        """SELECT * FROM dataset_catalog WHERE instrument_id = ? AND data_type = ? AND frequency = ?
+                        """SELECT * FROM dataset_catalog
+                           WHERE instrument_id IN (?, 'equity:CRSP:ALL')
+                             AND data_type = ? AND frequency = ?
                            ORDER BY updated_at DESC LIMIT 1""",
                         (instrument_id, requirement.data_type, requirement.frequency),
                     ).fetchone()
@@ -434,7 +504,15 @@ class RequirementCompiler:
                             reasons.append("DATASET_NOT_READY")
                         if not row["start_time"] or str(row["start_time"]) > str(requirement.history_start):
                             reasons.append("START_NOT_COVERED")
-                        if requirement.history_end and (not row["end_time"] or str(row["end_time"]) < str(requirement.history_end)):
+                        if requirement.history_end and not range_end_covers_requirement(
+                            actual_end=row["end_time"],
+                            required_end=requirement.history_end,
+                            data_type=requirement.data_type,
+                            frequency=requirement.frequency,
+                            source=row["source"],
+                            schema_version=row["schema_version"],
+                            time_semantics=row["time_semantics"],
+                        ):
                             reasons.append("END_NOT_COVERED")
                         if int(row["gap_count"] or 0) > 0:
                             reasons.append("KNOWN_GAPS")

@@ -26,6 +26,12 @@ def main() -> int:
         description="Compute Qlib Alpha158-compatible factors without VWAP from frozen DataTube Manifests."
     )
     parser.add_argument("--manifest-id", action="append", required=True)
+    parser.add_argument(
+        "--instrument-id",
+        action="append",
+        default=[],
+        help="Row-level equity id(s), required for collection Manifests such as CRSP/CIZ; comma-separated values are accepted.",
+    )
     parser.add_argument("--input-bundle-id", default="")
     parser.add_argument("--start-time", default="")
     parser.add_argument("--end-time", default="")
@@ -40,6 +46,7 @@ def main() -> int:
             output_root=args.output_root or None,
         ).run(
             manifest_ids=_manifest_ids(args.manifest_id),
+            instrument_ids=_manifest_ids(args.instrument_id),
             input_bundle_id=args.input_bundle_id,
             start_time=args.start_time,
             end_time=args.end_time,

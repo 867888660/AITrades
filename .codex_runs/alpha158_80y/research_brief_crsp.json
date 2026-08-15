@@ -1,0 +1,22 @@
+{
+  "objective": "Run an exact completed 80-year US-equity research capability test from 1946-01-01 through 2025-12-31 using the READY CRSP/CIZ all-market collection Manifest and Qlib Alpha158-compatible (VWAP excluded), then attempt a formal Research Backtest without flattening the collection into one instrument.",
+  "instrument_scope": ["equity:CRSP:ALL"],
+  "provider": "CRSP",
+  "frequency": "1d",
+  "research_period": {
+    "start": "1946-01-01",
+    "end": "2025-12-31"
+  },
+  "evaluation_plan": {
+    "factor": ["coverage", "rank_ic", "quantile_return"],
+    "alpha": ["rank_ic", "decay", "membership_turnover", "regime_stability"],
+    "research_backtest": ["annualized_return", "max_drawdown", "sharpe_ratio", "trade_turnover", "cost_adjusted_return"]
+  },
+  "constraints": {
+    "long_only": true,
+    "leverage": false,
+    "max_turnover": null
+  },
+  "benchmark": "equal_weight_universe",
+  "idempotency_key": "alpha158-without-vwap-crsp-all-19460101-20251231-v1"
+}

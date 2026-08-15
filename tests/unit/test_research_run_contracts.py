@@ -257,6 +257,33 @@ class ResearchRunContractsTest(unittest.TestCase):
             for item in checks
         ))
 
+    def test_collection_catalog_id_is_not_a_tradable_universe_member(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            service = ResearchRunPreviewService(
+                DataPlatformStore(Path(root) / "metadata.db")
+            )
+            _closure, checks = service._execution_closure(
+                "FACTOR_EVALUATION",
+                {
+                    "universe_snapshot_id": "snapshot_crsp_collection",
+                    "actual_instrument_ids": ["equity:CRSP:ALL"],
+                    "resolved_instrument_tuples": [],
+                    "factor_definitions": [],
+                    "alpha_definitions": [],
+                },
+                {
+                    "evaluation_spec": {
+                        "horizons": [1],
+                        "minimum_cross_section_size": 1,
+                    }
+                },
+            )
+        self.assertTrue(any(
+            str(item.code) == "COLLECTION_UNIVERSE_NOT_EXPANDED"
+            and item.status == ReadinessStatus.BLOCKED
+            for item in checks
+        ))
+
     def test_alpha_evaluation_and_research_backtest_require_distinct_contracts(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             service = ResearchRunPreviewService(

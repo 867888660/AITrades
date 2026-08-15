@@ -375,6 +375,11 @@ class AlphaEngine:
         if spec.universe_snapshot_id and snapshot_id != spec.universe_snapshot_id:
             raise ValueError("AlphaSpec universe_snapshot_id does not match the supplied snapshot")
         universe_members = set(getattr(universe_snapshot, "actual_instrument_ids", ()) or ())
+        selection_inputs = dict(getattr(universe_snapshot, "selection_inputs", {}) or {})
+        dynamic_membership = bool(selection_inputs.get("dynamic_membership"))
+        from .universe_service import UniverseMembershipIndex
+
+        membership_index = UniverseMembershipIndex(universe_snapshot)
         factor_maps: Dict[str, Dict[str, Dict[str, float]]] = {}
         available_maps: Dict[str, Dict[str, str]] = {}
         all_times: set[str] = set()
@@ -406,18 +411,25 @@ class AlphaEngine:
 
         signals: list[Dict[str, Any]] = []
         for as_of_time in sorted(all_times, key=_parse_time):
+            active_members = universe_members
+            if dynamic_membership:
+                active_members = membership_index.active_at(as_of_time)
             component_values: list[tuple[AlphaComponent, Dict[str, float]]] = []
             for component in spec.components:
                 values = factor_maps[component.factor_name].get(as_of_time, {})
-                if universe_members:
-                    values = {item: value for item, value in values.items() if item in universe_members}
+                if dynamic_membership or active_members:
+                    values = {item: value for item, value in values.items() if item in active_members}
                 component_values.append((component, values))
             if not component_values:
                 continue
             instruments = set(component_values[0][1])
             for _, values in component_values[1:]:
                 instruments &= set(values)
-            denominator = len(universe_members) if universe_members else max((len(values) for _, values in component_values), default=0)
+            denominator = (
+                len(active_members)
+                if dynamic_membership or active_members
+                else max((len(values) for _, values in component_values), default=0)
+            )
             coverage = len(instruments) / max(1, denominator)
             if len(instruments) < spec.minimum_cross_section_size or coverage < spec.minimum_coverage:
                 continue
@@ -446,6 +458,7 @@ class AlphaEngine:
                 "coverage": coverage,
                 "quality_status": "PASS",
                 "universe_snapshot_id": snapshot_id or spec.universe_snapshot_id,
+                "active_universe_size": denominator,
             })
         return signals
 

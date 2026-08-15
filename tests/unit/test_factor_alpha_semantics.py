@@ -1,11 +1,49 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 from services.data_platform import AlphaComponent, AlphaEngine, AlphaSpec, FactorEngine, FactorSpec
 
 
 class FactorAlphaSemanticsTest(unittest.TestCase):
+    def test_dynamic_equity_membership_excludes_not_yet_listed_and_delisted_names(self) -> None:
+        snapshot = SimpleNamespace(
+            universe_snapshot_id="universe_snapshot_dynamic",
+            actual_instrument_ids=("A", "B"),
+            selection_inputs={
+                "dynamic_membership": True,
+                "membership_intervals": {
+                    "A": {"eligible_from": "2025-01-01", "eligible_to": "2025-01-15"},
+                    "B": {"eligible_from": "2025-01-16", "eligible_to": "2025-12-31"},
+                },
+            },
+        )
+        values = {
+            "size": {
+                "A": [
+                    {"available_time": "2025-01-10T21:00:00+00:00", "value": 1.0},
+                    {"available_time": "2025-01-20T21:00:00+00:00", "value": 1.0},
+                ],
+                "B": [
+                    {"available_time": "2025-01-10T21:00:00+00:00", "value": 2.0},
+                    {"available_time": "2025-01-20T21:00:00+00:00", "value": 2.0},
+                ],
+            }
+        }
+        spec = AlphaSpec(
+            "dynamic_size",
+            "1.0.0",
+            (AlphaComponent("size", 1.0),),
+            universe_snapshot_id="universe_snapshot_dynamic",
+            minimum_cross_section_size=1,
+        )
+
+        signals = AlphaEngine().build_signals(spec, values, universe_snapshot=snapshot)
+
+        self.assertEqual([{"A"}, {"B"}], [set(item["raw_scores"]) for item in signals])
+        self.assertEqual([1, 1], [item["active_universe_size"] for item in signals])
+
     def test_cross_sectional_ties_use_average_rank(self) -> None:
         transformed = AlphaEngine._transform({"A": 1.0, "B": 2.0, "C": 2.0}, "CS_RANK")
         self.assertAlmostEqual(1 / 3, transformed["A"])

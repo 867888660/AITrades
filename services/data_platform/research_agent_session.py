@@ -10,6 +10,13 @@ from typing import Any
 from .research_agent_authorization import DEFAULT_RESEARCH_OPERATIONS
 from .research_context_resolver import ResearchContextResolver
 from .research_control_plane import ResearchControlPlane
+from .research_semantics import (
+    ResearchContractService,
+    ResearchSemanticError,
+    build_research_contract,
+    infer_asset_class,
+    infer_research_stop_at,
+)
 from .store import DataPlatformStore, json_dumps, utc_now
 
 
@@ -67,6 +74,7 @@ _BRIEF_FIELDS = {
     "evaluation_metrics",
     "constraints",
     "benchmark",
+    "universe_policy",
 }
 
 
@@ -86,35 +94,96 @@ def _today() -> str:
 
 
 def normalize_research_brief(payload: dict[str, Any]) -> dict[str, Any]:
-    objective = _clean(payload.get("objective") or payload.get("goal"))
+    aligned = payload.get("aligned_research_intent") or payload.get("alignment") or {}
+    aligned = dict(aligned) if isinstance(aligned, dict) else {}
+    aligned_scope = dict(aligned.get("scope") or {})
+    objective = _clean(
+        payload.get("objective") or payload.get("goal") or aligned.get("question")
+    )
     if not objective:
         raise ValueError("objective is required")
-    instrument_scope = payload.get("instrument_scope")
+    instrument_scope = payload.get("instrument_scope") or aligned_scope.get("instrument_scope")
     if not instrument_scope:
-        instrument_scope = "BTCUSDT spot" if "BTC" in objective.upper() else ""
-    metrics = payload.get("evaluation_metrics") or [
-        "annualized_return",
-        "max_drawdown",
-        "sharpe_ratio",
-        "turnover",
-        "cost_adjusted_return",
-    ]
-    period = payload.get("research_period") or {"start": "2021-01-01", "end": _today()}
+        objective_upper = objective.upper()
+        for symbol in ("BTC", "ETH", "SOL"):
+            if symbol in objective_upper:
+                instrument_scope = f"{symbol}USDT spot"
+                break
+        else:
+            instrument_scope = ""
+    asset_class = infer_asset_class(objective, instrument_scope, _clean(payload.get("provider")))
+    scope_text = json_dumps(instrument_scope).upper()
+    if _clean(payload.get("provider")):
+        provider = _clean(payload.get("provider")).upper()
+    elif "CRSP" in scope_text:
+        provider = "CRSP"
+    elif asset_class == "US_EQUITY":
+        provider = "OPENBB"
+    elif asset_class == "POLYMARKET_BINARY":
+        provider = "POLYMARKET"
+    elif asset_class == "CRYPTO_SPOT":
+        provider = "BINANCE"
+    else:
+        provider = ""
+    supplied_evaluation = dict(dict(payload.get("research_contract") or {}).get("evaluation") or {})
+    explicit_stop = _clean(
+        aligned.get("stop_at")
+        or payload.get("stop_at")
+        or dict(payload.get("research_contract") or {}).get("stop_at")
+    ).upper()
+    stop_at = {
+        "FACTOR_EVALUATION": "FACTOR",
+        "ALPHA_EVALUATION": "ALPHA",
+        "RESEARCH_BACKTEST": "PORTFOLIO_EVIDENCE",
+        "UNIVERSE_DESIGN": "UNIVERSE",
+        "STRATEGY": "PORTFOLIO_EVIDENCE",
+        "PORTFOLIO": "PORTFOLIO_EVIDENCE",
+    }.get(explicit_stop, explicit_stop)
+    if not stop_at:
+        stop_at = infer_research_stop_at(objective, _clean(supplied_evaluation.get("run_type")))
+    if stop_at == "UNIVERSE":
+        default_metrics = ["eligible_count", "coverage"]
+    elif stop_at in {"FACTOR", "ALPHA"}:
+        default_metrics = ["rank_ic" if asset_class == "US_EQUITY" else "ic"]
+    elif stop_at == "PORTFOLIO_EVIDENCE":
+        default_metrics = [
+            "annualized_return", "max_drawdown", "sharpe_ratio",
+            "turnover", "cost_adjusted_return",
+        ]
+    else:
+        default_metrics = []
+    metrics = payload.get("evaluation_metrics") or default_metrics
+    period = (
+        payload.get("research_period")
+        or aligned_scope.get("research_period")
+        or {"start": "2021-01-01", "end": _today()}
+    )
     if isinstance(period, str):
         period = {"label": period}
-    constraints = dict(payload.get("constraints") or {})
-    constraints.setdefault("long_only", True)
-    constraints.setdefault("leverage", False)
-    constraints.setdefault("max_turnover", None)
+    constraints = dict(payload.get("constraints") or aligned_scope.get("constraints") or {})
+    if stop_at == "PORTFOLIO_EVIDENCE":
+        constraints.setdefault("long_only", True)
+        constraints.setdefault("leverage", False)
+        constraints.setdefault("max_turnover", None)
     return {
         "objective": objective,
         "instrument_scope": instrument_scope,
-        "provider": _clean(payload.get("provider") or ("POLYMARKET" if "POLYMARKET" in objective.upper() else "BINANCE")).upper(),
-        "frequency": _clean(payload.get("frequency") or "1h"),
+        "provider": provider,
+        "frequency": _clean(
+            payload.get("frequency")
+            or aligned_scope.get("frequency")
+            or ("1d" if asset_class == "US_EQUITY" else "1h")
+        ),
         "research_period": period,
         "evaluation_metrics": list(metrics),
         "constraints": constraints,
-        "benchmark": _clean(payload.get("benchmark") or "buy_and_hold"),
+        "benchmark": _clean(
+            payload.get("benchmark")
+            or ("buy_and_hold" if stop_at == "PORTFOLIO_EVIDENCE" else "NONE")
+        ),
+        "universe_policy": dict(
+            payload.get("universe_policy") or aligned_scope.get("universe_policy") or {}
+        ),
         "iteration_budget": {
             "max_runs": DEFAULT_SESSION_POLICY["max_runs"],
             "max_runtime_minutes": DEFAULT_SESSION_POLICY["max_runtime_seconds"] // 60,
@@ -130,8 +199,51 @@ class ResearchAgentSessionService:
         self.control = ResearchControlPlane(store)
         self.resolver = ResearchContextResolver(store)
 
-    def start(self, payload: dict[str, Any], *, created_by: str = "local_user") -> dict[str, Any]:
+    @staticmethod
+    def _semantic_payload(
+        payload: dict[str, Any],
+        brief: dict[str, Any],
+        *,
+        require_alignment: bool,
+    ) -> dict[str, Any]:
+        if require_alignment or payload.get("aligned_research_intent") or payload.get("alignment"):
+            return payload
+        supplied_contract = dict(payload.get("research_contract") or {})
+        if (
+            payload.get("stop_at")
+            or supplied_contract.get("stop_at")
+            or dict(supplied_contract.get("evaluation") or {}).get("run_type")
+        ):
+            return payload
+        # Compatibility for the legacy /api/agent/research/sessions surface.
+        # The researcher facade never takes this branch. Existing callers may
+        # still create a generic Session from a goal while they migrate to
+        # ALIGN -> START.
+        adapted = dict(payload)
+        adapted["aligned_research_intent"] = {
+            "question": brief["objective"],
+            "stop_at": "FACTOR",
+            "evidence_profile": "STANDARD",
+            "assumptions": ["Legacy Session compatibility: implicit Factor stopping point"],
+            "out_of_scope": ["Alpha construction", "portfolio backtest", "strategy creation"],
+        }
+        return adapted
+
+    def start(
+        self,
+        payload: dict[str, Any],
+        *,
+        created_by: str = "local_user",
+        require_alignment: bool = False,
+    ) -> dict[str, Any]:
         brief = normalize_research_brief(payload)
+        semantic_payload = self._semantic_payload(
+            payload, brief, require_alignment=require_alignment
+        )
+        # Validate the user-visible research boundary before creating any
+        # Project, internal authorization, or audit IR. Missing Universe choices
+        # are research questions for the Agent and user, not backend defaults.
+        build_research_contract(brief, semantic_payload)
         title = _clean(payload.get("title")) or brief["objective"][:96]
         idempotency_key = self._start_idempotency_key(payload, brief, title, created_by)
         with _START_LOCK:
@@ -143,6 +255,10 @@ class ResearchAgentSessionService:
                         "for a different Research Brief"
                     )
                 grant = self.control.get_grant(_clean(existing.get("internal_grant_id")))
+                ResearchContractService(self.store).ensure_for_session(
+                    existing["session_id"], existing["project_id"], existing["brief"], semantic_payload
+                )
+                existing = self.get(existing["session_id"]) or existing
                 existing["resolved_grant_scope"] = dict((grant or {}).get("scope") or {})
                 existing["idempotency_reused"] = True
                 return existing
@@ -160,6 +276,10 @@ class ResearchAgentSessionService:
                 idempotency_key=idempotency_key,
                 created_by=created_by,
             )
+            ResearchContractService(self.store).ensure_for_session(
+                session["session_id"], project["project_id"], brief, semantic_payload
+            )
+            session = self.get(session["session_id"]) or session
         # Echo back the resolved grant scope so agents see exactly what was
         # authorized; this makes silent truncation or scope mismatches visible
         # at START instead of three steps later at write time.
@@ -174,9 +294,26 @@ class ResearchAgentSessionService:
         payload: dict[str, Any] | None = None,
         *,
         created_by: str = "local_user",
+        require_alignment: bool = False,
     ) -> dict[str, Any]:
         payload = dict(payload or {})
         context = self.resolver.resolve(anchor_type, anchor_id)
+        resolution_status = _clean(context.get("resolution_status")).upper()
+        if resolution_status == "NOT_FOUND":
+            raise ResearchSemanticError(
+                "RESEARCH_RESUME_ANCHOR_NOT_FOUND",
+                f"Research resume anchor not found: {_clean(anchor_type).upper()}:{_clean(anchor_id)}",
+                context={
+                    "anchor_type": _clean(anchor_type).upper(),
+                    "anchor_id": _clean(anchor_id),
+                },
+            )
+        if resolution_status != "RESOLVED" and not list(context.get("candidates") or []):
+            raise ResearchSemanticError(
+                "RESEARCH_RESUME_CONTEXT_UNRESOLVABLE",
+                "Research resume anchor does not identify a selectable Research Project",
+                context=context,
+            )
         project_id = _clean(context.get("project_id"))
         base_brief, resume_brief_source = self._resume_base_brief(
             anchor_type, anchor_id, project_id
@@ -190,6 +327,9 @@ class ResearchAgentSessionService:
             objective = _clean((context.get("project") or {}).get("objective")) or f"Resume research from {anchor_type}:{anchor_id}"
         merged_brief["objective"] = objective
         brief = normalize_research_brief(merged_brief)
+        semantic_payload = self._semantic_payload(
+            payload, brief, require_alignment=require_alignment
+        )
         if context.get("resolution_status") != "RESOLVED":
             return self._insert_session(
                 entry_mode="RESUME",
@@ -207,6 +347,7 @@ class ResearchAgentSessionService:
                 },
                 created_by=created_by,
             )
+        build_research_contract(brief, semantic_payload)
         grant = self._create_internal_research_budget(project_id, brief, created_by=created_by)
         baseline = _clean(context.get("baseline_run_id"))
         session = self._insert_session(
@@ -222,6 +363,10 @@ class ResearchAgentSessionService:
             internal_grant_id=grant["grant_id"],
             created_by=created_by,
         )
+        ResearchContractService(self.store).ensure_for_session(
+            session["session_id"], project_id, brief, semantic_payload
+        )
+        session = self.get(session["session_id"]) or session
         session["resolved_grant_scope"] = dict(grant.get("scope") or {})
         session["resume_brief_source"] = resume_brief_source
         return session
@@ -250,6 +395,9 @@ class ResearchAgentSessionService:
             latest_context = self.resolver.resolve("PROJECT", project_id)
             if latest_context.get("resolution_status") == "RESOLVED":
                 result["context"] = latest_context
+        contract = ResearchContractService(self.store).active_for_session(session_id)
+        if contract:
+            result["research_contract"] = contract
         return result
 
     def _get_by_idempotency_key(self, idempotency_key: str) -> dict[str, Any] | None:
@@ -426,7 +574,15 @@ class ResearchAgentSessionService:
         with self.store.transaction(immediate=True) as conn:
             row = conn.execute("SELECT status FROM research_agent_sessions WHERE session_id=?", (_clean(session_id),)).fetchone()
             if not row:
-                raise ValueError("research session not found")
+                raise ResearchSemanticError(
+                    "RESEARCH_SESSION_NOT_FOUND", "Research Session not found"
+                )
+            if str(row["status"]).upper() in TERMINAL_SESSION_STATES:
+                raise ResearchSemanticError(
+                    "RESEARCH_SESSION_TERMINAL",
+                    "A terminal Research Session cannot request human input",
+                    context={"session_id": _clean(session_id), "status": str(row["status"])},
+                )
             conn.execute(
                 "UPDATE research_agent_sessions SET status='NEED_HUMAN', resume_state=?, pending_question_json=?, updated_at=? WHERE session_id=?",
                 (str(row["status"]), json_dumps(question_payload), now, _clean(session_id)),
@@ -436,8 +592,16 @@ class ResearchAgentSessionService:
 
     def answer(self, session_id: str, answer: Any) -> dict[str, Any]:
         current = self.get(session_id, include_events=False, include_iterations=False)
-        if not current or current["status"] != "NEED_HUMAN":
-            raise ValueError("research session is not waiting for human input")
+        if not current:
+            raise ResearchSemanticError(
+                "RESEARCH_SESSION_NOT_FOUND", "Research Session not found"
+            )
+        if current["status"] != "NEED_HUMAN":
+            raise ResearchSemanticError(
+                "RESEARCH_SESSION_NOT_WAITING_FOR_INPUT",
+                "Research Session is not waiting for human input",
+                context={"session_id": _clean(session_id), "status": current["status"]},
+            )
         question = dict(current.get("pending_question") or {})
         context_update: dict[str, Any] | None = None
         internal_grant_id = _clean(current.get("internal_grant_id"))
@@ -450,10 +614,18 @@ class ResearchAgentSessionService:
                 if isinstance(item, dict) and _clean(item.get("project_id"))
             }
             if candidates and selected_project_id not in candidates:
-                raise ValueError("answer must select one of the candidate project_id values")
+                raise ResearchSemanticError(
+                    "RESEARCH_ANSWER_PROJECT_INVALID",
+                    "Answer must select one of the candidate project_id values",
+                    context={"candidate_project_ids": sorted(candidates)},
+                )
             context_update = self.resolver.resolve("PROJECT", selected_project_id)
             if context_update.get("resolution_status") != "RESOLVED":
-                raise ValueError("answer does not identify an existing Research Project")
+                raise ResearchSemanticError(
+                    "RESEARCH_ANSWER_PROJECT_NOT_FOUND",
+                    "Answer does not identify an existing Research Project",
+                    context={"project_id": selected_project_id},
+                )
             project_id = selected_project_id
             internal = self._create_internal_research_budget(
                 project_id, dict(current.get("brief") or {}), created_by="local_user"

@@ -7,23 +7,28 @@ import os
 import shutil
 import sys
 import tempfile
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from services.data_platform import FrozenManifestData
+from services.data_platform.factor_pack import (
+    ALPHA158_NO_VWAP_DISPLAY_NAME,
+    ALPHA158_NO_VWAP_EXCLUDED_FACTORS,
+    ALPHA158_NO_VWAP_FACTOR_COUNT,
+    ALPHA158_NO_VWAP_MINIMUM_HISTORY_BARS,
+    ALPHA158_NO_VWAP_PACK_ID,
+    ALPHA158_NO_VWAP_REQUIRED_FIELDS,
+)
 from services.data_platform.store import BASE_DIR, DataPlatformStore, get_default_store, json_dumps
 
 
-IMPORTER_VERSION = "datatube-qlib-alpha158.v1"
+IMPORTER_VERSION = "datatube-qlib-alpha158.v2"
 FACTOR_CACHE_SCHEMA_VERSION = "factor-pack-cache.v1"
 FACTOR_FRAME_SCHEMA_VERSION = "factor-frame.wide.v1"
-ALPHA158_NO_VWAP_PACK_ID = "qlib.alpha158_without_vwap"
-ALPHA158_NO_VWAP_DISPLAY_NAME = "Qlib Alpha158-compatible (VWAP excluded)"
-ALPHA158_NO_VWAP_FACTOR_COUNT = 157
-MINIMUM_HISTORY_BARS = 60
-REQUIRED_FIELDS = ("open", "high", "low", "close", "volume")
-EXCLUDED_FACTORS = ("VWAP0",)
+MINIMUM_HISTORY_BARS = ALPHA158_NO_VWAP_MINIMUM_HISTORY_BARS
+REQUIRED_FIELDS = ALPHA158_NO_VWAP_REQUIRED_FIELDS
+EXCLUDED_FACTORS = ALPHA158_NO_VWAP_EXCLUDED_FACTORS
 
 
 def _sha256_file(path: Path) -> str:
@@ -113,6 +118,9 @@ def _normalize_rows(
             raise ValueError("Alpha158 import found an empty instrument_id")
         seen_dates: set[str] = set()
         rows: list[dict[str, Any]] = []
+        issue_counts: dict[str, int] = {}
+        first_issue_dates: dict[str, str] = {}
+        last_issue_dates: dict[str, str] = {}
         for raw in raw_rows:
             event_date = _date_text(
                 raw.get("bar_start_time") or raw.get("event_time") or raw.get("date")
@@ -120,17 +128,35 @@ def _normalize_rows(
             if event_date in seen_dates:
                 raise ValueError(f"duplicate daily bar for {instrument_id}: {event_date}")
             seen_dates.add(event_date)
-            values = {
-                field: _finite_number(
-                    raw.get(field), field=field, instrument_id=instrument_id, event_date=event_date
-                )
-                for field in REQUIRED_FIELDS
-            }
+            values: dict[str, float] = {}
+            invalid_row = False
+            for field in REQUIRED_FIELDS:
+                try:
+                    values[field] = _finite_number(
+                        raw.get(field), field=field, instrument_id=instrument_id, event_date=event_date
+                    )
+                except ValueError:
+                    issue_counts[field] = issue_counts.get(field, 0) + 1
+                    first_issue_dates.setdefault(field, event_date)
+                    last_issue_dates[field] = event_date
+                    invalid_row = True
+            if invalid_row:
+                continue
             high = values["high"]
             low = values["low"]
             if high < low or not low <= values["open"] <= high or not low <= values["close"] <= high:
-                raise ValueError(f"invalid OHLC range for {instrument_id}: {event_date}")
+                issue_counts["ohlc_range"] = issue_counts.get("ohlc_range", 0) + 1
+                first_issue_dates.setdefault("ohlc_range", event_date)
+                last_issue_dates["ohlc_range"] = event_date
+                continue
             rows.append({"date": event_date, **values})
+        if issue_counts:
+            raise ValueError(
+                f"{instrument_id} does not satisfy Alpha158 OHLCV coverage; "
+                f"invalid_rows_by_field={dict(sorted(issue_counts.items()))}; "
+                f"first_invalid_date_by_field={dict(sorted(first_issue_dates.items()))}; "
+                f"last_invalid_date_by_field={dict(sorted(last_issue_dates.items()))}"
+            )
         rows.sort(key=lambda item: item["date"])
         if len(rows) < MINIMUM_HISTORY_BARS:
             raise ValueError(
@@ -305,20 +331,26 @@ class Alpha158ImportService:
         )
         self.frozen_factory = frozen_factory
 
-    def _load_inputs(
-        self, manifest_ids: Sequence[str]
-    ) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]], list[str]]:
+    def _resolve_inputs(
+        self,
+        manifest_ids: Sequence[str],
+        *,
+        instrument_ids: Sequence[str] = (),
+    ) -> tuple[list[tuple[Any, Any, str, bool]], list[dict[str, Any]], list[str]]:
         unique_ids = sorted({str(item).strip() for item in manifest_ids if str(item).strip()})
         if not unique_ids:
             raise ValueError("manifest_ids is required")
-        rows_by_instrument: dict[str, list[dict[str, Any]]] = {}
+        resolved: list[tuple[Any, Any, str, bool]] = []
         descriptors: list[dict[str, Any]] = []
         adjustments: set[str] = set()
+        selected_instruments = sorted({str(item).strip() for item in instrument_ids if str(item).strip()})
         for manifest_id in unique_ids:
             frozen = self.frozen_factory(self.store, manifest_id)
             descriptor = dict(frozen.descriptor())
-            if descriptor.get("schema_version") != "bars.v1":
-                raise ValueError(f"Alpha158 requires bars.v1 Manifest: {manifest_id}")
+            if descriptor.get("schema_version") not in {"bars.v1", "bars_daily.v2"}:
+                raise ValueError(
+                    f"Alpha158 requires bars.v1 or bars_daily.v2 Manifest: {manifest_id}"
+                )
             catalog = frozen.catalog.get_catalog(frozen.dataset_id)
             if catalog is None:
                 raise ValueError(f"catalog entry is missing for Manifest: {manifest_id}")
@@ -327,11 +359,15 @@ class Alpha158ImportService:
             instrument_id = str(catalog.instrument_id).strip()
             if not instrument_id.lower().startswith("equity:"):
                 raise ValueError(f"Alpha158 stock MVP requires equity instruments: {instrument_id}")
-            if instrument_id in rows_by_instrument:
-                raise ValueError(f"multiple Manifests bind the same instrument: {instrument_id}")
-            rows_by_instrument[instrument_id] = frozen.read_rows()
+            is_collection = bool(catalog.metadata.get("full_import")) or instrument_id.upper().endswith(":ALL")
+            if is_collection and not selected_instruments:
+                raise ValueError(
+                    "Alpha158 collection Manifest requires explicit row-level instrument_ids; "
+                    "the Catalog collection id must not be treated as one security"
+                )
             adjustment = str(catalog.adjustment or "NONE").upper()
             adjustments.add(adjustment)
+            resolved.append((frozen, catalog, instrument_id, is_collection))
             descriptors.append(
                 {
                     **descriptor,
@@ -339,13 +375,60 @@ class Alpha158ImportService:
                     "source": str(catalog.source),
                     "frequency": str(catalog.frequency),
                     "adjustment": adjustment,
+                    "instrument_scope": "COLLECTION" if is_collection else "SINGLE",
+                    "selected_instrument_ids": selected_instruments if is_collection else [instrument_id],
                 }
             )
         if len(adjustments) != 1:
             raise ValueError(
                 f"Alpha158 input Manifests must use one adjustment policy, got {sorted(adjustments)}"
             )
-        return _normalize_rows(rows_by_instrument), descriptors, sorted(adjustments)
+        return resolved, descriptors, sorted(adjustments)
+
+    def _load_inputs(
+        self,
+        manifest_ids: Sequence[str],
+        *,
+        instrument_ids: Sequence[str] = (),
+        start_time: str = "",
+        end_time: str = "",
+        resolved_inputs: Sequence[tuple[Any, Any, str, bool]] | None = None,
+        descriptors: Sequence[Mapping[str, Any]] | None = None,
+        adjustments: Sequence[str] | None = None,
+    ) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]], list[str]]:
+        selected_instruments = sorted({str(item).strip() for item in instrument_ids if str(item).strip()})
+        if resolved_inputs is None or descriptors is None or adjustments is None:
+            resolved_inputs, descriptor_values, adjustment_values = self._resolve_inputs(
+                manifest_ids, instrument_ids=selected_instruments
+            )
+            descriptors = descriptor_values
+            adjustments = adjustment_values
+        rows_by_instrument: dict[str, list[dict[str, Any]]] = {}
+        for frozen, _catalog, instrument_id, is_collection in resolved_inputs:
+            rows = frozen.iter_rows(
+                columns=["instrument_id", "bar_start_time", *REQUIRED_FIELDS],
+                start_time=start_time or None,
+                end_time=end_time or None,
+                instrument_ids=selected_instruments if is_collection else None,
+            )
+            seen_from_manifest: set[str] = set()
+            for row in rows:
+                row_instrument = str(row.get("instrument_id") or instrument_id).strip()
+                if selected_instruments and row_instrument not in selected_instruments:
+                    continue
+                rows_by_instrument.setdefault(row_instrument, []).append(row)
+                seen_from_manifest.add(row_instrument)
+            if not is_collection:
+                if instrument_id in seen_from_manifest and len(seen_from_manifest) > 1:
+                    raise ValueError(
+                        f"single-instrument Manifest contains multiple instruments: {frozen.manifest_id}"
+                    )
+            missing_selected = set(selected_instruments) - seen_from_manifest if is_collection else set()
+            if missing_selected:
+                raise ValueError(
+                    f"collection Manifest has no rows for selected instruments: {sorted(missing_selected)}"
+                )
+        return _normalize_rows(rows_by_instrument), [dict(item) for item in descriptors], list(adjustments)
 
     @staticmethod
     def _cache_id(
@@ -353,6 +436,7 @@ class Alpha158ImportService:
         descriptors: Sequence[Mapping[str, Any]],
         adjustment: str,
         input_bundle_id: str,
+        instrument_ids: Sequence[str],
         start_time: str,
         end_time: str,
         qlib_version: str,
@@ -362,6 +446,7 @@ class Alpha158ImportService:
             "importer_version": IMPORTER_VERSION,
             "qlib_version": qlib_version,
             "input_bundle_id": str(input_bundle_id or ""),
+            "instrument_ids": sorted({str(item) for item in instrument_ids}),
             "start_time": str(start_time or ""),
             "end_time": str(end_time or ""),
             "adjustment": adjustment,
@@ -411,20 +496,30 @@ class Alpha158ImportService:
         *,
         manifest_ids: Sequence[str],
         input_bundle_id: str = "",
+        instrument_ids: Sequence[str] = (),
         start_time: str = "",
         end_time: str = "",
         force: bool = False,
     ) -> dict[str, Any]:
-        rows_by_instrument, descriptors, adjustments = self._load_inputs(manifest_ids)
-        _, _, _, qlib_version = _load_qlib_components()
         requested_start = date.fromisoformat(start_time[:10]).isoformat() if start_time else ""
         requested_end = date.fromisoformat(end_time[:10]).isoformat() if end_time else ""
         if requested_start and requested_end and requested_start > requested_end:
             raise ValueError("start_time must not be after end_time")
+        # Alpha158 has rolling windows up to 60 sessions. Keep a conservative
+        # calendar overlap while still pushing the 80-year range into Parquet.
+        read_start = (
+            (date.fromisoformat(requested_start) - timedelta(days=120)).isoformat()
+            if requested_start else ""
+        )
+        resolved_inputs, descriptors, adjustments = self._resolve_inputs(
+            manifest_ids, instrument_ids=instrument_ids
+        )
+        _, _, _, qlib_version = _load_qlib_components()
         cache_id = self._cache_id(
             descriptors=descriptors,
             adjustment=adjustments[0],
             input_bundle_id=input_bundle_id,
+            instrument_ids=instrument_ids,
             start_time=requested_start,
             end_time=requested_end,
             qlib_version=qlib_version,
@@ -434,6 +529,16 @@ class Alpha158ImportService:
             cached = self._read_valid_cache(cache_dir, cache_id)
             if cached:
                 return cached
+
+        rows_by_instrument, _descriptors, _adjustments = self._load_inputs(
+            manifest_ids,
+            instrument_ids=instrument_ids,
+            start_time=read_start,
+            end_time=requested_end,
+            resolved_inputs=resolved_inputs,
+            descriptors=descriptors,
+            adjustments=adjustments,
+        )
 
         self.output_root.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=f".{cache_id}.", dir=self.output_root))
@@ -471,6 +576,7 @@ class Alpha158ImportService:
                     "adjustment": adjustments[0],
                 },
                 "input_bundle_id": str(input_bundle_id or ""),
+                "instrument_ids": sorted({str(item) for item in instrument_ids}),
                 "input_manifests": descriptors,
                 "requested_range": {"start_time": requested_start, "end_time": requested_end},
                 "engine": {

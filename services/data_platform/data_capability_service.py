@@ -114,6 +114,18 @@ class ResearchDataCapabilityService:
 
         providers.extend([
             {
+                "id": "SEC", "label": "SEC EDGAR", "gateway": "DATATUBE",
+                "configured": bool(self.settings.get("sec_edgar_user_agent")), "online": True,
+                "discovery": True, "historical": False,
+                "configuration_keys": ["sec_edgar_user_agent"],
+                "description": "Latest filing metadata and XBRL Company Facts; online reads remain separate from canonical PIT Manifests.",
+                "markets": [{
+                    "id": "EQUITY_FUNDAMENTALS", "label": "US Equity Fundamentals", "asset_type": "EQUITY",
+                    "search_category": "sec_companyfacts", "dataset_types": ["FUNDAMENTALS"],
+                    "frequencies": ["filing_event"], "prepare_supported": False, "search_defaults": {},
+                }],
+            },
+            {
                 "id": "FINNHUB", "label": "Finnhub", "gateway": "DATATUBE",
                 "configured": bool(self.settings.get("active_finnhub_api_key")), "online": True,
                 "discovery": True, "historical": False,
@@ -155,14 +167,28 @@ class ResearchDataCapabilityService:
         }
 
     def can_prepare(self, instrument_id: str, data_type: str, frequency: str) -> bool:
-        parts = str(instrument_id or "").split(":")
+        raw_instrument_id = str(instrument_id or "").strip()
+        parts = raw_instrument_id.split(":")
         asset_class = parts[0].lower() if parts else ""
         venue = parts[1].upper() if len(parts) > 1 else ""
         if asset_class == "crypto_spot" and venue == "BINANCE" and str(data_type).lower() == "bars":
             return str(frequency).lower() in BINANCE_INTERVALS
         if asset_class == "polymarket_binary" and venue == "POLYMARKET" and str(data_type).lower() == "price_history":
             return str(frequency).lower() in POLYMARKET_INTERVALS
-        if asset_class == "equity" and str(frequency).lower() == "1d":
+        # Researcher briefs intentionally accept bare US-equity tickers such
+        # as AAPL. They are routed through OpenBB with a default venue later;
+        # treating them as unpreparable leaves Experiments in PREPARING_DATA
+        # forever even though the controlled OpenBB adapter supports them.
+        bare_equity_symbol = (
+            bool(raw_instrument_id)
+            and ":" not in raw_instrument_id
+            and raw_instrument_id.replace(".", "").replace("-", "").isalnum()
+        )
+        if (
+            (asset_class == "equity" or bare_equity_symbol)
+            and str(data_type).lower() == "bars"
+            and str(frequency).lower() == "1d"
+        ):
             return any(
                 provider.get("gateway") == "OPENBB" and any(m.get("prepare_supported") for m in provider.get("markets", []))
                 for provider in self.describe()["providers"]

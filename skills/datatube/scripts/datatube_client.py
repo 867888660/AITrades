@@ -12,11 +12,11 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-# Force UTF-8 stdout to handle Chinese labels in capabilities/worker-status
-# responses on Windows; without this, GBK consoles mangle UTF-8 bytes.
-if sys.stdout.encoding.lower() not in {"utf-8", "utf8"}:
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+# Keep both output streams UTF-8. PowerShell merges stdout and stderr for
+# ``2>&1``; configuring only stdout produces mixed UTF-8/GBK output.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 DEFAULT_BASE_URL = "http://127.0.0.1:5001"
 
@@ -74,6 +74,13 @@ def with_agent(payload: Dict[str, Any]) -> Dict[str, Any]:
     data = dict(payload)
     data.setdefault("actor_type", "agent")
     data.setdefault("actor_id", "agent_strategy_assistant")
+    return data
+
+
+def with_researcher(payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = dict(payload)
+    data.setdefault("actor_type", "agent")
+    data.setdefault("actor_id", "datatube_researcher")
     return data
 
 
@@ -342,6 +349,53 @@ def main() -> None:
 
     research_start = sub.add_parser("research-start")
     research_start.add_argument("--data", required=True)
+
+    researcher_align = sub.add_parser("researcher-align")
+    researcher_align.add_argument("--data", required=True)
+
+    researcher_library = sub.add_parser("researcher-library")
+    researcher_library.add_argument("--kind", default="")
+    researcher_library.add_argument("--q", default="")
+    researcher_library.add_argument("--asset-class", default="")
+    researcher_library.add_argument("--frequency", default="")
+    researcher_library.add_argument("--limit", type=int, default=20)
+
+    researcher_start = sub.add_parser("researcher-start")
+    researcher_start.add_argument("--data", required=True)
+
+    researcher_resume = sub.add_parser("researcher-resume")
+    researcher_resume.add_argument("anchor_type")
+    researcher_resume.add_argument("anchor_id")
+    researcher_resume.add_argument("--data", default="{}")
+
+    researcher_status = sub.add_parser("researcher-status")
+    researcher_status.add_argument("session_id")
+
+    researcher_pause = sub.add_parser("researcher-pause")
+    researcher_pause.add_argument("session_id")
+    researcher_pause.add_argument("--message", default="")
+
+    researcher_continue = sub.add_parser("researcher-continue")
+    researcher_continue.add_argument("session_id")
+
+    researcher_need_human = sub.add_parser("researcher-need-human")
+    researcher_need_human.add_argument("session_id")
+    researcher_need_human.add_argument("--data", required=True)
+
+    researcher_answer = sub.add_parser("researcher-answer")
+    researcher_answer.add_argument("session_id")
+    researcher_answer.add_argument("answer")
+
+    researcher_experiment = sub.add_parser("researcher-experiment")
+    researcher_experiment.add_argument("session_id")
+    researcher_experiment.add_argument("--data", required=True)
+
+    researcher_result = sub.add_parser("researcher-result")
+    researcher_result.add_argument("experiment_id")
+
+    researcher_decide = sub.add_parser("researcher-decide")
+    researcher_decide.add_argument("experiment_id")
+    researcher_decide.add_argument("--data", required=True)
 
     research_resume = sub.add_parser("research-resume")
     research_resume.add_argument("anchor_type")
@@ -634,6 +688,76 @@ def main() -> None:
         payload = parse_json_arg(args.data)
         payload["entry_mode"] = "START"
         data = request("POST", "/api/agent/research/sessions", base_url=base_url, payload=with_agent(payload))
+    elif cmd == "researcher-align":
+        data = request(
+            "POST", "/api/agent/researcher/align",
+            base_url=base_url, payload=with_researcher(parse_json_arg(args.data)),
+        )
+    elif cmd == "researcher-library":
+        data = request(
+            "GET", query_path("/api/agent/researcher/library", {
+                "kind": args.kind,
+                "q": args.q,
+                "asset_class": args.asset_class,
+                "frequency": args.frequency,
+                "limit": args.limit,
+            }),
+            base_url=base_url,
+        )
+    elif cmd == "researcher-start":
+        data = request(
+            "POST", "/api/agent/researcher/start",
+            base_url=base_url, payload=with_researcher(parse_json_arg(args.data)),
+        )
+    elif cmd == "researcher-resume":
+        payload = parse_json_arg(args.data)
+        payload.update({"entry_mode": "RESUME", "anchor_type": args.anchor_type, "anchor_id": args.anchor_id})
+        data = request(
+            "POST", "/api/agent/researcher/resume",
+            base_url=base_url, payload=with_researcher(payload),
+        )
+    elif cmd == "researcher-status":
+        data = request(
+            "GET", f"/api/agent/researcher/sessions/{urllib.parse.quote(args.session_id)}",
+            base_url=base_url,
+        )
+    elif cmd == "researcher-pause":
+        data = request(
+            "POST", f"/api/agent/researcher/sessions/{urllib.parse.quote(args.session_id)}/status",
+            base_url=base_url,
+            payload={"actor_type": "human", "actor_id": "local_user", "status": "PAUSED", "message": args.message},
+        )
+    elif cmd == "researcher-continue":
+        data = request(
+            "POST", f"/api/agent/researcher/sessions/{urllib.parse.quote(args.session_id)}/continue",
+            base_url=base_url, payload={"actor_type": "human", "actor_id": "local_user"},
+        )
+    elif cmd == "researcher-need-human":
+        data = request(
+            "POST", f"/api/agent/researcher/sessions/{urllib.parse.quote(args.session_id)}/need-human",
+            base_url=base_url, payload=with_researcher(parse_json_arg(args.data)),
+        )
+    elif cmd == "researcher-answer":
+        data = request(
+            "POST", f"/api/agent/researcher/sessions/{urllib.parse.quote(args.session_id)}/answer",
+            base_url=base_url,
+            payload={"actor_type": "human", "actor_id": "local_user", "answer": args.answer},
+        )
+    elif cmd == "researcher-experiment":
+        data = request(
+            "POST", f"/api/agent/researcher/sessions/{urllib.parse.quote(args.session_id)}/experiments",
+            base_url=base_url, payload=with_researcher(parse_json_arg(args.data)), timeout=300.0,
+        )
+    elif cmd == "researcher-result":
+        data = request(
+            "GET", f"/api/agent/researcher/experiments/{urllib.parse.quote(args.experiment_id)}",
+            base_url=base_url,
+        )
+    elif cmd == "researcher-decide":
+        data = request(
+            "POST", f"/api/agent/researcher/experiments/{urllib.parse.quote(args.experiment_id)}/decide",
+            base_url=base_url, payload=with_researcher(parse_json_arg(args.data)),
+        )
     elif cmd == "research-resume":
         payload = parse_json_arg(args.data)
         payload.update({"entry_mode": "RESUME", "anchor_type": args.anchor_type, "anchor_id": args.anchor_id})

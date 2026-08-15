@@ -1,10 +1,74 @@
 # Research Agent Skill：START、RESUME 与迭代研究
 
-更新日期：2026-08-01
+更新日期：2026-08-14
 
 本文描述 DataTube 已落地的 Research Agent Skill、Research Session 控制面和
 AgentMonitor 监控方式。目标是让用户只需要表达研究意图，Agent 负责构建或恢复研究，
 并在可解释、可回溯的实验循环中持续改进。
+
+## 0. 2026-08-13：Alignment 与实验研究边界
+
+Research Agent 的正式入口已调整为：
+
+```text
+Research Goal
+  → Research Alignment
+  → AlignedResearchIntent v1
+  → Research Contract v2
+  → Universe / Factor / Alpha / Portfolio Evidence Experiment
+  → ResearchResult
+  → KEEP / REJECT / INCONCLUSIVE
+  → Learning
+```
+
+Alignment 只确定 `QUESTION / STOP_AT / BASE / SCOPE / EVIDENCE`，不创建
+Project、Session、Factor、Alpha 或执行对象。当前高层 researcher facade 已分别开放
+`UNIVERSE`、`FACTOR`、`ALPHA` 与 `PORTFOLIO_EVIDENCE`。Universe 只产生研究池证据；
+Portfolio Evidence 使用正式 `RESEARCH_BACKTEST`，并停止在 Strategy 创建之前。
+Alpha Candidate 可显式组合多个 Factor，不再退化为单因子近似。
+
+### 0.1 Universe v2 能力解释
+
+Researcher 看到的 Universe 产品模型已经收敛为：
+
+- `STATIC`：明确 Instrument 列表；
+- `DYNAMIC`：固定的 Base、Filter、Rank、Select、Rebalance 五阶段；
+- `COMPOSITE`：Universe 间的 Union、Intersection、Difference。
+
+Capability 中的 `field_registry` 是定义/编译能力，不代表对应字段已经接入正式
+Research Run。`field_execution_status`、`dynamic_point_in_time_filters` 与
+`selection_methods` 才描述当前 Formal Pipeline。当前正式选择仍为
+`ALL_ELIGIBLE`，当前正式动态字段为 `market_cap_usd`、`roe_ttm`、
+`pe_ttm`、`pb_mrq`、`fcf_yield_ttm`；比例阈值使用小数，且必要输入缺失时排除；
+`TOP_N / BOTTOM_N / PERCENTILE / Buffer` 已完成 v2 authoring 和纯 PIT
+Membership Engine，但还不是正式 `UNIVERSE_DESIGN` 结果。
+
+Standalone Universe Design 不能冻结所需 Manifest。动态字段 Candidate 必须返回
+`DYNAMIC_UNIVERSE_REQUIRES_FROZEN_EVALUATION`；Shared Preview 返回
+`REQUIRES_FROZEN_DATA` 只说明规则已编译，不能解释成动态成员已经解析。
+详细合同见 [Universe v2 设计](universe-v2-design.md)。
+
+正式高层接口为：
+
+```http
+POST /api/agent/researcher/align
+POST /api/agent/researcher/start
+POST /api/agent/researcher/resume
+GET  /api/agent/researcher/sessions
+GET  /api/agent/researcher/sessions/{session_id}
+POST /api/agent/researcher/sessions/{session_id}/status
+POST /api/agent/researcher/sessions/{session_id}/continue
+POST /api/agent/researcher/sessions/{session_id}/need-human
+POST /api/agent/researcher/sessions/{session_id}/answer
+POST /api/agent/researcher/sessions/{session_id}/experiments
+GET  /api/agent/researcher/experiments/{experiment_id}
+POST /api/agent/researcher/experiments/{experiment_id}/decide
+```
+
+旧 `/api/agent/research/*` Session/Iteration 接口进入正式弃用期，响应包含
+`Deprecation`、`Sunset` 与 successor `Link` 标头；低层 Project 工程接口继续用于
+Research Workspace，不属于 Researcher Skill。AgentMonitor 的 Research Sessions 页面只使用 researcher facade，默认
+只展示研究计划、假设、证据、Decision 和 Learning，不展示内部执行 IR。
 
 ## 1. 面向用户的模型
 
@@ -354,14 +418,15 @@ Content-Type: application/json
 ## 10. CLI
 
 ```powershell
-python scripts/datatube_client.py research-start --data brief.json
-python scripts/datatube_client.py research-resume RUN run_123 --data resume-goal.json
-python scripts/datatube_client.py research-sessions --limit 100
-python scripts/datatube_client.py research-session <session_id>
-python scripts/datatube_client.py research-session-status <session_id> PAUSED
-python scripts/datatube_client.py research-session-continue <session_id>
-python scripts/datatube_client.py research-iteration-create <session_id> --data iteration.json
-python scripts/datatube_client.py research-iteration-complete <iteration_id> --data result.json
+python scripts/datatube_client.py researcher-align --data alignment.json
+python scripts/datatube_client.py researcher-start --data start.json
+python scripts/datatube_client.py researcher-resume RUN run_123 --data alignment.json
+python scripts/datatube_client.py researcher-status <session_id>
+python scripts/datatube_client.py researcher-experiment <session_id> --data candidate.json
+python scripts/datatube_client.py researcher-result <experiment_id>
+python scripts/datatube_client.py researcher-decide <experiment_id> --data decision.json
+python scripts/datatube_client.py researcher-pause <session_id>
+python scripts/datatube_client.py researcher-continue <session_id>
 ```
 
 ## 11. AgentMonitor
@@ -418,15 +483,17 @@ research_agent_session_events
 - 固定研究额度及 `session_id` 到内部授权的映射。
 - AgentMonitor Research Sessions 页面。
 - DataTube Skill 与 CLI 命令。
+- Universe v2 三类型 Schema、Field Registry、Compiler、PIT Membership Engine、
+  Shared Dynamic Preview 与 Capability。
 
-仍由 Skill/Agent 编排，而不是后台常驻守护进程自动推进：
+高层 Experiment 后端现在自动编译并推进 Universe、Factor、多 Factor Alpha、数据准备、
+正式 Run 与 Research Backtest；Skill 只负责假设、Candidate、结果解释和下一轮选择。
+内部 Requirement、Manifest、Preview、Bundle、Provider Task 与 Worker 不暴露给研究员。
 
-- Universe、Factor、Alpha 和 Requirement 的具体生成。
-- 数据 Backfill、Preview、Run 和 Worker 的逐步调用。
-- 指标解释、候选假设生成和下一轮选择。
-
-换言之，Session 是可恢复、可监控的控制面；实际研究步骤继续复用现有正式 API 与
-Formal Research Worker，不建立第二套研究执行系统。
+Universe v2 的正式 `UNIVERSE_EVALUATION`、动态 Shared Binding、Composite
+Membership Timeline 尚未接通。在这些对象不存在时，Researcher 不得把
+`AUTHORED / COMPILED / REQUIRES_FROZEN_DATA` 描述成
+`FROZEN_EVALUATED / BOUND`。
 
 ## 14. 安全边界
 

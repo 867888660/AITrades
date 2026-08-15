@@ -197,7 +197,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 }
 .summary-line span { color: var(--research-muted); }
 .summary-line strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.research-card footer { display: flex; justify-content: flex-end; }
+.research-card footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 
 .research-tabs, .library-tabs {
   display: grid;

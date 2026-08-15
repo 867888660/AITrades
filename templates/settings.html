@@ -110,6 +110,22 @@
 
               <section class="settings-section">
                 <div class="settings-section-head">
+                  <h2>SEC EDGAR</h2>
+                  <p>用于在线读取最新披露与 XBRL Company Facts。User-Agent 按 SEC 自动访问要求加密保存，不会返回给数据源列表接口。</p>
+                </div>
+                <div class="grid two">
+                  <label>
+                    SEC EDGAR User-Agent
+                    <input id="secEdgarUserAgent" type="password" autocomplete="off" data-secret-field="sec_edgar_user_agent" placeholder="机构/姓名 contact@example.com">
+                    <span id="secEdgarUserAgentStatus" class="settings-note"></span>
+                    <label class="checkbox"><input id="clearSecEdgarUserAgent" type="checkbox"><span>清除已保存的 SEC User-Agent</span></label>
+                  </label>
+                  <div class="settings-note">在线结果以 filing date 为可用时间；正式 Research 仍需经过 SEC PIT 规范化并固定 Manifest。</div>
+                </div>
+              </section>
+
+              <section class="settings-section">
+                <div class="settings-section-head">
                   <h2>CoinGecko</h2>
                   <p>用于 Crypto Context Snapshot，不作为 Binance 历史 Bar 的透明替代。</p>
                 </div>
@@ -528,6 +544,6 @@
         </section>
       </main>
     </div>
-    <script src="{{ url_for('static', filename='settings.js') }}?v=history-inventory-20260811"></script>
+    <script src="{{ url_for('static', filename='settings.js') }}?v=equity-live-sources-20260813"></script>
   </body>
 </html>

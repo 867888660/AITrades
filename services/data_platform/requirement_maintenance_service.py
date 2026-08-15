@@ -40,13 +40,28 @@ class RequirementMaintenanceService:
         self.compiler = RequirementCompiler(store)
         self.control = ResearchControlPlane(store)
 
-    def run_once(self) -> dict[str, Any]:
+    def run_once(
+        self,
+        *,
+        project_id: str = "",
+        requirement_set_id: str = "",
+    ) -> dict[str, Any]:
+        target_project_id = _clean(project_id)
+        target_requirement_set_id = _clean(requirement_set_id)
         candidates: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
 
         # Library is the source of truth.  Assets are scanned even when no
-        # Research currently references them.
-        for asset in self.workspace.list_library_assets():
+        # Research currently references them. A Research Experiment uses the
+        # scoped path below so an unrelated Library asset can never block its
+        # orchestration.
+        library_assets: list[dict[str, Any]] = []
+        if not target_project_id:
+            try:
+                library_assets = self.workspace.list_library_assets()
+            except Exception as exc:
+                errors.append({"owner_id": "LIBRARY_SCAN", "error": str(exc)[:500]})
+        for asset in library_assets:
             asset_id = _clean(asset.get("library_asset_id"))
             for row in (asset.get("data_status") or {}).get("rows", []):
                 candidates.append(
@@ -60,13 +75,31 @@ class RequirementMaintenanceService:
 
         # Derived Factor/Alpha requirements may not have a Library asset, so
         # active Research RequirementSets are scanned as a second source.
-        for project in self.control.list_projects(limit=500):
+        if target_project_id:
+            project = self.control.get_project(target_project_id)
+            projects = [project] if project else []
+            if not project:
+                errors.append({"owner_id": target_project_id, "error": "Research not found"})
+        else:
+            projects = self.control.list_projects(limit=500)
+        for project in projects:
             project_id = _clean(project.get("project_id"))
             active_sets = [
                 item for item in self.compiler.list(project_id=project_id)
                 if _clean(item.status).upper() != "SUPERSEDED"
             ]
+            if target_requirement_set_id:
+                active_sets = [
+                    item for item in active_sets
+                    if item.requirement_set_id == target_requirement_set_id
+                ]
             set_ids = [item.requirement_set_id for item in active_sets] or [""]
+            if target_requirement_set_id and not active_sets:
+                errors.append({
+                    "owner_id": project_id,
+                    "error": f"RequirementSet not found or inactive: {target_requirement_set_id}",
+                })
+                continue
             for requirement_set_id in set_ids:
                 try:
                     status = self.workspace.data_status(project_id, requirement_set_id)
@@ -129,6 +162,10 @@ class RequirementMaintenanceService:
                 )
 
         return {
+            "scope": {
+                "project_id": target_project_id,
+                "requirement_set_id": target_requirement_set_id,
+            },
             "scanned": len(candidates),
             "scheduled": len(scheduled),
             "task_types": sorted(
@@ -211,6 +248,12 @@ class RequirementMaintenanceService:
                 # Grant scope authorizes bare tickers (e.g. "AAPL"); OpenBB
                 # export still needs a venue, so default to XNAS.
                 venue, symbol = "XNAS", instrument_id.upper()
+            if venue == "CRSP" or provider in {"crsp", "crsp/ciz"}:
+                # CRSP is a managed archive source, not an OpenBB venue or
+                # upstream provider. A CRSP readiness problem must remain
+                # visible for archive/contract repair instead of spawning an
+                # invalid OPENBB_EQUITY_DAILY_EXPORT task.
+                return None
             source_selection_policy = row.get("source_selection_policy")
             source_selection_policy = (
                 dict(source_selection_policy)

@@ -1,0 +1,22 @@
+{
+  "session_id": "research_session_a7e2aeda2b3c4260832ce3c497beced0",
+  "definition_type": "ALPHA",
+  "spec": {
+    "name": "crsp_collection_plumbing_probe_not_alpha158",
+    "version": "1.0.0",
+    "components": [
+      {
+        "factor_definition_id": "factor_881be7dbc5304a3eb04445467d8455b6",
+        "factor_version": "1.0.0",
+        "weight": 1.0,
+        "transform": "CS_RANK",
+        "ascending": false
+      }
+    ],
+    "minimum_coverage": 1.0,
+    "minimum_cross_section_size": 1,
+    "missing_policy": "EXCLUDE",
+    "rank_method": "AVERAGE",
+    "output_scale": "PERCENTILE"
+  }
+}

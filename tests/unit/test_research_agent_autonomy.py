@@ -90,6 +90,29 @@ class ResearchAgentAutonomyTests(unittest.TestCase):
         self.assertEqual("PROJECT", universe["library_scope"])
         self.assertEqual(project_id, universe["owner_project_id"])
 
+        snapshot_response = self.client.post(
+            f"/api/agent/research/projects/{project_id}/universes/"
+            f"{universe['universe_definition_id']}/snapshots",
+            json={
+                "grant_id": grant["grant_id"],
+                "as_of_time": "2026-07-01T00:00:00+00:00",
+            },
+        )
+        self.assertEqual(201, snapshot_response.status_code, snapshot_response.get_json())
+        snapshot = snapshot_response.get_json()["data"]
+        universe_pin_response = self.client.put(
+            f"/api/agent/research/projects/{project_id}/universe-ref",
+            json={
+                "grant_id": grant["grant_id"],
+                "universe_snapshot_id": snapshot["universe_snapshot_id"],
+            },
+        )
+        self.assertEqual(200, universe_pin_response.status_code, universe_pin_response.get_json())
+        self.assertEqual(
+            snapshot["universe_snapshot_id"],
+            universe_pin_response.get_json()["data"]["universe_snapshot_id"],
+        )
+
         factor_response = self.client.post(
             f"/api/agent/research/projects/{project_id}/definitions",
             json={

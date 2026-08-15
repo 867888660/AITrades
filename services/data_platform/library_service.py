@@ -301,8 +301,7 @@ class ResearchLibraryService:
             raise ValueError("Library asset not found")
         if asset.get("archived_at"):
             raise ValueError("Library asset is already archived")
-        if self.usage(library_asset_id)["research_count"]:
-            raise ValueError("Remove this asset from every Research before archiving it")
+        usage = self.usage(library_asset_id)
         now = utc_now()
         with self.store.transaction(immediate=True) as conn:
             cursor = conn.execute(
@@ -314,7 +313,11 @@ class ResearchLibraryService:
         result = self.get(library_asset_id)
         if result is None:
             raise RuntimeError("failed to archive Library asset")
-        return result
+        return {
+            **result,
+            "archived_research_count": usage["research_count"],
+            "references_preserved": True,
+        }
 
     @staticmethod
     def _row(row: Any) -> dict[str, Any]:

@@ -24,6 +24,10 @@ from services.data_source_management_service import (
     DataSourceManagementService,
     DataSourceRoutingConflict,
 )
+from services.data_source_connection_service import (
+    DataSourceConnectionError,
+    DataSourceConnectionService,
+)
 from services.data_source_definitions import OPENBB_CREDENTIAL_KEYS
 from services.event_graph_service import build_event_graph, get_event_graph_categories
 from services.event_news_service import (
@@ -64,9 +68,19 @@ from services.history_data_service import (
     rename_backtest_batch as rename_history_backtest_batch,
     rename_backtest_case as rename_history_backtest_case,
     rename_backtest_run as rename_history_backtest_run,
+    recover_backtest_queue,
     rerun_backtest_run as rerun_history_backtest_run,
 )
-from services.history_storage_service import HistoryStorageService, get_history_storage_job
+from services.history_storage_service import (
+    HistoryStorageService,
+    get_data_platform_storage_root,
+    get_history_storage_job,
+)
+from services.data_platform.workload_scheduler import (
+    IntelligentWorkloadRouter,
+    ResearchWorkloadPlanner,
+    ResourceAdmissionController,
+)
 from services.http_client import SESSION
 from services.data_platform.factor_run_result_service import (
     FACTOR_RUN_RESULT_SCHEMA_VERSION,
@@ -144,12 +158,17 @@ from services.data_platform import (
     DEFAULT_RESEARCH_OPERATIONS,
     ResearchAgentAuthorization,
     ResearchAgentSessionService,
+    ResearchExperimentService,
+    ResearchSemanticError,
+    align_research_intent,
+    normalize_research_brief,
     ResearchContextResolver,
     ResearchAuthorizationError,
     get_default_store,
     CrspBulkImportService,
     SecBulkImportService,
 )
+from services.data_platform.equity_monthly_research import EquityMonthlyResearchMaterializer
 from services.polymarket_dictionary_service import get_dictionary_status, start_dictionary_refresh
 from services.ledger_service import get_ledger_snapshot
 from services.polymarket_service import (
@@ -198,6 +217,19 @@ from services.workspace_preset_service import (
 
 app = Flask(__name__)
 
+
+@app.after_request
+def _mark_legacy_research_session_surface(response: Response) -> Response:
+    """Keep old clients working while making the Researcher migration explicit."""
+    path = request.path
+    if path.startswith("/api/agent/research/sessions") or path.startswith(
+        "/api/agent/research/iterations"
+    ) or path == "/api/agent/research/context":
+        response.headers["Deprecation"] = "true"
+        response.headers["Sunset"] = "Sat, 31 Jan 2027 00:00:00 GMT"
+        response.headers["Link"] = '</api/agent/researcher/sessions>; rel="successor-version"'
+    return response
+
 _binance_backfill_worker_lock = threading.Lock()
 _binance_backfill_worker_thread: threading.Thread | None = None
 _openbb_export_worker_lock = threading.Lock()
@@ -207,6 +239,12 @@ _polymarket_export_worker_lock = threading.Lock()
 _polymarket_export_worker_thread: threading.Thread | None = None
 _requirement_maintenance_thread: threading.Thread | None = None
 _requirement_maintenance_lock = threading.Lock()
+_research_experiment_thread: threading.Thread | None = None
+_research_experiment_lock = threading.Lock()
+_research_run_orchestrator_thread: threading.Thread | None = None
+_research_run_worker_thread: threading.Thread | None = None
+_research_run_lock = threading.Lock()
+_research_run_admission = ResourceAdmissionController()
 
 
 def _spawn_crsp_import_worker(job_id: str, *, chunk_rows: int = 250_000) -> dict:
@@ -457,7 +495,168 @@ def _start_requirement_maintenance() -> bool:
         return True
 
 
+def _start_research_experiment_orchestrator() -> bool:
+    """Advance semantic Experiments without exposing internal phases to Agents."""
+    global _research_experiment_thread
+    with _research_experiment_lock:
+        if _research_experiment_thread and _research_experiment_thread.is_alive():
+            return False
+
+        def run() -> None:
+            while True:
+                try:
+                    _advance_research_experiments_once()
+                except Exception as exc:
+                    print(f"[RESEARCH-EXPERIMENT][ERR] {type(exc).__name__}")
+                time.sleep(10)
+
+        _research_experiment_thread = threading.Thread(
+            target=run,
+            name="research-experiment-orchestrator",
+            daemon=True,
+        )
+        _research_experiment_thread.start()
+        return True
+
+
+def _dispatch_research_run_once() -> bool:
+    """Launch at most one isolated formal Run outside the HTTP request path."""
+
+    global _research_run_worker_thread
+    with _research_run_lock:
+        if _research_run_worker_thread and _research_run_worker_thread.is_alive():
+            return False
+        with get_default_store().connection() as conn:
+            queued = conn.execute(
+                "SELECT run_id FROM research_runs_v2 WHERE status='QUEUED' "
+                "ORDER BY priority DESC, queued_at LIMIT 1"
+            ).fetchone()
+        if queued is None:
+            return False
+        run_id = str(queued["run_id"])
+        run_service = ResearchRunService(get_default_store())
+        # Re-estimate at dispatch time so environment and dataset changes are
+        # reflected without asking the caller to resubmit or choose a worker.
+        run_service.apply_automatic_routing(run_id)
+        run = run_service.get(run_id)
+        if run is None:
+            return False
+        plan = ResearchWorkloadPlanner(get_default_store()).plan(run)
+        route = IntelligentWorkloadRouter().route_research(plan)
+        token = f"formal-research-dispatch:{run_id}"
+        if not _research_run_admission.acquire(
+            token, route.resource_class, route.worker_memory_mb
+        ):
+            return False
+
+        def execute() -> None:
+            try:
+                ResearchRunWorker(
+                    get_default_store(), "formal-research-dispatcher"
+                ).run_once(
+                    lease_seconds=300,
+                    run_id=run_id,
+                    isolate_execution=True,
+                )
+            except Exception as exc:
+                print(
+                    f"[RESEARCH-RUN][ERR] {type(exc).__name__}: {str(exc)[:500]}",
+                    flush=True,
+                )
+            finally:
+                _research_run_admission.release(token)
+
+        _research_run_worker_thread = threading.Thread(
+            target=execute,
+            name="formal-research-worker",
+            daemon=True,
+        )
+        _research_run_worker_thread.start()
+        return True
+
+
+def _start_research_run_orchestrator() -> bool:
+    """Drain the durable formal-Run queue while preserving frontend capacity."""
+
+    global _research_run_orchestrator_thread
+    with _research_run_lock:
+        if (
+            _research_run_orchestrator_thread
+            and _research_run_orchestrator_thread.is_alive()
+        ):
+            return False
+
+        def run() -> None:
+            # Any RUNNING lease at process startup belonged to a dead worker.
+            # Quarantine it instead of silently repeating expensive compute.
+            with get_default_store().connection() as conn:
+                interrupted = [
+                    str(row[0])
+                    for row in conn.execute(
+                        "SELECT run_id FROM research_runs_v2 WHERE status='RUNNING'"
+                    ).fetchall()
+                ]
+            recovery_worker = ResearchRunWorker(
+                get_default_store(), "formal-research-restart-recovery"
+            )
+            for run_id in interrupted:
+                recovery_worker.fail_interrupted(run_id)
+            while True:
+                try:
+                    _dispatch_research_run_once()
+                except Exception as exc:
+                    print(
+                        f"[RESEARCH-RUN][DISPATCH-ERR] {type(exc).__name__}: {str(exc)[:500]}",
+                        flush=True,
+                    )
+                time.sleep(2)
+
+        _research_run_orchestrator_thread = threading.Thread(
+            target=run,
+            name="formal-research-orchestrator",
+            daemon=True,
+        )
+        _research_run_orchestrator_thread.start()
+        return True
+
+
+def _advance_research_experiments_once() -> dict:
+    """Dispatch Experiments and independently drain their provider tasks.
+
+    Global Requirement maintenance may spend a long time resolving a very
+    large Research universe. Provider workers must not wait for that scan to
+    return after a scoped Experiment has already queued its preparation task.
+    """
+    result = ResearchExperimentService(
+        get_default_store(), isolate_experiment_execution=True
+    ).advance_pending(limit=20)
+    _dispatch_research_run_once()
+    _start_binance_backfill_worker()
+    _start_openbb_export_worker()
+    _start_polymarket_export_worker()
+    return result
+
+
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def _resolve_artifact_content_path(
+    content_uri: str,
+    *,
+    allowed_roots: tuple[Path, ...] | None = None,
+) -> Path:
+    """Resolve an artifact only inside a trusted DataTube-owned storage root."""
+    path = Path(content_uri)
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    path = path.resolve()
+    roots = allowed_roots or (
+        BASE_DIR.resolve(),
+        get_data_platform_storage_root().resolve(),
+    )
+    if not any(path.is_relative_to(root.resolve()) for root in roots):
+        raise ValueError("Artifact content is outside the trusted DataTube storage roots")
+    return path
 EXTERNAL_LATENCY_TARGETS = [
     {"key": "polymarket_web", "label": "Polymarket Web", "url": "https://polymarket.com", "group": "polymarket"},
     {"key": "polymarket_clob", "label": "Polymarket CLOB", "url": "https://clob.polymarket.com", "group": "polymarket"},
@@ -635,7 +834,24 @@ def settings_page():
 
 @app.get("/research")
 def research_workspace_page():
-    return render_template("research_workspace.html", initial_surface="research", initial_project_id="")
+    # The Research index is the default landing surface. Render its compact
+    # card projection into the first HTML response so users are not held behind
+    # a full-page loading gate while the large workspace client initializes.
+    try:
+        initial_project_summaries = ResearchControlPlane(
+            get_default_store()
+        ).list_project_summaries(limit=500)
+    except Exception as exc:
+        # Preserve the client-side error/retry path if local metadata is
+        # temporarily unavailable instead of turning the page shell into a 500.
+        app.logger.warning("Unable to bootstrap Research index: %s", exc)
+        initial_project_summaries = None
+    return render_template(
+        "research_workspace.html",
+        initial_surface="research",
+        initial_project_id="",
+        initial_project_summaries=initial_project_summaries,
+    )
 
 
 @app.get("/research/<project_id>")
@@ -1508,6 +1724,22 @@ def research_projects():
         return _json_error(exc)
 
 
+@app.get("/api/research/project-summaries")
+@debug_timing("research_project_summaries")
+def research_project_summaries():
+    try:
+        service = ResearchControlPlane(get_default_store())
+        data = service.list_project_summaries(
+            summary_state=request.args.get("summary_state", ""),
+            limit=int(request.args.get("limit") or 100),
+            include_archived=str(request.args.get("include_archived") or "").lower()
+            in {"1", "true", "yes"},
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _json_error(exc)
+
+
 @app.post("/api/research/projects")
 @require_local_request
 @debug_timing("research_project_create")
@@ -1906,7 +2138,14 @@ def research_library_list():
             data = legacy
         else:
             data = [item for item in legacy if item.get("component_type") != "REQUIREMENTS"]
-            data.extend(RequirementWorkspaceService(store).list_library_assets())
+            include_requirement_status = str(
+                request.args.get("include_requirement_status") or ""
+            ).lower() in {"1", "true", "yes"}
+            data.extend(
+                RequirementWorkspaceService(store).list_library_assets(
+                    include_data_status=include_requirement_status,
+                )
+            )
         return jsonify({"ok": True, "data": data})
     except Exception as exc:
         return _json_error(exc)
@@ -3284,21 +3523,16 @@ def research_run_result_summary(run_id: str):
             for artifact in artifacts
         ]
         factor_signals = []
-        base_dir = BASE_DIR.resolve()
         for artifact in artifacts:
             if artifact.artifact_type != "FACTOR_VALUES":
                 continue
-            path = Path(artifact.content_uri)
-            if not path.is_absolute():
-                path = BASE_DIR / path
-            path = path.resolve()
             try:
-                path.relative_to(base_dir)
+                path = _resolve_artifact_content_path(artifact.content_uri)
             except ValueError:
                 factor_signals.append({
                     "artifact_id": artifact.artifact_id,
                     "factor_name": artifact.logical_name,
-                    "error": "Artifact content is outside the DataTube runtime root",
+                    "error": "Artifact content is outside the trusted DataTube storage roots",
                 })
                 continue
             try:
@@ -3624,16 +3858,8 @@ def research_run_result_section(run_id: str, section_key: str):
             or artifact.artifact_id in produced_artifact_ids
         ]
         rows: list[dict[str, Any]] = []
-        base_dir = BASE_DIR.resolve()
         for artifact in artifacts:
-            path = Path(artifact.content_uri)
-            if not path.is_absolute():
-                path = BASE_DIR / path
-            path = path.resolve()
-            try:
-                path.relative_to(base_dir)
-            except ValueError:
-                raise ValueError("Artifact content is outside the DataTube runtime root")
+            path = _resolve_artifact_content_path(artifact.content_uri)
             import pyarrow.parquet as pq
 
             for row in pq.read_table(path).to_pylist():
@@ -3757,10 +3983,15 @@ def research_run_worker_claim():
 @debug_timing("research_run_worker_once")
 def research_run_worker_once():
     try:
-        payload = request.get_json(silent=True) or {}
-        result = ResearchRunWorker(
-            get_default_store(), worker_id=str(payload.get("worker_id") or "formal-research-worker")
-        ).run_once(lease_seconds=int(payload.get("lease_seconds") or 300))
+        dispatched = _dispatch_research_run_once()
+        queued = ResearchRunService(get_default_store()).list(
+            status="QUEUED", limit=100
+        )
+        result = {
+            "status": "DISPATCHED" if dispatched else ("QUEUED" if queued else "IDLE"),
+            "dispatched": dispatched,
+            "queue_depth": len(queued),
+        }
         return jsonify({"ok": True, "data": result})
     except Exception as exc:
         return _json_error(exc)
@@ -4032,6 +4263,7 @@ def research_sec_import_cancel(job_id: str):
 _REVEALABLE_SETTING_FIELDS = {
     "finnhub_api_keys",
     "active_finnhub_api_key",
+    "sec_edgar_user_agent",
     "coingecko_api_key",
     "llm_api_key",
 }
@@ -4078,6 +4310,57 @@ def data_sources_list():
         return jsonify({"ok": True, "data": data})
     except Exception as exc:
         return _json_error(exc)
+
+
+@app.post("/api/data-sources/<source_id>/test")
+@require_local_request
+@debug_timing("data_source_connection_test")
+def data_source_connection_test(source_id: str):
+    try:
+        data = DataSourceConnectionService(load_web_settings()).test(source_id)
+        return jsonify({"ok": True, "data": data})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except DataSourceConnectionError as exc:
+        return _json_error(exc, 502)
+    except Exception as exc:
+        return _json_error(exc, 502)
+
+
+@app.get("/api/data-sources/equity/quotes")
+@require_local_request
+@debug_timing("data_source_equity_quotes")
+def data_source_equity_quotes():
+    try:
+        symbols = request.args.get("symbols", "AAPL")
+        data = DataSourceConnectionService(load_web_settings()).equity_quotes(symbols)
+        return jsonify({"ok": True, "data": data})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except DataSourceConnectionError as exc:
+        return _json_error(exc, 502)
+    except Exception as exc:
+        return _json_error(exc, 502)
+
+
+@app.get("/api/data-sources/sec/company-facts/<cik>")
+@require_local_request
+@debug_timing("data_source_sec_company_facts")
+def data_source_sec_company_facts(cik: str):
+    try:
+        concepts = [
+            item.strip()
+            for item in request.args.get("concepts", "").split(",")
+            if item.strip()
+        ]
+        data = DataSourceConnectionService(load_web_settings()).sec_company_facts(
+            cik, concepts=concepts or None
+        )
+        return jsonify({"ok": True, "data": data})
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc, 502)
 
 
 @app.put("/api/data-sources/routing")
@@ -4827,7 +5110,7 @@ def history_backtest_run_rename(run_id: int):
 @debug_timing("history_backtest_run_create")
 def history_backtest_run_create(case_id: int):
     try:
-        payload = request.get_json(silent=True) or {}
+        payload = {**(request.get_json(silent=True) or {}), "run_mode": "async"}
         return jsonify({"ok": True, "data": create_history_backtest_run(case_id, payload)})
     except ValueError as exc:
         return _json_error(exc, 400)
@@ -4859,7 +5142,7 @@ def history_backtest_run(run_id: int):
 @debug_timing("history_backtest_run_rerun")
 def history_backtest_run_rerun(run_id: int):
     try:
-        payload = request.get_json(silent=True) or {}
+        payload = {**(request.get_json(silent=True) or {}), "run_mode": "async"}
         return jsonify({"ok": True, "data": rerun_history_backtest_run(run_id, payload)})
     except ValueError as exc:
         return _json_error(exc, 400)
@@ -4995,6 +5278,11 @@ def _agent_research_authorize(
 ):
     actor_type = str(payload.get("actor_type") or "agent").strip().lower()
     actor_id = str(payload.get("actor_id") or "agent_strategy_assistant").strip()
+    if actor_type == "agent" and actor_id == "datatube_researcher":
+        raise ResearchAuthorizationError(
+            "RESEARCHER_INFRASTRUCTURE_SURFACE_DENIED",
+            "The Research Agent may submit semantic Experiments but may not operate DataTube internal Research objects",
+        )
     agent_service.require_agent_capability(capability, actor_type)
     grant_id = str(payload.get("grant_id") or "")
     session_id = str(payload.get("session_id") or "").strip()
@@ -5059,6 +5347,12 @@ def _audit_agent_research(
 
 
 def _agent_research_error(exc: Exception):
+    if isinstance(exc, ResearchSemanticError):
+        body: dict = {"ok": False, "code": exc.code, "error": str(exc)}
+        if exc.context:
+            body["context"] = exc.context
+        status_code = 404 if exc.code.endswith("_NOT_FOUND") else 422
+        return jsonify(body), status_code
     if isinstance(exc, ResearchAuthorizationError):
         payload = request.get_json(silent=True) or {}
         if not isinstance(payload, dict):
@@ -5082,6 +5376,413 @@ def _agent_research_error(exc: Exception):
     if isinstance(exc, (TypeError, ValueError)):
         return _json_error(exc, 400)
     return _json_error(exc)
+
+
+def _researcher_session_view(value: dict | None) -> dict | None:
+    """Expose research meaning and progress, never internal execution IR."""
+    if value is None:
+        return None
+    contract_row = dict(value.get("research_contract") or {})
+    contract = dict(contract_row.get("contract") or {})
+    experiments = ResearchExperimentService(get_default_store()).list(
+        str(value.get("session_id") or ""), limit=100
+    )
+    champion = next((item for item in experiments if item.get("decision") == "KEEP"), None)
+    latest_learning = next(
+        (dict(item.get("learning") or {}) for item in experiments if item.get("learning")),
+        {},
+    )
+    public_stage = {
+        "BRIEFING": "ALIGNING",
+        "PLANNING": "READY_FOR_EXPERIMENT",
+        "BUILDING": "EXPERIMENTING",
+        "PREPARING_DATA": "EXPERIMENTING",
+        "PREVIEWING": "EXPERIMENTING",
+        "RUNNING": "EXPERIMENTING",
+        "EVALUATING": "EVALUATING",
+        "ITERATING": "DECIDING",
+        "NEED_HUMAN": "NEEDS_INPUT",
+        "PAUSED": "PAUSED",
+        "BLOCKED": "SYSTEM_BLOCKED",
+        "COMPLETED": "COMPLETED",
+        "FAILED": "FAILED",
+        "CANCELLED": "CANCELLED",
+    }.get(str(value.get("status") or "").upper(), "READY_FOR_EXPERIMENT")
+    research_plan = {
+        "question": contract.get("question") or contract.get("objective") or value.get("objective"),
+        "decision_supported": contract.get("decision_supported"),
+        "stop_at": contract.get("stop_at"),
+        "entry_mode": contract.get("entry_mode") or value.get("entry_mode"),
+        "base_refs": list(contract.get("base_refs") or []),
+        "scope": {
+            "asset_scope": dict(contract.get("asset_scope") or {}),
+            "research_period": dict(contract.get("research_period") or {}),
+            "frequency": contract.get("frequency"),
+            "universe_policy": dict(contract.get("universe_policy") or {}),
+        },
+        "evidence": {
+            "profile": contract.get("evidence_profile"),
+            **dict(contract.get("evaluation") or {}),
+        },
+        "assumptions": list(contract.get("assumptions") or []),
+        "out_of_scope": list(contract.get("out_of_scope") or []),
+        "alignment_hash": contract.get("alignment_hash"),
+    }
+    internal_status = str(value.get("status") or "").upper()
+    return {
+        "session_id": value.get("session_id"),
+        "status": public_stage,
+        "entry_mode": value.get("entry_mode"),
+        "updated_at": value.get("updated_at"),
+        "goal": value.get("objective"),
+        "research_plan": research_plan,
+        "research_contract": {
+            "version": contract_row.get("contract_version"),
+            "status": contract_row.get("status"),
+            "contract_hash": contract_row.get("contract_hash"),
+            **contract,
+        } if contract else {},
+        "current_champion": {
+            "product_type": dict(champion.get("result") or {}).get("product_type") if champion else "",
+            "experiment_id": champion.get("experiment_id") if champion else "",
+            "decision_metrics": dict(dict(champion.get("result") or {}).get("decision_metrics") or {}) if champion else {},
+        },
+        "latest_learning": latest_learning,
+        "experiment_count": len(experiments),
+        "experiments": experiments,
+        "pending_question": value.get("pending_question") or {},
+        "actions": {
+            "needs_human": internal_status == "NEED_HUMAN",
+            "can_pause": internal_status not in {
+                "PAUSED", "NEED_HUMAN", "BLOCKED", "COMPLETED", "FAILED", "CANCELLED"
+            },
+            "can_continue": internal_status in {"PAUSED", "BLOCKED"},
+            "terminal": internal_status in {"COMPLETED", "FAILED", "CANCELLED"},
+        },
+        "limits": {
+            "max_experiments": dict(contract.get("experiment_policy") or {}).get("max_experiments"),
+            "used": len(experiments),
+        },
+    }
+
+
+@app.post("/api/agent/researcher/align")
+@require_local_request
+@debug_timing("researcher_align")
+def researcher_align():
+    payload = _agent_body_payload()
+    try:
+        agent_service.require_agent_capability(
+            "research.read", str(payload["actor_type"]).lower()
+        )
+        brief = normalize_research_brief(payload)
+        alignment = align_research_intent(brief, payload)
+        return jsonify({"ok": True, "data": alignment})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.get("/api/agent/researcher/library")
+@debug_timing("researcher_library")
+def researcher_library():
+    try:
+        payload = _agent_query_payload()
+        agent_service.require_agent_capability("research.read", str(payload["actor_type"]).lower())
+        kind = str(payload.get("kind") or "").strip().upper()
+        query = str(payload.get("q") or "").strip().lower()
+        asset_class = str(payload.get("asset_class") or "").strip().upper()
+        frequency = str(payload.get("frequency") or "").strip().lower()
+        limit = max(1, min(int(payload.get("limit") or 20), 100))
+        rows = ResearchLibraryService(get_default_store()).list(
+            component_type=kind,
+            include_archived=False,
+        )
+        items = []
+        for row in rows:
+            content = dict(row.get("content") or {})
+            spec = dict(content.get("spec") or content)
+            name = str(row.get("name") or spec.get("name") or "").strip()
+            meaning = str(
+                spec.get("description")
+                or spec.get("research_meaning")
+                or content.get("description")
+                or name
+            ).strip()
+            row_asset_class = str(
+                spec.get("asset_class") or content.get("asset_class") or ""
+            ).strip().upper()
+            row_frequency = str(
+                spec.get("frequency") or content.get("frequency") or ""
+            ).strip().lower()
+            haystack = f"{name} {meaning} {row.get('component_type') or ''}".lower()
+            if query and query not in haystack:
+                continue
+            compatibility_reasons = []
+            if asset_class and not row_asset_class:
+                compatibility_reasons.append("ASSET_CLASS_UNKNOWN")
+            elif asset_class and asset_class != row_asset_class:
+                compatibility_reasons.append("ASSET_CLASS_MISMATCH")
+            if frequency and not row_frequency:
+                compatibility_reasons.append("FREQUENCY_UNKNOWN")
+            elif frequency and frequency != row_frequency:
+                compatibility_reasons.append("FREQUENCY_MISMATCH")
+            if any(reason.endswith("_MISMATCH") for reason in compatibility_reasons):
+                compatibility = "INCOMPATIBLE"
+            elif compatibility_reasons:
+                compatibility = "UNKNOWN"
+            else:
+                compatibility = "COMPATIBLE"
+            items.append({
+                "asset_ref": f"library:{row.get('library_asset_id')}",
+                "kind": str(row.get("component_type") or "").upper(),
+                "display_name": name,
+                "version": row.get("version"),
+                "research_meaning": meaning,
+                "asset_class": row_asset_class,
+                "frequency": row_frequency,
+                "compatibility": compatibility,
+                "compatibility_reasons": compatibility_reasons,
+            })
+            if len(items) >= limit:
+                break
+        return jsonify({"ok": True, "data": {"items": items, "count": len(items)}})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/researcher/start")
+@require_local_request
+@debug_timing("researcher_start")
+def researcher_start():
+    payload = _agent_body_payload()
+    try:
+        actor_type = str(payload["actor_type"]).lower()
+        actor_id = str(payload["actor_id"])
+        agent_service.require_agent_capability("research.project.create", actor_type)
+        result = ResearchAgentSessionService(get_default_store()).start(
+            payload, created_by="local_user", require_alignment=True
+        )
+        public = _researcher_session_view(result)
+        _audit_agent_research(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            capability="research.session.create",
+            target_type="research_session",
+            target_id=result["session_id"],
+            payload=payload,
+            output=public or {},
+        )
+        status_code = 200 if bool(result.get("idempotency_reused")) else 201
+        return jsonify({"ok": True, "data": public}), status_code
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/researcher/resume")
+@require_local_request
+@debug_timing("researcher_resume")
+def researcher_resume():
+    payload = _agent_body_payload()
+    try:
+        payload["entry_mode"] = "RESUME"
+        actor_type = str(payload["actor_type"]).lower()
+        actor_id = str(payload["actor_id"])
+        agent_service.require_agent_capability("research.project.create", actor_type)
+        result = ResearchAgentSessionService(get_default_store()).resume(
+            str(payload.get("anchor_type") or ""),
+            str(payload.get("anchor_id") or ""),
+            payload,
+            created_by="local_user",
+            require_alignment=True,
+        )
+        public = _researcher_session_view(result)
+        _audit_agent_research(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            capability="research.session.create",
+            target_type="research_session",
+            target_id=result["session_id"],
+            payload=payload,
+            output=public or {},
+        )
+        return jsonify({"ok": True, "data": public}), 201
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.get("/api/agent/researcher/sessions")
+@debug_timing("researcher_sessions")
+def researcher_sessions():
+    try:
+        payload = _agent_query_payload()
+        agent_service.require_agent_capability("research.read", str(payload["actor_type"]).lower())
+        service = ResearchAgentSessionService(get_default_store())
+        rows = service.list(
+            status=str(payload.get("status") or ""),
+            limit=int(payload.get("limit") or 100),
+        )
+        items = []
+        for row in rows:
+            detail = service.get(
+                str(row.get("session_id") or ""),
+                include_events=False,
+                include_iterations=False,
+            )
+            if detail:
+                items.append(_researcher_session_view(detail))
+        return jsonify({"ok": True, "data": items})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.get("/api/agent/researcher/sessions/<session_id>")
+@debug_timing("researcher_status")
+def researcher_status(session_id: str):
+    try:
+        payload = _agent_query_payload()
+        agent_service.require_agent_capability("research.read", str(payload["actor_type"]).lower())
+        result = ResearchAgentSessionService(get_default_store()).get(session_id)
+        if result is None:
+            return jsonify({"ok": False, "code": "RESEARCH_SESSION_NOT_FOUND", "error": "Research Session not found"}), 404
+        return jsonify({"ok": True, "data": _researcher_session_view(result)})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/researcher/sessions/<session_id>/status")
+@require_local_request
+@debug_timing("researcher_session_status")
+def researcher_session_status(session_id: str):
+    payload = _agent_body_payload(default_type="human", default_id="local_user")
+    try:
+        requested = str(payload.get("status") or "").strip().upper()
+        if requested not in {"PAUSED", "CANCELLED"}:
+            raise ValueError("Researcher status endpoint only accepts PAUSED or CANCELLED")
+        result = ResearchAgentSessionService(get_default_store()).set_status(
+            session_id,
+            requested,
+            message=str(payload.get("message") or ""),
+            payload=dict(payload.get("progress") or {}),
+        )
+        return jsonify({"ok": True, "data": _researcher_session_view(result)})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/researcher/sessions/<session_id>/continue")
+@require_local_request
+@debug_timing("researcher_session_continue")
+def researcher_session_continue(session_id: str):
+    try:
+        result = ResearchAgentSessionService(get_default_store()).continue_session(session_id)
+        return jsonify({"ok": True, "data": _researcher_session_view(result)})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/researcher/sessions/<session_id>/need-human")
+@require_local_request
+@debug_timing("researcher_session_need_human")
+def researcher_session_need_human(session_id: str):
+    payload = _agent_body_payload()
+    try:
+        agent_service.require_agent_capability(
+            "research.experiment.submit", str(payload["actor_type"]).lower()
+        )
+        result = ResearchAgentSessionService(get_default_store()).need_human(
+            session_id,
+            reason_code=str(payload.get("reason_code") or ""),
+            question=str(payload.get("question") or ""),
+            context=dict(payload.get("context") or {}),
+        )
+        return jsonify({"ok": True, "data": _researcher_session_view(result)})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/researcher/sessions/<session_id>/answer")
+@require_local_request
+@debug_timing("researcher_session_answer")
+def researcher_session_answer(session_id: str):
+    payload = _agent_body_payload(default_type="human", default_id="local_user")
+    try:
+        if str(payload.get("actor_type") or "").lower() != "human":
+            raise PermissionError("only a human actor can answer a Research Session question")
+        result = ResearchAgentSessionService(get_default_store()).answer(session_id, payload.get("answer"))
+        return jsonify({"ok": True, "data": _researcher_session_view(result)})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/researcher/sessions/<session_id>/experiments")
+@require_local_request
+@debug_timing("researcher_experiment_submit")
+def researcher_experiment_submit(session_id: str):
+    payload = _agent_body_payload()
+    try:
+        actor_type = str(payload["actor_type"]).lower()
+        actor_id = str(payload["actor_id"])
+        agent_service.require_agent_capability("research.experiment.submit", actor_type)
+        # Submission only persists and validates the Candidate. Compilation,
+        # data preparation and execution are dispatched by the isolated worker
+        # orchestrator so this HTTP request cannot monopolize the Web process.
+        result = ResearchExperimentService(get_default_store()).submit(
+            session_id, payload, advance_immediately=False
+        )
+        _audit_agent_research(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            capability="research.experiment.submit",
+            target_type="research_experiment",
+            target_id=result["experiment_id"],
+            payload=payload,
+            output=result,
+        )
+        return jsonify({"ok": True, "data": result}), 201
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.get("/api/agent/researcher/experiments/<experiment_id>")
+@debug_timing("researcher_experiment_result")
+def researcher_experiment_result(experiment_id: str):
+    try:
+        payload = _agent_query_payload()
+        agent_service.require_agent_capability("research.read", str(payload["actor_type"]).lower())
+        result = ResearchExperimentService(get_default_store()).get(experiment_id)
+        if result is None:
+            return jsonify({"ok": False, "code": "RESEARCH_EXPERIMENT_NOT_FOUND", "error": "Experiment not found"}), 404
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/researcher/experiments/<experiment_id>/decide")
+@require_local_request
+@debug_timing("researcher_experiment_decide")
+def researcher_experiment_decide(experiment_id: str):
+    payload = _agent_body_payload()
+    try:
+        actor_type = str(payload["actor_type"]).lower()
+        actor_id = str(payload["actor_id"])
+        agent_service.require_agent_capability("research.experiment.decide", actor_type)
+        result = ResearchExperimentService(get_default_store()).decide(
+            experiment_id,
+            str(payload.get("decision") or ""),
+            payload.get("learning") or {},
+        )
+        _audit_agent_research(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            capability="research.experiment.decide",
+            target_type="research_experiment",
+            target_id=experiment_id,
+            payload=payload,
+            output=result,
+        )
+        return jsonify({"ok": True, "data": result})
+    except Exception as exc:
+        return _agent_research_error(exc)
 
 
 @app.get("/api/agent/research/sessions")
@@ -5197,6 +5898,9 @@ def agent_research_session_continue(session_id: str):
 def agent_research_session_need_human(session_id: str):
     payload = _agent_body_payload()
     try:
+        agent_service.require_agent_capability(
+            "research.experiment.submit", str(payload["actor_type"]).lower()
+        )
         result = ResearchAgentSessionService(get_default_store()).need_human(
             session_id,
             reason_code=str(payload.get("reason_code") or ""),
@@ -5359,6 +6063,8 @@ def agent_research_universe_create(project_id: str):
             return jsonify({"ok": True, "data": data}), 201
         parameters = dict(payload.get("parameters") or {})
         instruments = parameters.get("instrument_ids") or parameters.get("candidate_instrument_ids") or []
+        if str(payload.get("universe_type") or "").strip().upper() == "HISTORICAL_EQUITY_PIT":
+            instruments = ["equity:CRSP:ALL"]
         actor_type, actor_id, decision = _agent_research_authorize(
             payload, project_id, "UNIVERSE_CREATE", "research.universe.create",
             providers=payload.get("providers") or [], instrument_ids=instruments,
@@ -5399,7 +6105,13 @@ def agent_research_universe_snapshot_create(project_id: str, universe_definition
         actor_type, actor_id, decision = _agent_research_authorize(
             payload, project_id, "UNIVERSE_SNAPSHOT_CREATE", "research.universe.snapshot.create",
             universe_definition_id=universe_definition_id,
-            instrument_ids=universe.parameters.get("instrument_ids") or universe.parameters.get("candidate_instrument_ids") or [],
+            instrument_ids=(
+                ["equity:CRSP:ALL"]
+                if universe.universe_type == "HISTORICAL_EQUITY_PIT"
+                else universe.parameters.get("instrument_ids")
+                or universe.parameters.get("candidate_instrument_ids")
+                or []
+            ),
         )
         catalog = DatasetCatalogService(get_default_store())
         manifests = []
@@ -5605,6 +6317,60 @@ def agent_research_universe_ref_remove(project_id: str):
         return _agent_research_error(exc)
 
 
+@app.put("/api/agent/research/projects/<project_id>/universe-ref")
+@require_local_request
+@debug_timing("agent_research_universe_ref_set")
+def agent_research_universe_ref_set(project_id: str):
+    payload = _agent_body_payload()
+    try:
+        snapshot_id = str(payload.get("universe_snapshot_id") or "").strip()
+        snapshot = UniverseService(get_default_store()).get_snapshot(snapshot_id)
+        if snapshot is None:
+            raise ValueError("universe snapshot not found")
+        definition = UniverseService(get_default_store()).get_definition(
+            snapshot.universe_definition_id
+        )
+        if definition is None or (
+            definition.library_scope == "PROJECT"
+            and definition.owner_project_id != project_id
+        ):
+            raise ResearchAuthorizationError(
+                "RESEARCH_UNIVERSE_OUT_OF_SCOPE",
+                "Universe Snapshot is outside Project scope",
+            )
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload,
+            project_id,
+            "PROJECT_PIN",
+            "research.project.pin",
+            universe_definition_id=definition.universe_definition_id,
+            universe_snapshot_id=snapshot_id,
+        )
+        if not bool(decision.grant.get("scope", {}).get("allow_project_pin", True)):
+            raise ResearchAuthorizationError(
+                "RESEARCH_PROJECT_PIN_DENIED",
+                "Project Pin is disabled in Grant scope",
+            )
+        result = UniverseService(get_default_store()).set_research_ref(
+            project_id=project_id,
+            universe_snapshot_id=snapshot_id,
+            library_asset_id=str(payload.get("library_asset_id") or ""),
+        )
+        data = {**result, "authorization": decision.to_dict()}
+        _audit_agent_research(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            capability="research.project.pin",
+            target_type="research_universe_ref",
+            target_id=project_id,
+            payload=payload,
+            output=data,
+        )
+        return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
 @app.delete("/api/agent/research/projects/<project_id>/requirements/items/<ref_id>")
 @require_local_request
 @debug_timing("agent_research_requirement_remove")
@@ -5733,6 +6499,44 @@ def agent_research_preview_create(project_id: str):
             target_type="run_inputs_preview", target_id=result["preview_id"], payload=payload, output=result,
         )
         return jsonify({"ok": True, "data": result}), 201
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/projects/<project_id>/equity-monthly-panel")
+@require_local_request
+@debug_timing("agent_research_equity_monthly_panel")
+def agent_research_equity_monthly_panel(project_id: str):
+    payload = _agent_body_payload()
+    try:
+        actor_type, actor_id, decision = _agent_research_authorize(
+            payload,
+            project_id,
+            "BACKFILL_CREATE",
+            "research.backfill.create",
+            universe_snapshot_id=str(payload.get("universe_snapshot_id") or ""),
+            time_start=str(payload.get("start_date") or ""),
+            time_end=str(payload.get("end_date") or ""),
+        )
+        result = EquityMonthlyResearchMaterializer(get_default_store()).materialize(
+            project_id=project_id,
+            universe_snapshot_id=str(payload.get("universe_snapshot_id") or ""),
+            start_date=str(payload.get("start_date") or ""),
+            end_date=str(payload.get("end_date") or ""),
+            source_manifest_ids=payload.get("source_manifest_ids") or {},
+            minimum_listing_age_days=int(payload.get("minimum_listing_age_days") or 365),
+        )
+        data = {**result, "authorization": decision.to_dict()}
+        _audit_agent_research(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            capability="research.backfill.create",
+            target_type="equity_research_monthly_panel",
+            target_id=str(result["panel_manifest_id"]),
+            payload=payload,
+            output=data,
+        )
+        return jsonify({"ok": True, "data": data}), 201
     except Exception as exc:
         return _agent_research_error(exc)
 
@@ -5987,15 +6791,50 @@ def agent_research_run_execute(project_id: str):
         actor_type, actor_id, _decision = _agent_research_authorize(
             payload, project_id, "RUN_EXECUTE", "research.run.execute"
         )
-        result = ResearchRunWorker(
-            get_default_store(), worker_id=str(payload.get("worker_id") or f"agent-worker:{actor_id}")
-        ).run_once(lease_seconds=int(payload.get("lease_seconds") or 300), project_id=project_id)
-        data = result or {"status": "IDLE", "project_id": project_id}
+        dispatched = _dispatch_research_run_once()
+        project_runs = ResearchRunService(get_default_store()).list(
+            project_id=project_id, limit=20
+        )
+        active = next(
+            (
+                item for item in project_runs
+                if str(item.get("status") or "").upper() in {"QUEUED", "RUNNING"}
+            ),
+            None,
+        )
+        data = active or {"status": "IDLE", "project_id": project_id}
+        data = {**data, "dispatch_accepted": dispatched, "execution_mode": "DURABLE_QUEUE"}
         _audit_agent_research(
             actor_type=actor_type, actor_id=actor_id, capability="research.run.execute",
             target_type="research_run", target_id=str(data.get("run_id") or project_id), payload=payload, output=data,
         )
         return jsonify({"ok": True, "data": data})
+    except Exception as exc:
+        return _agent_research_error(exc)
+
+
+@app.post("/api/agent/research/projects/<project_id>/budget-reconcile")
+@require_local_request
+@debug_timing("agent_research_budget_reconcile")
+def agent_research_budget_reconcile(project_id: str):
+    payload = _agent_body_payload()
+    try:
+        actor_type, actor_id, _decision = _agent_research_authorize(
+            payload, project_id, "RUN_EXECUTE", "research.run.execute"
+        )
+        result = ResearchRunWorker.reconcile_project_runtime_budget(
+            get_default_store(), project_id
+        )
+        _audit_agent_research(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            capability="research.run.execute",
+            target_type="research_budget_ledger",
+            target_id=project_id,
+            payload=payload,
+            output=result,
+        )
+        return jsonify({"ok": True, "data": result})
     except Exception as exc:
         return _agent_research_error(exc)
 
@@ -7687,10 +8526,114 @@ def virtual_reset(strategy_id: int):
         return _json_error(exc)
 
 
+# ============================================================================
+# Resource Configuration API (User-Configurable Memory Budgets)
+# ============================================================================
+
+@app.get("/api/resource-config")
+@debug_timing("resource_config_get")
+def get_resource_config():
+    """Get current resource configuration and real-time snapshot"""
+    try:
+        from services.data_platform.resource_config_service import ResourceConfigService
+        service = ResourceConfigService(get_default_store())
+        config = service.get()
+        snapshot = service.get_runtime_snapshot()
+        return jsonify({
+            "ok": True,
+            "config": {
+                "physical_memory_mb": config.physical_memory_mb,
+                "max_research_budget_mb": config.max_research_budget_mb,
+                "user_research_budget_mb": config.user_research_budget_mb,
+                "user_config_mode": config.user_config_mode,
+                "user_light_worker_mb": config.user_light_worker_mb,
+                "user_heavy_worker_mb": config.user_heavy_worker_mb,
+                "user_backtest_worker_mb": config.user_backtest_worker_mb,
+                "user_standard_worker_limit": config.user_standard_worker_limit,
+            },
+            "runtime": snapshot,
+        })
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.put("/api/resource-config")
+@require_local_request
+@debug_timing("resource_config_update")
+def update_resource_config():
+    """Update user resource configuration"""
+    try:
+        from services.data_platform.resource_config_service import ResourceConfigService
+        payload = request.get_json(silent=True) or {}
+        service = ResourceConfigService(get_default_store())
+
+        updated = service.update_user_config(
+            user_research_budget_mb=payload.get("user_research_budget_mb"),
+            user_config_mode=payload.get("user_config_mode"),
+            user_light_worker_mb=payload.get("user_light_worker_mb"),
+            user_heavy_worker_mb=payload.get("user_heavy_worker_mb"),
+            user_backtest_worker_mb=payload.get("user_backtest_worker_mb"),
+            user_standard_worker_limit=payload.get("user_standard_worker_limit"),
+            actor="web_user",
+        )
+        return jsonify({
+            "ok": True,
+            "message": "资源配置已更新",
+            "config": {
+                "user_research_budget_mb": updated.user_research_budget_mb,
+                "user_config_mode": updated.user_config_mode,
+            },
+        })
+    except ValueError as exc:
+        return _json_error(exc, 400)
+    except Exception as exc:
+        return _json_error(exc)
+
+
+@app.get("/api/resource-config/snapshot")
+@debug_timing("resource_snapshot")
+def get_resource_snapshot():
+    """Real-time resource snapshot (for dashboard polling)"""
+    try:
+        from services.data_platform.resource_config_service import ResourceConfigService
+        service = ResourceConfigService(get_default_store())
+        snapshot = service.get_runtime_snapshot()
+        return jsonify({"ok": True, "data": snapshot})
+    except Exception as exc:
+        return _json_error(exc)
+
+
 if __name__ == "__main__":
     ws_market_sync.start()
     collector.start()
     virtual_runner.start()
     event_news_scheduler.start()
-    _start_requirement_maintenance()
+    try:
+        backtest_recovery = recover_backtest_queue()
+        if backtest_recovery.get("queued") or backtest_recovery.get("interrupted"):
+            print(
+                "[BACKTEST][RECOVERY] "
+                f"queued={len(backtest_recovery.get('queued') or [])} "
+                f"interrupted={len(backtest_recovery.get('interrupted') or [])}",
+                flush=True,
+            )
+        recovery = ResearchExperimentService(
+            get_default_store(), isolate_experiment_execution=True
+        ).quarantine_interrupted()
+        if recovery.get("count"):
+            print(
+                f"[RESEARCH-EXPERIMENT][RECOVERY] quarantined={recovery['count']}",
+                flush=True,
+            )
+        _start_requirement_maintenance()
+        _start_research_run_orchestrator()
+        _start_research_experiment_orchestrator()
+    except Exception as exc:
+        # Keep the UI/diagnostic API available, but never resume Experiments
+        # when restart recovery itself could not prove the old worker is gone.
+        print(
+            f"[RESEARCH-EXPERIMENT][RECOVERY-ERR] orchestrator disabled: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
     app.run(host="127.0.0.1", port=5001, debug=False, use_reloader=False)

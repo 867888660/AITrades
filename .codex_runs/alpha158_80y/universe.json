@@ -1,0 +1,21 @@
+{
+  "session_id": "research_session_8c6252f86d454a09a517f583fdba769a",
+  "name": "Long-history US equities for 80-year capability test",
+  "version": "1.0.0",
+  "universe_type": "STATIC_LIST",
+  "providers": ["OPENBB"],
+  "parameters": {
+    "instrument_ids": [
+      "equity:XNYS:IBM",
+      "equity:XNYS:KO",
+      "equity:XNYS:PG",
+      "equity:XNYS:XOM",
+      "equity:XNYS:GE",
+      "equity:XNYS:JPM",
+      "equity:XNYS:CVX",
+      "equity:XNYS:CAT",
+      "equity:XNYS:MMM",
+      "equity:XNYS:DIS"
+    ]
+  }
+}

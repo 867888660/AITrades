@@ -7,8 +7,10 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from .data_client import FrozenManifestData
+from .coverage_semantics import range_end_covers_requirement
 from .models import DataRequirement
 from .requirement_compiler import RequirementCompiler
+from .equity_factor_bridge import field_is_available
 from .requirement_service import normalize_source_selection_policy
 from .run_contracts import (
     ReadinessCheck,
@@ -178,6 +180,7 @@ class DeterministicManifestResolver:
         run_policy = normalize_source_selection_policy(policy)
         bindings: list[dict[str, Any]] = []
         checks: list[ReadinessCheck] = []
+        physical_verification: dict[str, str | None] = {}
 
         for requirement in requirement_set.requirements:
             instruments = tuple(sorted(requirement.instrument_ids))
@@ -216,6 +219,7 @@ class DeterministicManifestResolver:
                     preferred_sources=preferred_sources,
                     allowed_sources=allowed_sources,
                     verify_physical=verify_physical,
+                    physical_verification=physical_verification,
                 )
                 checks.extend(item_checks)
                 if binding:
@@ -285,7 +289,13 @@ class DeterministicManifestResolver:
         preferred_sources: list[str],
         allowed_sources: set[str],
         verify_physical: bool,
+        physical_verification: dict[str, str | None] | None = None,
     ) -> tuple[dict[str, Any] | None, list[ReadinessCheck]]:
+        # Direct readiness callers do not need to coordinate verification across
+        # instruments.  Full resolve() calls pass a shared cache so one manifest
+        # is still verified only once for the whole universe.
+        if physical_verification is None:
+            physical_verification = {}
         checks: list[ReadinessCheck] = []
         object_ref = f"{instrument_id}:{requirement.data_type}:{requirement.frequency}"
         with self.store.connection() as conn:
@@ -300,7 +310,8 @@ class DeterministicManifestResolver:
                 FROM dataset_catalog c
                 JOIN dataset_manifests m ON m.dataset_id=c.dataset_id
                 JOIN dataset_partitions p ON p.manifest_id=m.manifest_id
-                WHERE c.instrument_id=? AND lower(c.data_type)=? AND lower(c.frequency)=?
+                WHERE c.instrument_id IN (?, 'equity:CRSP:ALL')
+                  AND lower(c.data_type)=? AND lower(c.frequency)=?
                   AND c.status='READY' AND m.status='READY'
                 GROUP BY m.manifest_id
                 """,
@@ -329,7 +340,21 @@ class DeterministicManifestResolver:
             fields = set(json.loads(row["fields_json"] or "[]"))
             if not fields and "bar" in str(row["schema_version"]).lower():
                 fields = set(_CANONICAL_BAR_FIELDS)
-            missing_fields = sorted({item.lower() for item in requirement.fields} - {item.lower() for item in fields})
+            logical_dataset = (
+                "fundamentals"
+                if requirement.data_type.lower() in {"fundamentals_pit", "fundamentals_derived"}
+                else requirement.data_type.lower()
+            )
+            missing_fields = sorted(
+                item.lower()
+                for item in requirement.fields
+                if not field_is_available(
+                    logical_dataset,
+                    item,
+                    physical_data_type=requirement.data_type,
+                    catalog_fields=fields,
+                )
+            )
             if missing_fields:
                 failure_checks.append(self._blocked(
                     ResearchReasonCode.FIELD_NOT_COVERED, object_ref,
@@ -377,7 +402,15 @@ class DeterministicManifestResolver:
                     RemediationCode.CREATE_BACKFILL_TASK, "Manifest does not cover the compiled warmup start",
                 ))
                 continue
-            if required_end and not event_history and (not range_end or range_end < required_end):
+            if required_end and not event_history and not range_end_covers_requirement(
+                actual_end=range_end,
+                required_end=required_end,
+                data_type=requirement.data_type,
+                frequency=requirement.frequency,
+                source=row["source"],
+                schema_version=row["manifest_schema_version"],
+                time_semantics=row["time_semantics"],
+            ):
                 failure_checks.append(self._blocked(
                     ResearchReasonCode.REQUESTED_RANGE_NOT_COVERED, object_ref,
                     {"end_time": requirement.history_end}, {"end_time": row["partition_end"] or row["end_time"]},
@@ -391,7 +424,13 @@ class DeterministicManifestResolver:
             # provider adapter uses instead of leaving an automatically
             # prepared dataset permanently unresolved.
             equity_unadjusted_compatible = (
-                instrument_id.lower().startswith("equity:")
+                (
+                    instrument_id.lower().startswith("equity:")
+                    or (
+                        ":" not in instrument_id
+                        and str(row["source"] or "").upper().startswith("OPENBB")
+                    )
+                )
                 and required_adjustment in {"NONE", "UNADJUSTED"}
                 and actual_adjustment in {"NONE", "UNADJUSTED", "SPLITS_ONLY"}
             )
@@ -435,12 +474,19 @@ class DeterministicManifestResolver:
                 ))
                 continue
             if verify_physical:
-                try:
-                    FrozenManifestData(self.store, str(row["manifest_id"])).verify()
-                except Exception as exc:
+                manifest_id = str(row["manifest_id"])
+                if manifest_id not in physical_verification:
+                    try:
+                        FrozenManifestData(self.store, manifest_id).verify()
+                    except Exception as exc:
+                        physical_verification[manifest_id] = str(exc)
+                    else:
+                        physical_verification[manifest_id] = None
+                verification_error = physical_verification[manifest_id]
+                if verification_error is not None:
                     failure_checks.append(self._blocked(
                         ResearchReasonCode.MANIFEST_DAMAGED, object_ref,
-                        {"integrity": "VERIFIED"}, {"manifest_id": row["manifest_id"], "error": str(exc)},
+                        {"integrity": "VERIFIED"}, {"manifest_id": manifest_id, "error": verification_error},
                         RemediationCode.RETRY_PHYSICAL_VALIDATION, "Manifest physical verification failed",
                     ))
                     continue

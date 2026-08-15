@@ -206,6 +206,60 @@ class FactorInputCandidateResolverTests(unittest.TestCase):
                 [{"variable_name": "price", "dataset": "bars", "field": "close", "frequency": "1d"}],
             )
 
+    def test_crsp_all_catalog_rows_expose_pit_valuation_dividend_and_sec_inputs(self) -> None:
+        project_id = self._project_with_instrument(
+            Instrument(
+                instrument_id="equity:CRSP:10001",
+                asset_class="equity",
+                venue="CRSP",
+                market_type="EQUITY",
+                native_symbol="10001",
+                currency="USD",
+            ),
+            ("crsp:permno", "10001"),
+        )
+        catalog = DatasetCatalogService(self.store)
+        for payload in (
+            {
+                "dataset_id": "crsp:all:valuation",
+                "data_type": "equity_valuation_daily",
+                "frequency": "1d",
+                "fields": ["market_cap", "shares_outstanding"],
+                "source": "CRSP",
+            },
+            {
+                "dataset_id": "crsp:all:actions",
+                "data_type": "corporate_actions",
+                "frequency": "event",
+                "fields": ["cash_dividend", "price_factor", "share_factor"],
+                "source": "CRSP",
+            },
+            {
+                "dataset_id": "sec:all:pit",
+                "data_type": "fundamentals_pit",
+                "frequency": "event",
+                "fields": ["concept", "value", "available_time"],
+                "source": "SEC",
+            },
+        ):
+            catalog.upsert_catalog({
+                **payload,
+                "instrument_id": "equity:CRSP:ALL",
+                "status": "READY",
+                "quality_status": "PASS",
+                "schema_version": "equity_pit.v1",
+                "storage_path": "unused",
+                "point_in_time_policy": "AS_OF",
+            })
+
+        result = FactorInputCandidateResolver(self.store, settings={}).resolve_project(project_id)
+        by_id = {item["candidate_id"]: item for item in result["input_candidates"]}
+
+        self.assertTrue(by_id["equity_valuation_daily.market_cap:1d"]["factor_selectable"])
+        self.assertTrue(by_id["corporate_actions.cash_dividend:event"]["factor_selectable"])
+        self.assertTrue(by_id["fundamentals.net_income_ttm:event"]["factor_selectable"])
+        self.assertEqual(1, by_id["fundamentals.net_income_ttm:event"]["prepared_instrument_count"])
+
 
 if __name__ == "__main__":
     unittest.main()

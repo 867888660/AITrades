@@ -63,6 +63,7 @@ const marketUi = window.PolyMarketUi;
 const HOMEPAGE_STRATEGY_LIMIT = 30;
 
 let uiRefreshTimer = null;
+const uiLoadsInFlight = new Map();
 let hasLoadedOverview = false;
 let hasLoadedCrypto = false;
 let hasLoadedFinance = false;
@@ -596,8 +597,20 @@ function renderTable(container, columns, rows) {
 async function fetchJson(url, options = undefined) {
   const t0 = performance.now();
   console.log(`[FE][start] ${url}`, options || {});
+  const requestOptions = { ...(options || {}) };
+  const timeoutMs = Math.max(1000, Number(requestOptions.timeoutMs || 20000));
+  delete requestOptions.timeoutMs;
+  const externalSignal = requestOptions.signal;
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    else externalSignal.addEventListener("abort", forwardAbort, { once: true });
+  }
+  requestOptions.signal = controller.signal;
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(url, options);
+    const response = await fetch(url, requestOptions);
     const data = await response.json();
     const dt = (performance.now() - t0).toFixed(1);
     console.log(`[FE][done] ${url} status=${response.status} cost=${dt}ms`, data);
@@ -608,7 +621,13 @@ async function fetchJson(url, options = undefined) {
   } catch (error) {
     const dt = (performance.now() - t0).toFixed(1);
     console.error(`[FE][error] ${url} cost=${dt}ms`, error);
+    if (error?.name === "AbortError") {
+      throw new Error(`请求超时（${Math.round(timeoutMs / 1000)} 秒）：${url}`);
+    }
     throw error;
+  } finally {
+    clearTimeout(timeoutId);
+    externalSignal?.removeEventListener?.("abort", forwardAbort);
   }
 }
 
@@ -1222,7 +1241,7 @@ async function loadOverview(options = {}) {
   if (!silent && !hasLoadedOverview) {
     setStatus(overviewCards, "加载中...");
   }
-  const data = await fetchJson("/api/overview");
+  const data = await fetchJson("/api/overview", { timeoutMs: 8000 });
   const t1 = performance.now();
   latestOverview = data;
   renderCards(data);
@@ -1828,12 +1847,19 @@ function switchBinanceTab(category) {
 }
 
 async function loadStrategies(options = {}) {
+  return runUiLoad("strategies", () => loadStrategiesOnce(options));
+}
+
+async function loadStrategiesOnce(options = {}) {
   const { silent = false } = options;
   const t0 = performance.now();
   if (!silent && !hasLoadedStrategies) {
     setStatus(strategyTable, "加载中...");
   }
-  const data = await fetchJson(`/api/polymarket/strategies?limit=${HOMEPAGE_STRATEGY_LIMIT}&sync_stats=0`);
+  const data = await fetchJson(
+    `/api/polymarket/strategies?limit=${HOMEPAGE_STRATEGY_LIMIT}&sync_stats=0`,
+    { timeoutMs: 12000 }
+  );
   const t1 = performance.now();
   renderStrategyMeta(data);
   if (!data.ok) {
@@ -2304,22 +2330,42 @@ function startUiPolling(seconds) {
     clearInterval(uiRefreshTimer);
   }
   uiRefreshTimer = setInterval(() => {
-    loadAgentDashboard({ silent: true }).catch((error) => {
+    runUiLoad("agent", () => loadAgentDashboard({ silent: true }), (error) => {
       if (agentMeta) agentMeta.textContent = error.message;
     });
-    loadOverview({ silent: true }).catch((error) => setStatus(systemStatus, error.message));
-    loadRealtimeCrypto({ silent: true }).catch((error) => setStatus(cryptoTable, error.message));
-    loadRealtimeFinance({ silent: true }).catch((error) => setStatus(financeTable, error.message));
+    runUiLoad("overview", () => loadOverview({ silent: true }), (error) => setStatus(systemStatus, error.message));
+    runUiLoad("crypto", () => loadRealtimeCrypto({ silent: true }), (error) => setStatus(cryptoTable, error.message));
+    runUiLoad("finance", () => loadRealtimeFinance({ silent: true }), (error) => setStatus(financeTable, error.message));
   }, Math.max(2, seconds) * 1000);
 }
 
+function runUiLoad(key, loader, onError) {
+  if (uiLoadsInFlight.has(key)) {
+    return uiLoadsInFlight.get(key);
+  }
+  const pending = Promise.resolve()
+    .then(loader)
+    .catch((error) => {
+      onError?.(error);
+      throw error;
+    })
+    .finally(() => {
+      if (uiLoadsInFlight.get(key) === pending) uiLoadsInFlight.delete(key);
+    });
+  // Polling callers intentionally do not await; attach a terminal handler so
+  // a transient endpoint failure never becomes an unhandled rejection.
+  pending.catch(() => {});
+  uiLoadsInFlight.set(key, pending);
+  return pending;
+}
+
 document.getElementById("refreshOverviewBtn").addEventListener("click", () => {
-  loadAgentDashboard().catch((error) => {
+  runUiLoad("agent", () => loadAgentDashboard(), (error) => {
     if (agentMeta) agentMeta.textContent = error.message;
   });
-  loadOverview().catch((error) => setStatus(overviewCards, error.message));
-  loadRealtimeCrypto().catch((error) => setStatus(cryptoTable, error.message));
-  loadRealtimeFinance().catch((error) => setStatus(financeTable, error.message));
+  runUiLoad("overview", () => loadOverview(), (error) => setStatus(overviewCards, error.message));
+  runUiLoad("crypto", () => loadRealtimeCrypto(), (error) => setStatus(cryptoTable, error.message));
+  runUiLoad("finance", () => loadRealtimeFinance(), (error) => setStatus(financeTable, error.message));
 });
 
 refreshAgentBtn?.addEventListener("click", () => {

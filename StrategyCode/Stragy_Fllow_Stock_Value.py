@@ -2,6 +2,7 @@ import ast
 import difflib
 import json
 import re
+from datetime import datetime, timezone
 
 # ===== 节点定义 =====
 OutPutNum = 2
@@ -48,6 +49,15 @@ ControlsSchema = {
     "force_flat": {"type": "bool", "default": False, "label": "强制清仓"},
     "risk_scale": {"type": "number", "default": 1.0, "min": 0.0, "max": 1.0, "label": "目标仓位缩放"},
     "debug_raw_inputs": {"type": "bool", "default": False, "label": "打印原始 UseData"},
+    "allow_no_reversal": {"type": "bool", "default": False, "label": "允许自动反手买 NO"},
+    "settlement_lock_days": {"type": "number", "default": 7.0, "min": 0.0, "max": 30.0, "label": "结算前锁仓天数"},
+    "max_yes_entry_price": {"type": "number", "default": 0.70, "min": 0.0, "max": 1.0, "label": "YES 最高开仓价"},
+    "max_no_entry_price": {"type": "number", "default": 0.70, "min": 0.0, "max": 1.0, "label": "NO 最高开仓价"},
+    "min_entry_cash_usdc": {"type": "number", "default": 5.0, "min": 0.0, "label": "最低加仓现金"},
+    "yes_full_on_pct": {"type": "number", "default": 0.03, "min": 0.0, "max": 1.0, "label": "YES 满仓排名差比例"},
+    "yes_off_pct": {"type": "number", "default": 0.015, "min": 0.0, "max": 1.0, "label": "YES 中性排名差比例"},
+    "no_full_on_pct": {"type": "number", "default": 0.06, "min": 0.0, "max": 1.0, "label": "NO 满仓回归差比例"},
+    "no_off_pct": {"type": "number", "default": 0.03, "min": 0.0, "max": 1.0, "label": "NO 中性回归差比例"},
 }
 
 RuntimeStateSchema = {
@@ -306,6 +316,19 @@ def _pick_ts(usedata: _UseDataProxy):
     return None
 
 
+def _parse_utc_datetime(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _emit_db_json(Print, ts, inputs, actions, calc=None):
     payload = {
         "ts": ts,
@@ -453,7 +476,10 @@ def _run_strategy(usedata: _UseDataProxy, anchor_company: str, rank_position: in
         if fact_state == "F_YES":
             return "P2_YES_FULL"
         if fact_state == "F_NO":
-            return "P4_NO_FULL"
+            # A single-company YES thesis is not automatically a sufficiently
+            # strong NO thesis. Default to cash when the rank signal breaks;
+            # explicit opt-in preserves the old symmetric reversal behaviour.
+            return "P4_NO_FULL" if allow_no_reversal else "P0_EMPTY"
         return "P0_EMPTY"
 
     def step_towards(cur_state, target_state):
@@ -498,6 +524,11 @@ def _run_strategy(usedata: _UseDataProxy, anchor_company: str, rank_position: in
     force_flat = _to_bool(controls.get("force_flat"), False)
     risk_scale = clamp01(controls.get("risk_scale", 1.0))
     debug_raw_inputs = _to_bool(controls.get("debug_raw_inputs"), False)
+    allow_no_reversal = _to_bool(controls.get("allow_no_reversal"), False)
+    settlement_lock_days = max(0.0, _to_float(controls.get("settlement_lock_days"), 7.0))
+    max_yes_entry_price = clamp01(controls.get("max_yes_entry_price", 0.70))
+    max_no_entry_price = clamp01(controls.get("max_no_entry_price", 0.70))
+    min_entry_cash_usdc = max(0.0, _to_float(controls.get("min_entry_cash_usdc"), 5.0))
     if debug_raw_inputs:
         Print("=== INPUT_PARAMS_BEGIN ===")
         Print("param.AnchorCompany=" + str(anchor_company))
@@ -511,6 +542,23 @@ def _run_strategy(usedata: _UseDataProxy, anchor_company: str, rank_position: in
 
     Enddate = usedata.get("Enddate", usedata.get("end_date", ""))
     day_to_end = _to_float(usedata.get("day_to_end", usedata.get("days_to_end", 9999)), default=9999)
+    market_status = str(
+        usedata.get("L0_MarketStatus", usedata.get("MarketStatus", "")) or ""
+    ).strip().lower()
+    now_at = _parse_utc_datetime(_pick_ts(usedata))
+    end_at = _parse_utc_datetime(
+        usedata.get("L0_EndTime", usedata.get("Enddate_L0", Enddate))
+    )
+    market_terminal = market_status in {"closed", "expired", "resolved", "settled", "finalized"}
+    if now_at is not None and end_at is not None and now_at >= end_at:
+        market_terminal = True
+    terminal_reason = "market_terminal:" + (market_status or "end_time_reached")
+    settlement_locked = bool(
+        not market_terminal
+        and not force_flat
+        and settlement_lock_days > 0.0
+        and 0.0 <= day_to_end <= settlement_lock_days
+    )
 
     Yes_now_bid = _to_float(usedata.get("Yes_now_bid", 0.0), default=0.0)
     Yes_now_ask = _to_float(usedata.get("Yes_now_ask", 1.0), default=1.0)
@@ -634,14 +682,17 @@ def _run_strategy(usedata: _UseDataProxy, anchor_company: str, rank_position: in
     Print("is_target_rank=" + str(is_target_rank))
 
     # =========================
-    # 防抖阈值（无历史版）
+    # 防抖阈值（按锚定公司市值比例缩放）
     # =========================
-    # 你后续可直接调这些数字
-    YES_FULL_ON = 120000000000.0   # 在目标位且领先缓冲很大，偏 Yes
-    YES_OFF = 60000000000.0        # 低于此值就不再认为 Yes 强
-
-    NO_FULL_ON = 250000000000.0    # 不在目标位且距离回归很远，偏 No
-    NO_OFF = 120000000000.0        # 小于此值说明“不在目标位但很接近”，进入中性观察
+    # 固定美元阈值会让 5T 公司比 1T 公司敏感得多，改为相对市值阈值。
+    yes_full_on_pct = max(0.0, _to_float(controls.get("yes_full_on_pct"), 0.03))
+    yes_off_pct = max(0.0, _to_float(controls.get("yes_off_pct"), 0.015))
+    no_full_on_pct = max(0.0, _to_float(controls.get("no_full_on_pct"), 0.06))
+    no_off_pct = max(0.0, _to_float(controls.get("no_off_pct"), 0.03))
+    YES_FULL_ON = anchor_mcap * max(yes_full_on_pct, yes_off_pct)
+    YES_OFF = anchor_mcap * min(yes_full_on_pct, yes_off_pct)
+    NO_FULL_ON = anchor_mcap * max(no_full_on_pct, no_off_pct)
+    NO_OFF = anchor_mcap * min(no_full_on_pct, no_off_pct)
 
     # 临近结算时更保守
     if day_to_end <= 1.0:
@@ -684,13 +735,47 @@ def _run_strategy(usedata: _UseDataProxy, anchor_company: str, rank_position: in
     # =========================
     pos_state = detect_pos_state(Yes_Now_Pos, No_Now_Pos)
     target_state = target_state_from_fact(fact_state)
-    if force_flat:
+    guard_reason = ""
+    if market_terminal:
+        target_state = pos_state
+        guard_reason = terminal_reason
+    elif settlement_locked:
+        target_state = pos_state
+        guard_reason = f"settlement_lock({day_to_end:.4f}d <= {settlement_lock_days:.4f}d)"
+    elif force_flat:
         target_state = "P0_EMPTY"
         fact_reason = "controls_force_flat"
     elif manual_pause_open and pos_state == "P0_EMPTY" and target_state != "P0_EMPTY":
         target_state = "P0_EMPTY"
         fact_reason = "controls_manual_pause_open"
     next_state = step_towards(pos_state, target_state)
+
+    # 只拦截加仓，不拦截减仓。避免价格过高或现金不足时每个 tick 重复发单。
+    state_allocations = {
+        "P0_EMPTY": (0.0, 0.0),
+        "P1_YES_HALF": (0.5, 0.0),
+        "P2_YES_FULL": (1.0, 0.0),
+        "P3_NO_HALF": (0.0, 0.5),
+        "P4_NO_FULL": (0.0, 1.0),
+    }
+    next_yes_target, next_no_target = state_allocations[next_state]
+    portfolio = _as_dict(usedata.get("Portfolio", {}))
+    available_cash = portfolio.get("cash")
+    available_cash = _to_float(available_cash, 0.0) if available_cash is not None else None
+    entry_block_reason = ""
+    if next_yes_target > Yes_Now_Pos + 0.05:
+        if Yes_now_ask <= 0.0 or Yes_now_ask > max_yes_entry_price:
+            entry_block_reason = f"yes_entry_price_guard({Yes_now_ask} > {max_yes_entry_price})"
+        elif available_cash is not None and available_cash < min_entry_cash_usdc:
+            entry_block_reason = f"entry_cash_guard({available_cash} < {min_entry_cash_usdc})"
+    elif next_no_target > No_Now_Pos + 0.05:
+        if No_now_ask <= 0.0 or No_now_ask > max_no_entry_price:
+            entry_block_reason = f"no_entry_price_guard({No_now_ask} > {max_no_entry_price})"
+        elif available_cash is not None and available_cash < min_entry_cash_usdc:
+            entry_block_reason = f"entry_cash_guard({available_cash} < {min_entry_cash_usdc})"
+    if entry_block_reason:
+        next_state = pos_state
+        guard_reason = entry_block_reason
 
     Print("pos_state=" + str(pos_state))
     Print("fact_state=" + str(fact_state))
@@ -701,7 +786,10 @@ def _run_strategy(usedata: _UseDataProxy, anchor_company: str, rank_position: in
     # =========================
     # 执行动作
     # =========================
-    if not rank_ok:
+    if market_terminal or settlement_locked or entry_block_reason:
+        Print("decision=HOLD")
+        Print("reason=" + guard_reason)
+    elif not rank_ok:
         Print("decision=HOLD")
         Print("reason=rank_data_incomplete: 市值数据不完整，不执行任何仓位变动")
     elif next_state == pos_state:
@@ -747,6 +835,17 @@ def _run_strategy(usedata: _UseDataProxy, anchor_company: str, rank_position: in
         "risk_scale": risk_scale,
         "manual_pause_open": manual_pause_open,
         "force_flat": force_flat,
+        "allow_no_reversal": allow_no_reversal,
+        "settlement_lock_days": settlement_lock_days,
+        "settlement_locked": settlement_locked,
+        "market_terminal": market_terminal,
+        "max_yes_entry_price": max_yes_entry_price,
+        "max_no_entry_price": max_no_entry_price,
+        "min_entry_cash_usdc": min_entry_cash_usdc,
+        "yes_full_on_pct": yes_full_on_pct,
+        "yes_off_pct": yes_off_pct,
+        "no_full_on_pct": no_full_on_pct,
+        "no_off_pct": no_off_pct,
     }
     metrics_meta = {
         "gap_up": {"kind": "continuous", "label": "Gap Up", "unit": "compact_currency", "panel": "market_mcap"},
@@ -754,10 +853,10 @@ def _run_strategy(usedata: _UseDataProxy, anchor_company: str, rank_position: in
         "hold_buffer_yes": {"kind": "continuous", "label": "Hold Buffer Yes", "unit": "compact_currency", "panel": "market_mcap"},
         "recover_buffer_no": {"kind": "continuous", "label": "Recover Buffer No", "unit": "compact_currency", "panel": "market_mcap"},
         "day_to_end": {"kind": "continuous", "label": "Days To End", "unit": "days"},
-        "yes_full_on": {"kind": "continuous", "label": "Yes Full On", "unit": "ratio"},
-        "yes_off": {"kind": "continuous", "label": "Yes Off", "unit": "ratio"},
-        "no_full_on": {"kind": "continuous", "label": "No Full On", "unit": "ratio"},
-        "no_off": {"kind": "continuous", "label": "No Off", "unit": "ratio"},
+        "yes_full_on": {"kind": "continuous", "label": "Yes Full On", "unit": "compact_currency", "panel": "market_mcap"},
+        "yes_off": {"kind": "continuous", "label": "Yes Off", "unit": "compact_currency", "panel": "market_mcap"},
+        "no_full_on": {"kind": "continuous", "label": "No Full On", "unit": "compact_currency", "panel": "market_mcap"},
+        "no_off": {"kind": "continuous", "label": "No Off", "unit": "compact_currency", "panel": "market_mcap"},
         "risk_scale": {"kind": "continuous", "label": "Risk Scale", "unit": "ratio"},
         "decision": {"kind": "state", "label": "Decision"},
         "fact_state": {"kind": "state", "label": "Fact State"},
@@ -766,6 +865,17 @@ def _run_strategy(usedata: _UseDataProxy, anchor_company: str, rank_position: in
         "next_state": {"kind": "state", "label": "Next State"},
         "manual_pause_open": {"kind": "state", "label": "Manual Pause Open"},
         "force_flat": {"kind": "state", "label": "Force Flat"},
+        "allow_no_reversal": {"kind": "state", "label": "Allow NO Reversal"},
+        "settlement_lock_days": {"kind": "continuous", "label": "Settlement Lock Days", "unit": "days"},
+        "settlement_locked": {"kind": "state", "label": "Settlement Locked"},
+        "market_terminal": {"kind": "state", "label": "Market Terminal"},
+        "max_yes_entry_price": {"kind": "continuous", "label": "Max YES Entry", "unit": "ratio"},
+        "max_no_entry_price": {"kind": "continuous", "label": "Max NO Entry", "unit": "ratio"},
+        "min_entry_cash_usdc": {"kind": "continuous", "label": "Min Entry Cash", "unit": "currency"},
+        "yes_full_on_pct": {"kind": "continuous", "label": "YES Full Gap Ratio", "unit": "ratio"},
+        "yes_off_pct": {"kind": "continuous", "label": "YES Off Gap Ratio", "unit": "ratio"},
+        "no_full_on_pct": {"kind": "continuous", "label": "NO Full Gap Ratio", "unit": "ratio"},
+        "no_off_pct": {"kind": "continuous", "label": "NO Off Gap Ratio", "unit": "ratio"},
     }
 
     summary_inputs = [

@@ -2,13 +2,34 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
-from services.polymarket_service import _virtual_total_pnl_from_account
+from services.polymarket_service import (
+    _resolved_binary_settlement_prices,
+    _virtual_total_pnl_from_account,
+)
 from services.strategy_chart_service import _apply_virtual_account_pnl_to_rows
 from services.virtual_context_builder import _market_status
 from services.virtual_execution import _leg_market_expiry_reason, execute_actions
 
 
 class VirtualExpirationGuardTests(unittest.TestCase):
+    def test_resolved_market_uses_only_official_binary_outcome_prices(self) -> None:
+        resolved = {
+            "selected": {
+                "closed": True,
+                "category": "Resolved",
+                "raw": {
+                    "umaResolutionStatus": "resolved",
+                    "outcomePrices": '["1", "0"]',
+                },
+            }
+        }
+        with patch("services.polymarket_service.resolve_market_selection", return_value=resolved):
+            prices = _resolved_binary_settlement_prices(
+                {"condition_id": "0xabc", "legs_count": 1, "raw": {}}
+            )
+
+        self.assertEqual(prices, {"YES": 1.0, "NO": 0.0})
+
     def test_context_marks_market_expired_even_when_snapshot_says_open(self) -> None:
         status = _market_status(
             {"status": "open"},
@@ -120,6 +141,50 @@ class VirtualExpirationGuardTests(unittest.TestCase):
         self.assertEqual(strategy["virtual_expiry_included_orders"], 8)
         self.assertEqual(strategy["yes_qty"], 0.0)
         self.assertEqual(strategy["no_qty"], 0.0)
+
+    def test_expired_summary_values_open_position_at_official_settlement(self) -> None:
+        strategy = {
+            "mode": "Virtual",
+            "condition_id": "0xbea2",
+            "legs_count": 1,
+            "raw": {"Enddate": "2026-07-31T23:59:00Z"},
+        }
+        account = {
+            "initial_cash": 100.0,
+            "cash": 160.63001792907164,
+            "realized_pnl": 62.550752136614705,
+            "total_fees_paid": 1.920734207543074,
+        }
+        expiry_snapshot = {
+            "cash": 0.0,
+            "open_cost": 98.0872976949485,
+            "settlement_value": 160.79884868024345,
+            "valuation_value": 160.79884868024345,
+            "equity": 160.79884868024345,
+            "positions": {(0, "YES"): {"qty": 160.79884868024345, "avg": 0.61}},
+            "included_orders": 2,
+            "realized_pnl": 0.0,
+            "fees_paid": 1.912702305051496,
+            "settlement_prices": {"YES": 1.0, "NO": 0.0},
+            "cutoff_at": "2026-07-31T23:59:00+00:00",
+        }
+
+        with (
+            patch(
+                "services.polymarket_service._resolved_binary_settlement_prices",
+                return_value={"YES": 1.0, "NO": 0.0},
+            ),
+            patch(
+                "services.polymarket_service._virtual_expiry_account_snapshot",
+                return_value=expiry_snapshot,
+            ),
+        ):
+            _virtual_total_pnl_from_account(strategy, 87, [], account=account)
+
+        self.assertEqual(strategy["pnl_source"], "virtual_account_resolved_settlement")
+        self.assertAlmostEqual(strategy["virtual_equity"], 160.79884868024345)
+        self.assertAlmostEqual(strategy["strategy_pnl"], 60.79884868024345)
+        self.assertEqual(strategy["virtual_settlement_prices"], {"YES": 1.0, "NO": 0.0})
 
     def test_chart_ignores_fills_after_expiration_and_freezes_last_valid_pnl(self) -> None:
         account = {"initial_cash": 100.0}

@@ -17,6 +17,7 @@ class DataSourceManagementServiceTest(unittest.TestCase):
     def settings(self) -> dict:
         return {
             "active_finnhub_api_key": "finnhub-secret-value",
+            "sec_edgar_user_agent": "DataTube Research data@example.com",
             "openbb_provider_credentials": {"polygon_api_key": "polygon-secret-value"},
             "openbb_settings": {
                 "enabled": True,
@@ -49,10 +50,14 @@ class DataSourceManagementServiceTest(unittest.TestCase):
                 ).describe()
         sources = {item["source_id"]: item for item in result["sources"]}
         self.assertEqual("ready", sources["FINNHUB"]["runtime_status"])
+        self.assertEqual("ready", sources["SEC"]["runtime_status"])
+        self.assertTrue(sources["SEC"]["test_supported"])
+        self.assertEqual(["company-facts"], sources["SEC"]["query_operations"])
         self.assertEqual("ready", sources["OPENBB:POLYGON"]["runtime_status"])
         self.assertEqual("credential_required", sources["OPENBB:TIINGO"]["runtime_status"])
         self.assertNotIn("polygon-secret-value", str(result))
         self.assertNotIn("finnhub-secret-value", str(result))
+        self.assertNotIn("data@example.com", str(result))
         equity = next(item for item in result["routing_policies"] if item["policy_key"] == "EQUITY:1D:BARS")
         self.assertEqual("OPENBB:POLYGON", equity["order"][0])
 
@@ -158,6 +163,28 @@ class DataSourceManagementServiceTest(unittest.TestCase):
             ["polygon", "yfinance", "tiingo"],
             task["input"]["source_policy"]["providers"],
         )
+
+    def test_crsp_daily_requirement_never_routes_to_openbb(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RequirementMaintenanceService(
+                DataPlatformStore(Path(temp) / "metadata.db")
+            )
+            task = service._task_spec({
+                "instrument_id": "equity:CRSP:10001",
+                "frequency": "1d",
+                "data_type": "bars",
+                "required_range": {
+                    "start": "2025-01-01T00:00:00+00:00",
+                    "end": "2025-12-31T23:59:59+00:00",
+                },
+                "provider": "CRSP/CIZ",
+                "adjustment": "CRSP_FIELDS",
+                "source_selection_policy": {
+                    "mode": "FIXED",
+                    "preferred_sources": ["crsp/ciz"],
+                },
+            })
+        self.assertIsNone(task)
 
 
 if __name__ == "__main__":

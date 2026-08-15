@@ -399,7 +399,13 @@ class CrspCizNormalizer:
                 event_time_field=event_field,
                 point_in_time_policy="AS_OF",
                 adjustment="CRSP_FIELDS" if key == "bars" else "NONE",
-                metadata={"quality_report": quality, "vwap_included": False},
+                metadata={
+                    "quality_report": quality,
+                    "vwap_included": False,
+                    "instrument_scope": "COLLECTION",
+                    "member_instrument_id_field": "instrument_id",
+                    "member_instrument_id_prefix": "equity:CRSP:",
+                },
             )
             committed[key] = {
                 "dataset_id": result["dataset_id"],

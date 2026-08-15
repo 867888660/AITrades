@@ -12,6 +12,12 @@ from .data_capability_service import (
     POLYMARKET_INTERVALS,
     ResearchDataCapabilityService,
 )
+from .equity_factor_bridge import (
+    EQUITY_FACTOR_DATASETS,
+    dataset_fields,
+    field_is_available,
+    physical_data_types,
+)
 from .instrument_registry import InstrumentRegistry
 from .store import BASE_DIR, DataPlatformStore, json_dumps
 from .universe_service import UniverseService
@@ -71,6 +77,9 @@ class FactorInputCandidateResolver:
             dict(settings) if settings is not None else load_web_settings(),
             base_dir=base_dir,
         )
+        self._prepared_catalog_index: dict[
+            tuple[str, str, str], list[tuple[set[str], str]]
+        ] | None = None
 
     def resolve_project(self, project_id: str) -> dict[str, Any]:
         project_id = _clean(project_id)
@@ -97,7 +106,7 @@ class FactorInputCandidateResolver:
         if snapshot is None:
             raise ValueError("Universe Snapshot not found")
         instrument_ids = tuple(snapshot.actual_instrument_ids)
-        instruments = [self._instrument(item) for item in instrument_ids]
+        instruments = self._instruments(instrument_ids)
         datasets = self._datasets(instruments)
         input_candidates = [
             candidate
@@ -248,15 +257,8 @@ class FactorInputCandidateResolver:
 
     def _instrument(self, instrument_id: str) -> dict[str, Any]:
         stored = self.registry.get(instrument_id) or {}
-        parts = instrument_id.split(":", 2)
-        asset_class = _clean(stored.get("asset_class") or (parts[0] if parts else "")).lower()
-        venue = _upper(stored.get("venue") or (parts[1] if len(parts) > 1 else ""))
-        symbol = _upper(stored.get("native_symbol") or (parts[2] if len(parts) > 2 else ""))
-        quote = _upper(stored.get("quote_asset") or stored.get("currency"))
-        if not quote and asset_class == "crypto_spot":
-            quote = next((item for item in _KNOWN_QUOTES if symbol.endswith(item)), "")
         with self.store.connection() as conn:
-            aliases = conn.execute(
+            rows = conn.execute(
                 """
                 SELECT source, source_symbol
                 FROM instrument_aliases
@@ -265,6 +267,53 @@ class FactorInputCandidateResolver:
                 """,
                 (instrument_id,),
             ).fetchall()
+        return self._instrument_record(instrument_id, stored, rows)
+
+    def _instruments(self, instrument_ids: tuple[str, ...]) -> list[dict[str, Any]]:
+        stored_by_id: dict[str, Mapping[str, Any]] = {}
+        aliases_by_id: dict[str, list[Mapping[str, Any]]] = {}
+        batch_size = 800
+        with self.store.connection() as conn:
+            for offset in range(0, len(instrument_ids), batch_size):
+                batch = instrument_ids[offset:offset + batch_size]
+                placeholders = ",".join("?" for _ in batch)
+                for row in conn.execute(
+                    f"SELECT * FROM instrument_registry WHERE instrument_id IN ({placeholders})",
+                    batch,
+                ).fetchall():
+                    stored_by_id[str(row["instrument_id"])] = dict(row)
+                for row in conn.execute(
+                    f"""
+                    SELECT instrument_id, source, source_symbol
+                    FROM instrument_aliases
+                    WHERE instrument_id IN ({placeholders})
+                    ORDER BY instrument_id, source, source_symbol
+                    """,
+                    batch,
+                ).fetchall():
+                    aliases_by_id.setdefault(str(row["instrument_id"]), []).append(dict(row))
+        return [
+            self._instrument_record(
+                instrument_id,
+                stored_by_id.get(instrument_id, {}),
+                aliases_by_id.get(instrument_id, []),
+            )
+            for instrument_id in instrument_ids
+        ]
+
+    @staticmethod
+    def _instrument_record(
+        instrument_id: str,
+        stored: Mapping[str, Any],
+        aliases: Iterable[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        parts = instrument_id.split(":", 2)
+        asset_class = _clean(stored.get("asset_class") or (parts[0] if parts else "")).lower()
+        venue = _upper(stored.get("venue") or (parts[1] if len(parts) > 1 else ""))
+        symbol = _upper(stored.get("native_symbol") or (parts[2] if len(parts) > 2 else ""))
+        quote = _upper(stored.get("quote_asset") or stored.get("currency"))
+        if not quote and asset_class == "crypto_spot":
+            quote = next((item for item in _KNOWN_QUOTES if symbol.endswith(item)), "")
         provider_ids = [
             {"provider": _upper(row["source"]), "id": str(row["source_symbol"])}
             for row in aliases
@@ -325,6 +374,19 @@ class FactorInputCandidateResolver:
                 frequencies=bar_frequencies,
                 provider_status=self._provider_status(instruments, "bars"),
             ))
+        if asset_classes == {"equity"}:
+            for dataset, contract in EQUITY_FACTOR_DATASETS.items():
+                provider_status = self._provider_status(instruments, dataset)
+                if provider_status.get("status") != "READY":
+                    continue
+                datasets.append(self._dataset(
+                    instruments,
+                    dataset=dataset,
+                    label=str(contract["label"]),
+                    fields=tuple(dict(contract["fields"]).items()),
+                    frequencies=[str(contract["frequency"])],
+                    provider_status=provider_status,
+                ))
         if "polymarket_binary" in asset_classes:
             datasets.append(self._dataset(
                 instruments,
@@ -358,7 +420,7 @@ class FactorInputCandidateResolver:
                 requestable = [
                     item for item in applicable
                     if self._frequency_applicable(item, dataset, frequency)
-                    and self._requestable(item, dataset, frequency)
+                    and self._requestable(item, dataset, field, frequency)
                 ]
                 prepared = [
                     item for item in requestable
@@ -431,6 +493,8 @@ class FactorInputCandidateResolver:
                 return field in {item[0] for item in _CRYPTO_BAR_FIELDS}
         if dataset == "price_history":
             return asset_class == "polymarket_binary" and field == "price"
+        if asset_class == "equity" and dataset in EQUITY_FACTOR_DATASETS:
+            return field in dataset_fields(dataset)
         return False
 
     @staticmethod
@@ -446,23 +510,34 @@ class FactorInputCandidateResolver:
             return frequency in BINANCE_INTERVALS
         if dataset == "price_history" and asset_class == "polymarket_binary":
             return frequency in POLYMARKET_INTERVALS
+        contract = EQUITY_FACTOR_DATASETS.get(dataset)
+        if asset_class == "equity" and contract:
+            return frequency == str(contract["frequency"])
         return False
 
     @staticmethod
     def _engine_supported(dataset: str, field: str, frequency: str) -> bool:
         if frequency not in _FACTOR_FREQUENCIES:
-            return False
+            if frequency != "event":
+                return False
         if dataset == "bars":
-            return field in {item[0] for item in _CRYPTO_BAR_FIELDS}
+            return field in {
+                item[0] for item in (*_CRYPTO_BAR_FIELDS, *_EQUITY_BAR_FIELDS)
+            }
+        if dataset in EQUITY_FACTOR_DATASETS:
+            return field in dataset_fields(dataset)
         return dataset == "price_history" and field == "price"
 
     def _requestable(
         self,
         instrument: Mapping[str, Any],
         dataset: str,
+        field: str,
         frequency: str,
     ) -> bool:
         instrument_id = _clean(instrument.get("instrument_id"))
+        if self._prepared(instrument_id, dataset, field, frequency):
+            return True
         return self.capabilities.can_prepare(instrument_id, dataset, frequency)
 
     def _provider_status(
@@ -522,6 +597,21 @@ class FactorInputCandidateResolver:
                     "equity provider extension is unavailable. Daily OHLCV cannot be "
                     "prepared until that provider is ready."
                 ),
+            }
+        if dataset in EQUITY_FACTOR_DATASETS and asset_classes == {"equity"}:
+            ready = any(
+                self._prepared(
+                    _clean(instrument.get("instrument_id")),
+                    dataset,
+                    next(iter(dataset_fields(dataset))),
+                    str(EQUITY_FACTOR_DATASETS[dataset]["frequency"]),
+                )
+                for instrument in instruments
+            )
+            return {
+                "status": "READY" if ready else "UNAVAILABLE",
+                "providers": ["CRSP" if dataset != "fundamentals" else "SEC"],
+                "reason": "" if ready else "No READY point-in-time equity Manifest exposes this Dataset.",
             }
         if dataset == "bars" and asset_classes <= {
             "crypto_spot", "crypto_derivative", "equity"
@@ -583,22 +673,57 @@ class FactorInputCandidateResolver:
         field: str,
         frequency: str,
     ) -> bool:
+        accepted_types = physical_data_types(dataset)
+        index = self._catalog_index()
+        scopes = [instrument_id]
+        if instrument_id.lower().startswith("equity:crsp:"):
+            scopes.append("equity:CRSP:ALL")
+        rows = [
+            (physical_type, catalog_fields, schema_version)
+            for scope in scopes
+            for physical_type in accepted_types
+            for catalog_fields, schema_version in index.get(
+                (scope, physical_type.lower(), frequency.lower()), []
+            )
+        ]
+        for physical_type, catalog_fields, schema_version in rows:
+            catalog_fields = set(catalog_fields)
+            if not catalog_fields and "bars" in schema_version.lower():
+                catalog_fields = {item[0] for item in _CRYPTO_BAR_FIELDS}
+            if not catalog_fields and "polymarket_price" in schema_version.lower():
+                catalog_fields = {"price"}
+            if field_is_available(
+                dataset,
+                field,
+                physical_data_type=physical_type,
+                catalog_fields=catalog_fields,
+            ):
+                return True
+        return False
+
+    def _catalog_index(
+        self,
+    ) -> dict[tuple[str, str, str], list[tuple[set[str], str]]]:
+        if self._prepared_catalog_index is not None:
+            return self._prepared_catalog_index
         with self.store.connection() as conn:
             rows = conn.execute(
                 """
-                SELECT fields_json, schema_version
+                SELECT instrument_id, data_type, frequency, fields_json, schema_version
                 FROM dataset_catalog
-                WHERE instrument_id=? AND lower(data_type)=? AND lower(frequency)=?
-                  AND status='READY' AND quality_status!='FAIL'
-                """,
-                (instrument_id, dataset, frequency.lower()),
+                WHERE status='READY' AND quality_status!='FAIL'
+                """
             ).fetchall()
+        index: dict[tuple[str, str, str], list[tuple[set[str], str]]] = {}
         for row in rows:
-            catalog_fields = set(json.loads(row["fields_json"] or "[]"))
-            if not catalog_fields and "bars" in str(row["schema_version"]).lower():
-                catalog_fields = {item[0] for item in _CRYPTO_BAR_FIELDS}
-            if not catalog_fields and "polymarket_price" in str(row["schema_version"]).lower():
-                catalog_fields = {"price"}
-            if field in catalog_fields:
-                return True
-        return False
+            key = (
+                str(row["instrument_id"]),
+                str(row["data_type"]).lower(),
+                str(row["frequency"]).lower(),
+            )
+            index.setdefault(key, []).append((
+                set(json.loads(row["fields_json"] or "[]")),
+                str(row["schema_version"] or ""),
+            ))
+        self._prepared_catalog_index = index
+        return index

@@ -177,15 +177,30 @@ class ResearchAgentSessionTests(unittest.TestCase):
         result = ResearchContextResolver(self.store).resolve("RUN", "run_missing")
         self.assertEqual("NOT_FOUND", result["resolution_status"])
 
-    def test_human_can_resolve_an_ambiguous_resume_to_a_project(self):
-        project = self.service.start({"objective": "BTC baseline"})
-        waiting = self.service.resume("RUN", "run_missing", {"objective": "continue BTC research"})
-        self.assertEqual("NEED_HUMAN", waiting["status"])
+    def test_missing_resume_anchor_does_not_create_a_need_human_session(self):
+        with self.assertRaises(ValueError) as caught:
+            self.service.resume(
+                "RUN", "run_missing", {"objective": "continue BTC research"}
+            )
+        self.assertEqual("RESEARCH_RESUME_ANCHOR_NOT_FOUND", caught.exception.code)
+        with self.store.connection() as conn:
+            self.assertEqual(
+                0,
+                conn.execute("SELECT COUNT(*) FROM research_agent_sessions").fetchone()[0],
+            )
 
-        resolved = self.service.answer(waiting["session_id"], project["project_id"])
-        self.assertEqual("PLANNING", resolved["status"])
-        self.assertEqual(project["project_id"], resolved["project_id"])
-        self.assertEqual("RESOLVED", resolved["resolution_status"])
+    def test_terminal_session_cannot_transition_back_to_need_human(self):
+        session = self.service.start({"objective": "BTC terminal session"})
+        self.service.set_status(session["session_id"], "CANCELLED")
+
+        with self.assertRaises(ValueError) as caught:
+            self.service.need_human(
+                session["session_id"],
+                reason_code="MATERIAL_SCOPE_CHANGE",
+                question="Change scope?",
+            )
+
+        self.assertEqual("RESEARCH_SESSION_TERMINAL", caught.exception.code)
 
 
 class ResearchAgentSessionApiTests(unittest.TestCase):

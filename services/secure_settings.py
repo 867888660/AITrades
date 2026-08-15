@@ -12,6 +12,7 @@ from typing import Any, Dict
 SENSITIVE_SETTING_KEYS = (
     "finnhub_api_keys",
     "active_finnhub_api_key",
+    "sec_edgar_user_agent",
     "coingecko_api_key",
     "llm_api_key",
     "openbb_fred_api_key",
@@ -152,6 +153,8 @@ def strip_sensitive(settings: Dict[str, Any]) -> Dict[str, Any]:
             public["has_active_finnhub_api_key"] = bool(value)
         elif key == "finnhub_api_keys":
             public["finnhub_api_key_count"] = len(value or [])
+        elif key == "sec_edgar_user_agent":
+            public["has_sec_edgar_user_agent"] = bool(value)
         elif key == "coingecko_api_key":
             public["has_coingecko_api_key"] = bool(value)
         elif key == "llm_api_key":

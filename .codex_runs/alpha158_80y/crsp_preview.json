@@ -1,0 +1,30 @@
+{
+  "session_id": "research_session_a7e2aeda2b3c4260832ce3c497beced0",
+  "run_type": "RESEARCH_BACKTEST",
+  "requirement_set_id": "reqset_feaf35d09dd2500b06290e67",
+  "universe_snapshot_id": "universe_snapshot_04589014b0e5ff1d36f63645",
+  "portfolio_spec": {
+    "selection_method": "TOP_N",
+    "top_n": 1,
+    "weighting_method": "EQUAL_WEIGHT",
+    "direction": "LONG_ONLY",
+    "rebalance_frequency": "MONTHLY",
+    "max_position_weight": 1.0,
+    "cash_buffer": 0.0
+  },
+  "execution_spec": {
+    "initial_cash": 1000000,
+    "fee_bps": 5,
+    "slippage_bps": 10,
+    "order_submission": "NEXT_BAR_OPEN"
+  },
+  "benchmark_spec": {
+    "type": "EQUAL_WEIGHT_UNIVERSE",
+    "rebalance_frequency": "MONTHLY"
+  },
+  "budget": {
+    "runs": 1,
+    "runtime_seconds": 1800,
+    "download_bytes": 0
+  }
+}

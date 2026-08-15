@@ -47,6 +47,7 @@ _market_index_cache: Dict[str, Any] = {"ts": 0.0, "count": 0, "index": None}
 _wallet_positions_cache: Dict[str, Dict[str, Any]] = {}
 _WS_SNAPSHOT_TTL_SECONDS = 2
 _WS_FRESHNESS_SECONDS = 180
+_WS_SNAPSHOT_MAP_LIMIT = 256
 _ws_snapshot_cache: Dict[str, Any] = {"ts": 0.0, "db_key": "", "by_token": {}}
 _MARKET_SNAPSHOT_PATH = BASE_DIR / "polymarket_active_markets_cache.json"
 _DICTIONARY_INDEX_TTL_SECONDS = 60
@@ -629,6 +630,27 @@ def _known_markets(force_refresh: bool = False) -> List[Dict[str, Any]]:
     if snapshot_markets:
         _market_cache["ts"] = 0.0
         _market_cache["data"] = list(snapshot_markets)
+    return snapshot_markets
+
+
+def _local_market_snapshot() -> List[Dict[str, Any]]:
+    """Return locally available markets without starting a remote market crawl.
+
+    Monitoring and UI read paths must stay responsive even when the on-disk
+    snapshot is old.  A stale snapshot is still sufficient for resolving
+    strategy identifiers; explicit refresh paths remain responsible for
+    updating it from Gamma.
+    """
+    markets = list(_market_cache.get("data") or [])
+    if markets:
+        return markets
+    snapshot_markets = _read_market_snapshot()
+    if snapshot_markets:
+        # Keep ts at zero so this stale fallback is never mistaken for a fresh
+        # remote refresh by _known_markets().
+        _market_cache["ts"] = 0.0
+        _market_cache["data"] = list(snapshot_markets)
+        _market_index_cache.update(ts=None, count=None, index=None)
     return snapshot_markets
 
 
@@ -1541,11 +1563,16 @@ def resolve_market_selection(
     token_id: str = "",
     limit: int = 20,
     force_refresh: bool = False,
+    allow_remote: bool = True,
 ) -> Dict[str, Any]:
     query_text = str(query or "").strip()
     condition_text = str(condition_id or "").strip()
     token_text = str(token_id or "").strip()
-    markets = _known_markets(force_refresh=force_refresh)
+    markets = (
+        _known_markets(force_refresh=force_refresh)
+        if allow_remote
+        else _local_market_snapshot()
+    )
     market_index = _cached_market_index_from_markets(markets)
     selected = None
     source = "cache" if markets else "empty"
@@ -1561,7 +1588,7 @@ def resolve_market_selection(
     if selected is None and token_text:
         selected = (market_index.get("by_token") or {}).get(token_text)
 
-    if selected is None and (condition_text or token_text):
+    if allow_remote and selected is None and (condition_text or token_text):
         stub = _gamma_lookup_market_stub(
             resolve_cache={},
             condition_id=condition_text or None,
@@ -1571,7 +1598,11 @@ def resolve_market_selection(
             selected = _normalize_market(stub, category="Resolved")
             source = "gamma"
 
-    results = search_markets(query=query_text, limit=max(1, limit), force_refresh=force_refresh) if query_text else []
+    results = (
+        search_markets(query=query_text, limit=max(1, limit), force_refresh=force_refresh)
+        if query_text and allow_remote
+        else []
+    )
     if selected:
         selected_condition = str(selected.get("condition_id") or "").strip()
         results = [
@@ -1732,7 +1763,7 @@ def fetch_wallet_positions(wallet: str | None = None) -> Dict[str, Any]:
 
     all_positions: List[Dict[str, Any]] = []
     errors: List[str] = []
-    active_index = _cached_market_index_from_markets(_known_markets())
+    active_index = _cached_market_index_from_markets(_local_market_snapshot())
     dictionary_index = _load_dictionary_market_index()
     for user_wallet in wallets:
         try:
@@ -1786,10 +1817,24 @@ def get_overview(wallet: str | None = None, allow_remote_positions: bool = False
 
     try:
         tm0 = time.perf_counter()
-        markets = fetch_active_markets()
+        # Overview is a health/status endpoint. It must never wait on the
+        # multi-page remote market crawl; the dedicated markets endpoint owns
+        # that refresh and updates this in-memory/disk snapshot independently.
+        markets = list(_market_cache.get("data") or [])
+        snapshot_age: float | None = None
+        if not markets:
+            markets, snapshot_age = _read_market_snapshot_payload()
         tm1 = time.perf_counter()
-        print(f"[SV][overview] fetch_active_markets {(tm1 - tm0) * 1000:.1f}ms count={len(markets)}")
-        source_statuses["markets_api"] = _source_status("good", count=len(markets))
+        print(f"[SV][overview] market_snapshot {(tm1 - tm0) * 1000:.1f}ms count={len(markets)}")
+        source_statuses["markets_api"] = _source_status(
+            "good"
+            if markets and (snapshot_age is None or snapshot_age <= _MARKET_SNAPSHOT_MAX_AGE_SECONDS)
+            else "degraded" if markets else "pending",
+            "Using a stale market snapshot while the independent refresh runs."
+            if markets and snapshot_age is not None and snapshot_age > _MARKET_SNAPSHOT_MAX_AGE_SECONDS
+            else None,
+            count=len(markets),
+        )
     except Exception as exc:
         tm1 = time.perf_counter()
         print(f"[SV][overview] fetch_active_markets {(tm1 - tm0) * 1000:.1f}ms error={exc}")
@@ -1801,13 +1846,26 @@ def get_overview(wallet: str | None = None, allow_remote_positions: bool = False
 
     try:
         th0 = time.perf_counter()
-        holdings = fetch_wallet_positions(wallet)
+        if allow_remote_positions:
+            holdings = fetch_wallet_positions(wallet)
+        else:
+            wallets = [wallet.strip()] if wallet and wallet.strip() else get_default_wallets()
+            cache_key = "|".join(sorted(wallets))
+            holdings = dict(_wallet_positions_cache.get(cache_key) or {})
+            holdings.setdefault("wallets", wallets)
+            holdings.setdefault("positions", [])
+            holdings.setdefault("count", len(holdings.get("positions") or []))
+            holdings.setdefault("errors", [])
+            holdings["stale"] = True
+            holdings["fallback_source"] = "cache" if cache_key in _wallet_positions_cache else None
         th1 = time.perf_counter()
         print(f"[SV][overview] fetch_wallet_positions {(th1 - th0) * 1000:.1f}ms count={holdings.get('count', 0)}")
         holding_errors = holdings.get("errors") or []
         source_statuses["holdings_api"] = _source_status(
-            "degraded" if holding_errors else "good",
-            " | ".join(str(item) for item in holding_errors) if holding_errors else None,
+            "pending" if not allow_remote_positions else "degraded" if holding_errors else "good",
+            "Using the last cached snapshot; holdings refresh independently."
+            if not allow_remote_positions
+            else " | ".join(str(item) for item in holding_errors) if holding_errors else None,
             count=holdings.get("count", 0),
             wallet_count=len(holdings.get("wallets", [])),
         )
@@ -1818,10 +1876,14 @@ def get_overview(wallet: str | None = None, allow_remote_positions: bool = False
 
     try:
         ts0 = time.perf_counter()
-        local_strategy = _load_strategy_monitoring_rows(
-            enrich_tokens=False,
-            allow_remote_positions=allow_remote_positions,
-            include_realtime_prices=True,
+        local_strategy = (
+            _load_strategy_monitoring_rows(
+                enrich_tokens=False,
+                allow_remote_positions=True,
+                include_realtime_prices=True,
+            )
+            if allow_remote_positions
+            else {"ok": True, "data": []}
         )
         ts1 = time.perf_counter()
         strategy_items = local_strategy.get("data") or []
@@ -1844,8 +1906,12 @@ def get_overview(wallet: str | None = None, allow_remote_positions: bool = False
             "total_strategy_return_pct": total_strategy_return_pct,
         }
         source_statuses["strategy_profit"] = _source_status(
-            "good" if local_strategy.get("ok") and strategy_items else "pending",
-            None if local_strategy.get("ok") else local_strategy.get("error"),
+            "good"
+            if allow_remote_positions and local_strategy.get("ok") and strategy_items
+            else "pending",
+            "Strategy monitoring refreshes independently."
+            if not allow_remote_positions
+            else None if local_strategy.get("ok") else local_strategy.get("error"),
             running_strategy_count=running_strategy_count,
             total_strategy_profit=total_strategy_profit,
             history_loaded=bool(strategy_items),
@@ -1930,6 +1996,13 @@ def _ws_snapshot_db_paths() -> list[Path]:
 
 
 def _load_ws_snapshot_map(force_refresh: bool = False) -> Dict[str, Any]:
+    """Load a small, bounded fallback sample of WebSocket snapshots.
+
+    The realtime database can contain gigabytes of order-book JSON.  Loading
+    the entire table here used to duplicate that data in Python and could
+    exhaust system memory.  Callers that know token IDs use the indexed lookup
+    in _load_ws_snapshots_for_tokens instead.
+    """
     now = time.time()
     db_paths = _ws_snapshot_db_paths()
     cache_db_key = str(_ws_snapshot_cache.get("db_key") or "")
@@ -1955,45 +2028,19 @@ def _load_ws_snapshot_map(force_refresh: bool = False) -> Dict[str, Any]:
             if "markets_state" not in tables:
                 continue
             rows = conn.execute(
-                'SELECT target_option_json, target_price, market_json, depth_metrics_json, raw_clob_json, updated_at_utc, question, condition_id, status FROM "markets_state"'
+                '''SELECT clobTokenId, target_option_json, target_price, market_json,
+                          depth_metrics_json, raw_clob_json, updated_at_utc,
+                          question, condition_id, status
+                   FROM "markets_state"
+                   ORDER BY rowid DESC
+                   LIMIT ?''',
+                (_WS_SNAPSHOT_MAP_LIMIT,),
             ).fetchall()
             for row in rows:
-                target_option = {}
-                market_json = {}
-                depth_metrics = {}
-                raw_clob_json = {}
-                try:
-                    target_option = json.loads(row["target_option_json"] or "{}")
-                except (TypeError, json.JSONDecodeError):
-                    target_option = {}
-                try:
-                    market_json = json.loads(row["market_json"] or "{}")
-                except (TypeError, json.JSONDecodeError):
-                    market_json = {}
-                try:
-                    depth_metrics = json.loads(row["depth_metrics_json"] or "{}")
-                except (TypeError, json.JSONDecodeError):
-                    depth_metrics = {}
-                try:
-                    raw_clob_json = json.loads(row["raw_clob_json"] or "{}")
-                except (TypeError, json.JSONDecodeError):
-                    raw_clob_json = {}
-                token_id = str((target_option or {}).get("clobTokenId") or "").strip()
-                if not token_id:
+                token_id = str(row["clobTokenId"] or "").strip()
+                candidate = _snapshot_from_ws_row(row, db_path, token_id)
+                if not candidate:
                     continue
-                candidate = {
-                    "token_id": token_id,
-                    "outcome_side": str((target_option or {}).get("name") or "").strip().lower(),
-                    "target_price": _safe_float(row["target_price"]),
-                    "market_json": market_json if isinstance(market_json, dict) else {},
-                    "depth_metrics": depth_metrics if isinstance(depth_metrics, dict) else {},
-                    "raw_clob_json": raw_clob_json if isinstance(raw_clob_json, dict) else {},
-                    "updated_at_utc": row["updated_at_utc"],
-                    "question": row["question"],
-                    "condition_id": row["condition_id"],
-                    "status": row["status"],
-                    "db_path": str(db_path),
-                }
                 existing = by_token.get(token_id)
                 existing_dt = _parse_iso_datetime((existing or {}).get("updated_at_utc")) if existing else None
                 candidate_dt = _parse_iso_datetime(candidate.get("updated_at_utc"))
@@ -2155,8 +2202,6 @@ def _select_strategy_ws_snapshot(yes_token: str, no_token: str, condition_id: st
         snapshot = _load_latest_condition_snapshot(condition_id)
         return snapshot
     by_token = _load_ws_snapshots_for_tokens(tokens)
-    if not by_token:
-        by_token = _load_ws_snapshot_map()
     for token_id in tokens:
         if not token_id:
             continue
@@ -2578,10 +2623,61 @@ def _load_virtual_account(
         return None
 
 
+def _resolved_binary_settlement_prices(
+    strategy_item: Dict[str, Any],
+    *,
+    allow_remote_lookup: bool = True,
+) -> Dict[str, float] | None:
+    """Return official 0/1 settlement prices for a resolved single-leg market."""
+    legs_count = int(_safe_float(strategy_item.get("legs_count")) or 1)
+    if legs_count != 1:
+        return None
+    raw_strategy = strategy_item.get("raw") if isinstance(strategy_item.get("raw"), dict) else {}
+    condition_id = str(
+        strategy_item.get("condition_id")
+        or raw_strategy.get("condition_id")
+        or raw_strategy.get("ConditionId")
+        or ""
+    ).strip()
+    if not condition_id:
+        return None
+    try:
+        resolved = resolve_market_selection(
+            condition_id=condition_id,
+            limit=1,
+            allow_remote=allow_remote_lookup,
+        )
+        selected = resolved.get("selected") if isinstance(resolved, dict) else {}
+        if not isinstance(selected, dict) or not selected:
+            return None
+        raw_market = selected.get("raw") if isinstance(selected.get("raw"), dict) else {}
+        resolution_status = str(raw_market.get("umaResolutionStatus") or "").strip().lower()
+        is_resolved = bool(selected.get("closed")) and (
+            resolution_status == "resolved"
+            or str(selected.get("category") or "").strip().lower() == "resolved"
+        )
+        if not is_resolved:
+            return None
+        outcome_prices = raw_market.get("outcomePrices")
+        if isinstance(outcome_prices, str):
+            outcome_prices = json.loads(outcome_prices)
+        if not isinstance(outcome_prices, list) or len(outcome_prices) < 2:
+            return None
+        yes_price = float(outcome_prices[0])
+        no_price = float(outcome_prices[1])
+        # Only accept an actual binary settlement, never a merely extreme quote.
+        if sorted((round(yes_price, 9), round(no_price, 9))) != [0.0, 1.0]:
+            return None
+        return {"YES": yes_price, "NO": no_price}
+    except Exception:
+        return None
+
+
 def _virtual_expiry_account_snapshot(
     strategy_id: int,
     end_at: datetime,
     initial_cash: float,
+    settlement_prices: Dict[str, float] | None = None,
 ) -> Dict[str, Any] | None:
     """Replay only filled binary orders at or before the market deadline."""
     try:
@@ -2602,6 +2698,8 @@ def _virtual_expiry_account_snapshot(
     cash = float(initial_cash)
     positions: Dict[tuple[int, str], Dict[str, float]] = {}
     included_orders = 0
+    realized_pnl = 0.0
+    fees_paid = 0.0
     for raw_row in rows:
         row = dict(raw_row)
         created_at = _parse_iso_datetime(row.get("created_at_utc"))
@@ -2626,6 +2724,7 @@ def _virtual_expiry_account_snapshot(
             gross = qty * price
             net_cash_change = -(gross + fee) if action == "BUY" else gross - fee
         cash += net_cash_change
+        fees_paid += fee
 
         position = positions.setdefault((leg_index, side), {"qty": 0.0, "avg": 0.0})
         if action == "BUY":
@@ -2637,18 +2736,32 @@ def _virtual_expiry_account_snapshot(
             )
             position["qty"] = next_qty
         else:
+            sold_qty = min(position["qty"], qty)
+            realized_pnl += sold_qty * (price - position["avg"])
             position["qty"] = max(0.0, position["qty"] - qty)
             if position["qty"] <= 0:
                 position["avg"] = 0.0
         included_orders += 1
 
     open_cost = sum(position["qty"] * position["avg"] for position in positions.values())
+    settlement_value = None
+    if settlement_prices:
+        settlement_value = sum(
+            position["qty"] * float(settlement_prices.get(str(side).upper(), 0.0))
+            for (_leg, side), position in positions.items()
+        )
+    valuation_value = open_cost if settlement_value is None else settlement_value
     return {
         "cash": cash,
         "open_cost": open_cost,
-        "equity": cash + open_cost,
+        "settlement_value": settlement_value,
+        "valuation_value": valuation_value,
+        "equity": cash + valuation_value,
         "positions": positions,
         "included_orders": included_orders,
+        "realized_pnl": realized_pnl,
+        "fees_paid": fees_paid,
+        "settlement_prices": dict(settlement_prices or {}),
         "cutoff_at": end_at.astimezone(timezone.utc).isoformat(),
     }
 
@@ -2658,6 +2771,7 @@ def _virtual_total_pnl_from_account(
     strategy_id: int,
     positions: List[Dict[str, Any]] | None = None,
     account: Dict[str, Any] | None = None,
+    allow_remote_market_lookup: bool = True,
 ) -> None:
     """Overlay Virtual summary PnL with account-equity PnL.
 
@@ -2763,7 +2877,16 @@ def _virtual_total_pnl_from_account(
     realized_pnl = _safe_float(account.get("realized_pnl")) or 0.0
     fees_paid = _safe_float(account.get("total_fees_paid")) or 0.0
     if market_expired and end_at is not None:
-        expiry_snapshot = _virtual_expiry_account_snapshot(strategy_id, end_at, initial_cash)
+        settlement_prices = _resolved_binary_settlement_prices(
+            strategy_item,
+            allow_remote_lookup=allow_remote_market_lookup,
+        )
+        expiry_snapshot = _virtual_expiry_account_snapshot(
+            strategy_id,
+            end_at,
+            initial_cash,
+            settlement_prices=settlement_prices,
+        )
         if expiry_snapshot is not None:
             equity = float(expiry_snapshot.get("equity") or 0.0)
             total_pnl = equity - initial_cash
@@ -2801,13 +2924,13 @@ def _virtual_total_pnl_from_account(
                     "no_current_pct": no_cost / allocation_base if allocation_base > 0 else 0.0,
                     "strategy_pnl": total_pnl,
                     "virtual_total_pnl": total_pnl,
-                    "virtual_unrealized_pnl": 0.0,
-                    "virtual_realized_pnl": realized_pnl,
-                    "virtual_fees_paid": fees_paid,
+                    "virtual_unrealized_pnl": float(expiry_snapshot.get("valuation_value") or 0.0) - float(expiry_snapshot.get("open_cost") or 0.0),
+                    "virtual_realized_pnl": float(expiry_snapshot.get("realized_pnl") or 0.0),
+                    "virtual_fees_paid": float(expiry_snapshot.get("fees_paid") or 0.0),
                     "virtual_cash": float(expiry_snapshot.get("cash") or 0.0),
                     "virtual_equity": equity,
                     "virtual_initial_cash": initial_cash,
-                    "virtual_liquidation_value": float(expiry_snapshot.get("open_cost") or 0.0),
+                    "virtual_liquidation_value": float(expiry_snapshot.get("valuation_value") or 0.0),
                     "virtual_estimated_exit_fees": 0.0,
                     "virtual_liquidation_requested_qty": 0.0,
                     "virtual_liquidation_filled_qty": 0.0,
@@ -2815,7 +2938,12 @@ def _virtual_total_pnl_from_account(
                     "virtual_liquidation_fills": [],
                     "virtual_expiry_cutoff_at": expiry_snapshot.get("cutoff_at"),
                     "virtual_expiry_included_orders": int(expiry_snapshot.get("included_orders") or 0),
-                    "pnl_source": "virtual_account_expired_order_cutoff",
+                    "virtual_settlement_prices": expiry_snapshot.get("settlement_prices") or {},
+                    "pnl_source": (
+                        "virtual_account_resolved_settlement"
+                        if expiry_snapshot.get("settlement_prices")
+                        else "virtual_account_expired_order_cutoff"
+                    ),
                 }
             )
             return
@@ -2862,6 +2990,8 @@ def _virtual_total_pnl_from_account(
 def _recompute_strategy_metrics(
     strategy_item: Dict[str, Any],
     virtual_account: Dict[str, Any] | None = None,
+    *,
+    allow_remote_market_lookup: bool = True,
 ) -> None:
     yes_qty = _safe_float(strategy_item.get("yes_qty")) or 0.0
     no_qty = _safe_float(strategy_item.get("no_qty")) or 0.0
@@ -2883,7 +3013,12 @@ def _recompute_strategy_metrics(
     strategy_item["unrealized_pnl"] = pnl_yes + pnl_no
     row_id = _safe_float(strategy_item.get("strategy_id") or strategy_item.get("row_id"))
     if row_id is not None:
-        _virtual_total_pnl_from_account(strategy_item, int(row_id), account=virtual_account)
+        _virtual_total_pnl_from_account(
+            strategy_item,
+            int(row_id),
+            account=virtual_account,
+            allow_remote_market_lookup=allow_remote_market_lookup,
+        )
 
 
 def _strategy_leg_side(yes_qty: float, no_qty: float) -> str:
@@ -3173,7 +3308,7 @@ def get_strategy_leg_snapshots(
         return []
 
     strategy_id = int(source_strategy.get("strategy_id") or row_id)
-    active_index = _cached_market_index_from_markets(_known_markets())
+    active_index = _cached_market_index_from_markets(_local_market_snapshot())
     dictionary_index = _load_dictionary_market_index()
     is_virtual = str(source_strategy.get("mode") or source_strategy.get("state") or "").strip().lower() == "virtual"
     virtual_ids = [strategy_id] if is_virtual else []
@@ -3554,6 +3689,7 @@ def _decorate_strategy_overview(
         row_id,
         virtual_positions,
         account=(prefetched_virtual_accounts or {}).get(row_id),
+        allow_remote_market_lookup=bool(allow_clob_book),
     )
     _apply_multi_leg_snapshot_pnl(strategy_item, snapshots)
     if (
@@ -3751,7 +3887,7 @@ def _strategy_storage_db_path() -> Path:
 
 
 def _load_strategy_market_index() -> Dict[str, Dict[str, Any]]:
-    active_index = _cached_market_index_from_markets(_known_markets())
+    active_index = _cached_market_index_from_markets(_local_market_snapshot())
     dictionary_index = _load_dictionary_market_index()
     by_condition_id = dict(dictionary_index.get("by_condition_id") or {})
     by_condition_id.update(active_index.get("by_condition_id") or {})
@@ -3898,7 +4034,7 @@ def _load_strategy_monitoring_rows(
             if row_id in virtual_strategy_id_set:
                 _inject_virtual_positions(item, row_id, prefetched_positions=prefetched_virtual_positions)
         live_ctx = _get_live_position_cache(allow_remote=allow_remote_positions)
-        active_index = _cached_market_index_from_markets(_known_markets())
+        active_index = _cached_market_index_from_markets(_local_market_snapshot())
         dictionary_index = _load_dictionary_market_index()
         items: List[Dict[str, Any]] = []
         for item in flat_rows:
@@ -3917,6 +4053,7 @@ def _load_strategy_monitoring_rows(
             _recompute_strategy_metrics(
                 strategy_item,
                 virtual_account=prefetched_virtual_accounts.get(int(row_id or 0)),
+                allow_remote_market_lookup=bool(allow_remote_positions),
             )
             strategy_item["display_name"] = _build_strategy_display_name(strategy_item, row_id=row_id)
             source_strategy = strategies_by_id.get(int(row_id or 0))
@@ -3973,7 +4110,7 @@ def _load_strategy_monitoring_rows(
         rows = cur.execute(f'SELECT rowid, * FROM "{actual_table}"{limit_sql}').fetchall()
         t_query1 = time.perf_counter()
         t_index0 = time.perf_counter()
-        active_index = _cached_market_index_from_markets(_known_markets())
+        active_index = _cached_market_index_from_markets(_local_market_snapshot())
         dictionary_index = _load_dictionary_market_index()
         t_index1 = time.perf_counter()
         t_live0 = time.perf_counter()
@@ -4031,7 +4168,10 @@ def _load_strategy_monitoring_rows(
             _apply_wallet_live_positions(strategy_item, live_ctx)
             if matched_market:
                 market_match_count += 1
-            _recompute_strategy_metrics(strategy_item)
+            _recompute_strategy_metrics(
+                strategy_item,
+                allow_remote_market_lookup=bool(allow_remote_positions),
+            )
             strategy_item["display_name"] = _build_strategy_display_name(strategy_item, row_id=row_id)
             items.append(strategy_item)
             row_ms = (time.perf_counter() - row_t0) * 1000

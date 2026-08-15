@@ -7,6 +7,8 @@ const state = {
   projects: [],
   project: null,
   projectIndex: [],
+  projectIndexLoaded: false,
+  projectIndexPromise: null,
   universes: [],
   sharedUniverses: [],
   universeBindings: [],
@@ -16,6 +18,8 @@ const state = {
   factorDrafts: [],
   alphaDrafts: [],
   library: [],
+  libraryRequirementsLoaded: false,
+  libraryRequirementsPromise: null,
   refs: {},
   universeRef: null,
   requirements: [],
@@ -53,6 +57,13 @@ const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
 }[char]));
 const json = value => JSON.stringify(value ?? {}, null, 2);
+
+let initialResearchSummaries = (() => {
+  const node = document.getElementById('researchBootstrap');
+  if (!node) return null;
+  try { return JSON.parse(node.textContent || '[]'); }
+  catch { return null; }
+})();
 
 async function api(url, options = {}) {
   const response = await fetch(url, {
@@ -259,25 +270,89 @@ function setActiveNavigation() {
   document.querySelectorAll('[data-nav]').forEach(node => node.classList.toggle('active', node.dataset.nav === active));
 }
 
-async function loadBase() {
+async function loadBase({force = false} = {}) {
   setActiveNavigation();
-  const [projects, universes, sharedUniverses, definitions, factorDrafts, alphaDrafts, library, runs, capabilities, dataCapabilities] = await Promise.all([
-    api('/api/research/projects'),
+
+  // Keep list surfaces intentionally small. Research used to fan out into five
+  // or six requests per project and every page loaded unrelated workspace data.
+  if (state.surface === 'research') {
+    if (!force && initialResearchSummaries !== null) {
+      setProjectSummaries(initialResearchSummaries);
+      initialResearchSummaries = null;
+      // The server generated this projection for the same navigation response,
+      // so another startup fetch would only duplicate work. Explicit refreshes
+      // still use the API through the forced branch below.
+      return;
+    }
+    setProjectSummaries(await api('/api/research/project-summaries?limit=500'));
+    await renderResearchIndex();
+    return;
+  }
+  if (state.surface === 'library') {
+    const [projectSummaries, sharedUniverses, definitions, factorLibrary, alphaLibrary, capabilities, dataCapabilities] = await Promise.all([
+      api('/api/research/project-summaries?limit=500'),
+      api('/api/library/universes'),
+      api('/api/research/definitions'),
+      api('/api/research/library?component_type=FACTOR'),
+      api('/api/research/library?component_type=ALPHA'),
+      api('/api/research/engine-capabilities'),
+      api('/api/research/data/capabilities'),
+    ]);
+    setProjectSummaries(projectSummaries);
+    state.sharedUniverses = sharedUniverses;
+    state.definitions = definitions;
+    state.library = [...factorLibrary, ...alphaLibrary];
+    state.libraryRequirementsLoaded = false;
+    state.libraryRequirementsPromise = null;
+    state.capabilities = capabilities;
+    state.dataCapabilities = dataCapabilities;
+    await renderLibrary();
+    return;
+  }
+  if (state.surface === 'runs') {
+    const [projectSummaries, runs] = await Promise.all([
+      api('/api/research/project-summaries?limit=500'),
+      api('/api/research/runs'),
+    ]);
+    setProjectSummaries(projectSummaries);
+    state.runs = runs;
+    renderGlobalRuns();
+    return;
+  }
+  if (state.surface === 'data-catalog') {
+    await renderDataCatalog();
+    return;
+  }
+  if (state.surface === 'approvals') {
+    await renderApprovals();
+    return;
+  }
+  if (state.surface === 'research-detail' && ['runs', 'strategy'].includes(state.researchTab)) {
+    if (state.researchTab === 'runs') state.runs = await api('/api/research/runs');
+    await loadResearch(state.projectId);
+    return;
+  }
+
+  const [projectSummaries, universes, sharedUniverses, definitions, factorDrafts, alphaDrafts, factorLibrary, alphaLibrary, runs, capabilities, dataCapabilities] = await Promise.all([
+    api('/api/research/project-summaries?limit=500'),
     api('/api/research/universes?status='),
     api('/api/library/universes'),
     api('/api/research/definitions'),
     api('/api/research/factor-drafts'),
     api('/api/research/alpha-drafts'),
-    api('/api/research/library'),
+    api('/api/research/library?component_type=FACTOR'),
+    api('/api/research/library?component_type=ALPHA'),
     api('/api/research/runs'),
     api('/api/research/engine-capabilities'),
     api('/api/research/data/capabilities'),
   ]);
-  state.projects = projects;
+  setProjectSummaries(projectSummaries);
   state.universes = universes;
   state.sharedUniverses = sharedUniverses;
   state.definitions = definitions;
-  state.library = library;
+  state.library = [...factorLibrary, ...alphaLibrary];
+  state.libraryRequirementsLoaded = false;
+  state.libraryRequirementsPromise = null;
   state.runs = runs;
   state.capabilities = capabilities;
   state.dataCapabilities = dataCapabilities;
@@ -288,15 +363,52 @@ async function loadBase() {
   state.factorDrafts = factorDrafts;
   state.alphaDrafts = alphaDrafts;
 
-  if (state.surface === 'research') await renderResearchIndex();
-  else if (state.surface === 'research-detail') await loadResearch(state.projectId);
-  else if (state.surface === 'library') await renderLibrary();
-  else if (state.surface === 'runs') renderGlobalRuns();
-  else if (state.surface === 'data-catalog') await renderDataCatalog();
-  else if (state.surface === 'approvals') await renderApprovals();
+  await loadResearch(state.projectId);
+}
+
+function renderWorkspaceLoadError(error) {
+  $('appView').innerHTML = `<div class="empty-state compact workspace-load-error"><h2>Workspace could not be loaded</h2><p>${esc(error?.message || 'The server did not return the required data.')}</p><button type="button" class="primary" data-action="retry-workspace-load">Retry</button></div>`;
+}
+
+function setProjectSummaries(summaries) {
+  state.projectIndex = arr(summaries);
+  state.projects = state.projectIndex.map(item => item.project);
+  state.projectIndexLoaded = true;
+  state.projectIndexPromise = null;
+}
+
+function mergeLibraryAssets(componentType, assets) {
+  state.library = [
+    ...state.library.filter(item => item.component_type !== componentType),
+    ...arr(assets),
+  ];
+}
+
+async function ensureLibraryRequirements(force = false) {
+  if (state.libraryRequirementsLoaded && !force) {
+    return state.library.filter(item => item.component_type === 'REQUIREMENTS');
+  }
+  if (state.libraryRequirementsPromise && !force) return state.libraryRequirementsPromise;
+  const request = api('/api/research/library?component_type=REQUIREMENTS').then(assets => {
+    mergeLibraryAssets('REQUIREMENTS', assets);
+    state.libraryRequirementsLoaded = true;
+    return assets;
+  }).finally(() => {
+    if (state.libraryRequirementsPromise === request) state.libraryRequirementsPromise = null;
+  });
+  state.libraryRequirementsPromise = request;
+  return request;
 }
 
 async function loadResearch(projectId) {
+  if (['runs', 'strategy'].includes(state.researchTab)) {
+    const detail = await api(`/api/research/projects/${encodeURIComponent(projectId)}`);
+    state.projectId = projectId;
+    state.project = detail.project;
+    state.requirementRefreshError = '';
+    renderResearchWorkspace();
+    return;
+  }
   const automaticFactorAssets = await api(
     `/api/research/projects/${encodeURIComponent(projectId)}/factors/sync-library`,
     {method: 'POST', body: '{}'},
@@ -306,17 +418,9 @@ async function loadResearch(projectId) {
     if (index >= 0) state.library[index] = asset;
     else state.library.unshift(asset);
   });
-  // Rebuild the single canonical set from the current Universe plus pinned,
-  // validated Factor/Alpha references and explicit manual Requirements.
-  let effectiveRefreshError = '';
-  try {
-    await api(`/api/research/projects/${encodeURIComponent(projectId)}/requirements/refresh`, {
-      method: 'POST',
-      body: '{}',
-    });
-  } catch (error) {
-    effectiveRefreshError = error.message;
-  }
+  // Requirement maintenance is backend-owned. Opening a Research is read-only
+  // and must not block on a full RequirementSet rebuild.
+  const effectiveRefreshError = '';
   const [detail, refs, universeRef, universeBindings, requirements, requirementRef, grants, requirementItems, dataStatus, factorDrafts, factorInputCandidates, alphaDrafts, alphaFactorCandidates] = await Promise.all([
     api(`/api/research/projects/${encodeURIComponent(projectId)}`),
     api(`/api/research/projects/${encodeURIComponent(projectId)}/definition-refs`),
@@ -394,30 +498,21 @@ async function loadResearch(projectId) {
   }
 }
 
-async function researchSummary(project) {
-  await api(`/api/research/projects/${encodeURIComponent(project.project_id)}/requirements/refresh`, {
-    method: 'POST',
-    body: '{}',
-  }).catch(() => null);
-  const [refs, universeRef, requirements, requirementRef, dataStatus] = await Promise.all([
-    api(`/api/research/projects/${encodeURIComponent(project.project_id)}/definition-refs`).catch(() => ({})),
-    api(`/api/research/projects/${encodeURIComponent(project.project_id)}/universe-ref`).catch(() => null),
-    api(`/api/research/data/requirement-sets?project_id=${encodeURIComponent(project.project_id)}`).catch(() => []),
-    api(`/api/research/projects/${encodeURIComponent(project.project_id)}/requirements/ref`).catch(() => null),
-    api(`/api/research/projects/${encodeURIComponent(project.project_id)}/data-status`).catch(() => null),
-  ]);
-  const values = Object.values(refs);
-  let coverage = null;
-  const effectiveRequirement = requirements.find(
-    item => item.requirement_set_id === requirementRef?.requirement_set_id
-  );
-  if (effectiveRequirement) {
-    coverage = await api(`/api/research/data/requirement-sets/${encodeURIComponent(effectiveRequirement.requirement_set_id)}/coverage`).catch(() => null);
-  }
-  return {project, refs, universeRef, requirements, requirementRef, dataStatus, coverage, factors: values.filter(item => item.definition_type === 'FACTOR'), alphas: values.filter(item => item.definition_type === 'ALPHA')};
+async function ensureProjectIndex() {
+  if (state.projectIndexLoaded) return state.projectIndex;
+  if (state.projectIndexPromise) return state.projectIndexPromise;
+  const request = api('/api/research/project-summaries?limit=500').then(summaries => {
+    setProjectSummaries(summaries);
+    return state.projectIndex;
+  }).finally(() => {
+    if (state.projectIndexPromise === request) state.projectIndexPromise = null;
+  });
+  state.projectIndexPromise = request;
+  return request;
 }
 
 function summaryDataLabel(item) {
+  if (item.dataConfigured !== undefined) return item.dataConfigured ? 'Configured' : 'Not configured';
   if (!item.requirements.length) return 'Not configured';
   if (item.dataStatus) {
     return arr(item.dataStatus.rows).length && arr(item.dataStatus.rows).every(row => row.status === 'READY')
@@ -428,8 +523,7 @@ function summaryDataLabel(item) {
   return arr(item.coverage.checks).some(check => !check.satisfied) ? 'Missing data' : 'Ready';
 }
 
-async function renderResearchIndex() {
-  state.projectIndex = await Promise.all(state.projects.map(researchSummary));
+function renderResearchIndexCards() {
   $('appView').innerHTML = `<header class="page-heading"><div><span class="eyebrow">RESEARCH</span><h1>Research</h1><p>Create, combine, validate, and test a research idea.</p></div><button type="button" class="primary" data-action="new-research">New Research</button></header>
     <div class="research-grid">${state.projectIndex.map(item => {
       const universe = item.universeRef?.name || 'Not configured';
@@ -439,8 +533,12 @@ async function renderResearchIndex() {
         <div class="summary-line"><span>Alpha</span><strong>${esc(item.alphas[0]?.name || 'Not configured')}</strong></div>
         <div class="summary-line"><span>Data</span><strong>${esc(summaryDataLabel(item))}</strong></div>
         <div class="summary-line"><span>Strategy</span><strong>Not configured</strong></div>
-      </div><footer><a class="button-link primary" href="/research/${encodeURIComponent(item.project.project_id)}">Open Research</a></footer></article>`;
+      </div><footer><button type="button" class="danger-quiet" data-action="delete-research" data-id="${esc(item.project.project_id)}" data-name="${esc(item.project.title)}">Delete Research</button><a class="button-link primary" href="/research/${encodeURIComponent(item.project.project_id)}">Open Research</a></footer></article>`;
     }).join('') || `<div class="empty-state"><h2>No Research yet</h2><p>Start with one hypothesis. Components can be published to Library after validation.</p><button type="button" class="primary" data-action="new-research">New Research</button></div>`}</div>`;
+}
+
+async function renderResearchIndex() {
+  renderResearchIndexCards();
 }
 
 function renderResearchWorkspace() {
@@ -647,7 +745,7 @@ function componentActions(item, type) {
 function factorCard(item, library = false, usage = 0) {
   const spec = item.spec || {};
   const footer = library
-    ? `<div class="usage">Usage <strong>${usage} Research</strong></div><div class="card-actions"><button type="button" class="primary" data-action="library-use" data-kind="FACTOR" data-id="${esc(item.library_asset_id)}">Use in Research</button><button type="button" data-action="library-new-version" data-kind="FACTOR" data-id="${esc(item.library_asset_id)}">Create New Version</button><button type="button" data-action="view-usage" data-kind="FACTOR" data-id="${esc(item.library_asset_id)}">View Usage</button><button type="button" data-action="definition-details" data-id="${esc(item.definition_id)}">Details</button><button type="button" class="danger-quiet" data-action="archive-library-definition" data-id="${esc(item.library_asset_id)}" data-name="${esc(item.name)}">Archive</button></div>`
+    ? `<div class="usage">Usage <strong>${usage} Research</strong></div><div class="card-actions"><button type="button" class="primary" data-action="library-use" data-kind="FACTOR" data-id="${esc(item.library_asset_id)}">Use in Research</button><button type="button" data-action="library-new-version" data-kind="FACTOR" data-id="${esc(item.library_asset_id)}">Create New Version</button><button type="button" data-action="view-usage" data-kind="FACTOR" data-id="${esc(item.library_asset_id)}">View Usage</button><button type="button" data-action="definition-details" data-id="${esc(item.definition_id)}">Details</button><button type="button" class="danger-quiet" data-action="archive-library-assets" data-asset-type="FACTOR" data-id="${esc(item.library_asset_id)}" data-name="${esc(item.name)}" data-usage="${usage}">Remove from Library</button></div>`
     : `${publishedAssetForSource(item.definition_id) ? `<div class="usage">Available in <strong>Library v${publishedAssetForSource(item.definition_id).version}</strong></div>` : ''}<div class="card-actions">${componentActions(item, 'factor')}</div>`;
   const source = item.origin === 'LIBRARY' ? `Source: Library · v${item.library_version}` : 'Source: Current Research';
   return `<article class="component-card"><div class="card-header"><div><h3>${esc(item.name)}</h3><small>${library ? `Library · v${item.version}` : source}</small></div>${statusChip(library ? 'Published' : componentStatus(item))}</div><div class="fact-grid">
@@ -660,7 +758,7 @@ function factorCard(item, library = false, usage = 0) {
 function alphaCard(item, library = false, usage = 0) {
   const inputs = arr(item.spec?.components).map(component => state.definitions.find(definition => definition.definition_id === component.factor_definition_id)?.name || component.factor_name || 'Factor').join(', ');
   const footer = library
-    ? `<div class="usage">Usage <strong>${usage} Research</strong></div><div class="card-actions"><button type="button" class="primary" data-action="library-use" data-kind="ALPHA" data-id="${esc(item.library_asset_id)}">Use in Research</button><button type="button" data-action="library-new-version" data-kind="ALPHA" data-id="${esc(item.library_asset_id)}">Create New Version</button><button type="button" data-action="view-usage" data-kind="ALPHA" data-id="${esc(item.library_asset_id)}">View Usage</button><button type="button" data-action="definition-details" data-id="${esc(item.definition_id)}">Details</button><button type="button" class="danger-quiet" data-action="archive-library-definition" data-id="${esc(item.library_asset_id)}" data-name="${esc(item.name)}">Archive</button></div>`
+    ? `<div class="usage">Usage <strong>${usage} Research</strong></div><div class="card-actions"><button type="button" class="primary" data-action="library-use" data-kind="ALPHA" data-id="${esc(item.library_asset_id)}">Use in Research</button><button type="button" data-action="library-new-version" data-kind="ALPHA" data-id="${esc(item.library_asset_id)}">Create New Version</button><button type="button" data-action="view-usage" data-kind="ALPHA" data-id="${esc(item.library_asset_id)}">View Usage</button><button type="button" data-action="definition-details" data-id="${esc(item.definition_id)}">Details</button><button type="button" class="danger-quiet" data-action="archive-library-assets" data-asset-type="ALPHA" data-id="${esc(item.library_asset_id)}" data-name="${esc(item.name)}" data-usage="${usage}">Remove from Library</button></div>`
     : `${publishedAssetForSource(item.definition_id) ? `<div class="usage">Published as <strong>Library v${publishedAssetForSource(item.definition_id).version}</strong></div>` : ''}<div class="card-actions">${componentActions(item, 'alpha')}</div>`;
   const source = item.origin === 'LIBRARY' ? `Source: Library · v${item.library_version}` : 'Source: Current Research';
   return `<article class="component-card"><div class="card-header"><div><h3>${esc(item.name)}</h3><small>${library ? `Library · v${item.version}` : source}</small></div>${statusChip(library ? 'Published' : componentStatus(item))}</div><div class="fact-grid">
@@ -1062,6 +1160,7 @@ function renderResearchRuns() {
 }
 
 function definitionUsageCount(libraryAssetId) {
+  if (!state.projectIndexLoaded) return '\u2026';
   const asset = state.library.find(item => item.library_asset_id === libraryAssetId);
   return state.projectIndex.reduce((count, item) => count + (Object.values(item.refs).some(ref =>
     ref.library_asset_id === libraryAssetId || ref.definition_id === asset?.source_object_id
@@ -1074,10 +1173,6 @@ function universeUsageCount(libraryAssetId) {
 
 function requirementUsageCount(libraryAssetId) {
   return state.projectIndex.filter(item => item.requirementRef?.library_asset_id === libraryAssetId).length;
-}
-
-async function ensureProjectIndex() {
-  if (!state.projectIndex.length && state.projects.length) state.projectIndex = await Promise.all(state.projects.map(researchSummary));
 }
 
 const GROUPABLE_LIBRARY_TABS = new Set(['factor', 'alpha']);
@@ -1131,6 +1226,7 @@ function libraryBatchBarHtml(assetType, groups) {
     <span>${selected.length} selected</span>
     <select id="libraryBatchTarget"><option value="">Ungrouped</option>${groups.map(group => `<option value="${esc(group.group_id)}">${esc(group.name)}</option>`).join('')}</select>
     <button type="button" class="primary" data-action="library-batch-move" data-asset-type="${esc(assetType)}">Move</button>
+    <button type="button" class="danger-quiet" data-action="library-batch-archive" data-asset-type="${esc(assetType)}">Remove from Library</button>
     <button type="button" data-action="library-clear-selection">Clear</button>
   </div>`;
 }
@@ -1183,10 +1279,14 @@ function renderGroupedLibraryAssets(target, assetType, allItems) {
 }
 
 async function renderLibrary() {
-  await ensureProjectIndex();
   $('appView').innerHTML = `<header class="page-heading"><div><span class="eyebrow">LIBRARY</span><h1>Library</h1><p>Reusable research components and data Requirements.</p></div></header><div class="library-intro">Library stores reusable components and all Requirements. Research selects what it needs.</div><nav class="library-tabs" aria-label="Library navigation">${['universe','factor','alpha','requirements','strategy'].map(tab => `<button type="button" data-library-tab="${tab}" class="${state.libraryTab === tab ? 'active' : ''}">${tab.charAt(0).toUpperCase() + tab.slice(1)}</button>`).join('')}</nav><section id="libraryTabContent" class="tab-content"></section>`;
   await renderLibraryTab();
   if (state.libraryTab === 'requirements') scheduleRequirementRefresh();
+  else if (GROUPABLE_LIBRARY_TABS.has(state.libraryTab)) {
+    ensureProjectIndex().then(() => {
+      if (state.surface === 'library' && GROUPABLE_LIBRARY_TABS.has(state.libraryTab)) renderLibraryTab();
+    }).catch(() => null);
+  }
 }
 
 async function switchLibraryTab(tab) {
@@ -1196,7 +1296,14 @@ async function switchLibraryTab(tab) {
   document.querySelectorAll('[data-library-tab]').forEach(node => node.classList.toggle('active', node.dataset.libraryTab === tab));
   await renderLibraryTab();
   if (tab === 'requirements') scheduleRequirementRefresh();
-  else clearTimeout(state.requirementRefreshTimer);
+  else {
+    clearTimeout(state.requirementRefreshTimer);
+    if (GROUPABLE_LIBRARY_TABS.has(tab)) {
+      ensureProjectIndex().then(() => {
+        if (state.surface === 'library' && state.libraryTab === tab) renderLibraryTab();
+      }).catch(() => null);
+    }
+  }
 }
 
 async function renderLibraryTabLegacy() {
@@ -1246,10 +1353,15 @@ function requirementLibraryCard(asset) {
   const status = asset.data_status || {status: 'PENDING', coverage: 'Data status has not been checked.'};
   const resolved = {status: status.status || 'CHECKING', coverage: status.status === 'READY' && status.latest_available ? `Complete coverage through ${formatDateTime(status.latest_available)}` : status.coverage || friendlyStatus(status.status), preparation: status.preparation || null};
   const instruments = arr(scope.instruments?.include).map(requirementInstrumentLabel).join(', ') || 'Rule based';
-  return `<article class="requirement-library-card"><div class="card-header"><div><h3>${esc(asset.name)}</h3><small>${esc(scope.provider || '-')} ${esc(scope.market || '')} · ${esc(instruments)}</small></div>${statusChip(friendlyStatus(resolved.status))}</div><div class="requirement-essentials library"><div><span>Scope</span><strong>${esc(scope.provider || '-')} ${esc(scope.market || '')} · ${esc(instruments)}</strong></div><div><span>Data</span><strong>${esc(data.frequency || '-')} ${esc(data.dataset_type || 'Data')} · ${esc(arr(data.fields).join(' / ') || '-')}</strong></div><div><span>Time</span><strong>${esc(formatDate(time.start))} → ${esc(time.end === 'LATEST_AVAILABLE' ? 'Latest' : formatDate(time.end))}</strong></div></div><div class="requirement-library-bottom"><div>${preparationBlock(resolved)}</div><div class="requirement-usage"><span>Used by</span><strong>${esc(asset.usage_count || 0)} Research</strong></div></div><div class="card-actions requirement-actions"><button data-action="edit-library-requirement" data-id="${esc(asset.library_asset_id)}">Edit</button><button data-action="save-as-library-requirement" data-id="${esc(asset.library_asset_id)}">Save As</button><button data-action="library-asset-details" data-id="${esc(asset.library_asset_id)}">Details</button><details class="overflow-menu"><summary aria-label="More actions">···</summary><div><button data-action="view-usage" data-id="${esc(asset.library_asset_id)}">View Usage</button><button data-action="archive-library-requirement" data-id="${esc(asset.library_asset_id)}">Archive</button></div></details></div></article>`;
+  return `<article class="requirement-library-card"><div class="card-header"><div><h3>${esc(asset.name)}</h3><small>${esc(scope.provider || '-')} ${esc(scope.market || '')} · ${esc(instruments)}</small></div>${statusChip(friendlyStatus(resolved.status))}</div><div class="requirement-essentials library"><div><span>Scope</span><strong>${esc(scope.provider || '-')} ${esc(scope.market || '')} · ${esc(instruments)}</strong></div><div><span>Data</span><strong>${esc(data.frequency || '-')} ${esc(data.dataset_type || 'Data')} · ${esc(arr(data.fields).join(' / ') || '-')}</strong></div><div><span>Time</span><strong>${esc(formatDate(time.start))} → ${esc(time.end === 'LATEST_AVAILABLE' ? 'Latest' : formatDate(time.end))}</strong></div></div><div class="requirement-library-bottom"><div>${preparationBlock(resolved)}</div><div class="requirement-usage"><span>Used by</span><strong>${esc(asset.usage_count || 0)} Research</strong></div></div><div class="card-actions requirement-actions"><button data-action="edit-library-requirement" data-id="${esc(asset.library_asset_id)}">Edit</button><button data-action="save-as-library-requirement" data-id="${esc(asset.library_asset_id)}">Save As</button><button data-action="library-asset-details" data-id="${esc(asset.library_asset_id)}">Details</button><button data-action="view-usage" data-id="${esc(asset.library_asset_id)}">View Usage</button><button class="danger-quiet" data-action="archive-library-assets" data-asset-type="REQUIREMENTS" data-id="${esc(asset.library_asset_id)}" data-name="${esc(asset.name)}" data-usage="${esc(asset.usage_count || 0)}">Remove from Library</button></div></article>`;
 }
 
 async function renderRequirementLibrary() {
+  const target = $('libraryTabContent');
+  if (!state.libraryRequirementsLoaded) {
+    if (target) target.innerHTML = '<div class="empty-state compact"><h2>Loading Requirements\u2026</h2><p>Checking the latest data coverage in the background.</p></div>';
+    await ensureLibraryRequirements();
+  }
   await ensureLibraryGroups('REQUIREMENTS');
   const groups = state.libraryGroupsByType.REQUIREMENTS || [];
   const membership = state.libraryGroupMembershipByType.REQUIREMENTS || {};
@@ -1294,7 +1406,7 @@ async function renderRequirementLibrary() {
 function sharedUniverseCard(item) {
   const resolution = item.current_resolution || {};
   const members = arr(resolution.instrument_ids);
-  return `<article class="component-card universe-shared-card"><div class="card-header"><div><h3>${esc(item.name)}</h3><small>Stable ID · revision ${esc(item.revision_number)} · ${esc(item.type)}</small></div>${statusChip(item.status === 'VALID' ? 'Shared' : friendlyStatus(item.status))}</div><div class="fact-grid"><div class="fact-block"><span>Resolved</span><strong>${esc(resolution.member_count || 0)} Instruments${resolution.combination_count ? ` · ${esc(resolution.combination_count)} combinations` : ''}</strong></div><div class="fact-block"><span>Usage</span><strong>${esc(item.active_research_count || 0)} active Research</strong></div><div class="fact-block"><span>Updated</span><strong>${esc(formatDate(item.updated_at))}</strong></div></div><div class="member-tags">${members.slice(0, 10).map(value => `<span>${esc(value.split(':').pop())}</span>`).join('')}${members.length > 10 ? `<span>+${members.length - 10}</span>` : ''}</div><div class="card-actions"><button type="button" class="primary" data-action="edit-shared-universe" data-id="${esc(item.universe_id)}">Edit</button><button type="button" data-action="copy-shared-universe" data-id="${esc(item.universe_id)}">Copy</button><button type="button" data-action="preview-shared-universe" data-id="${esc(item.universe_id)}">Preview</button><button type="button" data-action="shared-universe-usage" data-id="${esc(item.universe_id)}">Usage</button><button type="button" data-action="shared-universe-details" data-id="${esc(item.universe_id)}">Details</button><details class="overflow-menu"><summary aria-label="More actions">···</summary><div><button type="button" class="danger-quiet" data-action="archive-library-universe" data-id="${esc(item.universe_id)}">Archive</button></div></details></div></article>`;
+  return `<article class="component-card universe-shared-card"><div class="card-header"><div><h3>${esc(item.name)}</h3><small>Stable ID · revision ${esc(item.revision_number)} · ${esc(item.type)}</small></div>${statusChip(item.status === 'VALID' ? 'Shared' : friendlyStatus(item.status))}</div><div class="fact-grid"><div class="fact-block"><span>Resolved</span><strong>${esc(resolution.member_count || 0)} Instruments${resolution.combination_count ? ` · ${esc(resolution.combination_count)} combinations` : ''}</strong></div><div class="fact-block"><span>Usage</span><strong>${esc(item.active_research_count || 0)} active Research</strong></div><div class="fact-block"><span>Updated</span><strong>${esc(formatDate(item.updated_at))}</strong></div></div><div class="member-tags">${members.slice(0, 10).map(value => `<span>${esc(value.split(':').pop())}</span>`).join('')}${members.length > 10 ? `<span>+${members.length - 10}</span>` : ''}</div><div class="card-actions"><button type="button" class="primary" data-action="edit-shared-universe" data-id="${esc(item.universe_id)}">Edit</button><button type="button" data-action="copy-shared-universe" data-id="${esc(item.universe_id)}">Copy</button><button type="button" data-action="preview-shared-universe" data-id="${esc(item.universe_id)}">Preview</button><button type="button" data-action="shared-universe-usage" data-id="${esc(item.universe_id)}">Usage</button><button type="button" data-action="shared-universe-details" data-id="${esc(item.universe_id)}">Details</button><button type="button" class="danger-quiet" data-action="archive-library-assets" data-asset-type="UNIVERSE" data-id="${esc(item.universe_id)}" data-name="${esc(item.name)}" data-usage="${esc(item.active_research_count || 0)}">Remove from Library</button></div></article>`;
 }
 
 async function renderUniverseLibrary() {
@@ -4487,7 +4599,7 @@ function scheduleRequirementRefresh(delay) {
     ? arr(state.dataStatus?.rows).map(item => item.status)
     : state.library.filter(item => item.component_type === 'REQUIREMENTS').map(item => item.data_status?.status);
   const live = statuses.some(status => ['CHECKING', 'QUEUED', 'PREPARING'].includes(status));
-  state.requirementRefreshTimer = window.setTimeout(refreshRequirementStatus, delay ?? (live ? 2000 : 15000));
+  state.requirementRefreshTimer = window.setTimeout(refreshRequirementStatus, delay ?? (live ? 15000 : 60000));
 }
 
 async function refreshRequirementStatus() {
@@ -4495,9 +4607,7 @@ async function refreshRequirementStatus() {
     if (state.surface === 'research-detail' && state.researchTab === 'data') {
       await checkData();
     } else if (state.surface === 'library' && state.libraryTab === 'requirements') {
-      const library = await api('/api/research/library');
-      const other = state.library.filter(item => item.component_type !== 'REQUIREMENTS');
-      state.library = [...other, ...library.filter(item => item.component_type === 'REQUIREMENTS')];
+      await ensureLibraryRequirements(true);
       state.requirementRefreshError = '';
       renderRequirementLibrary();
       scheduleRequirementRefresh();
@@ -4505,7 +4615,7 @@ async function refreshRequirementStatus() {
   } catch (error) {
     state.requirementRefreshError = error.message;
     if (state.surface === 'research-detail' && state.researchTab === 'data') renderResearchData();
-    scheduleRequirementRefresh(15000);
+    scheduleRequirementRefresh(30000);
   }
 }
 
@@ -5249,6 +5359,7 @@ document.addEventListener('click', async event => {
   const action = node.dataset.action;
   try {
     if (action === 'new-research') newResearchDialog();
+    else if (action === 'delete-research') await deleteResearch(node.dataset.id, node.dataset.name);
     else if (action === 'go-research-tab') switchResearchTab(node.dataset.target);
     else if (action === 'new-universe') universeDialog(null, {surface: 'research'});
     else if (action === 'new-library-universe') universeDialog(null, {surface: 'library'});
@@ -5407,9 +5518,11 @@ document.addEventListener('click', async event => {
     else if (action === 'new-library-requirement') await openRequirementEditor({target: 'library'});
     else if (action === 'edit-library-requirement') { const baseAsset = state.library.find(item => item.library_asset_id === node.dataset.id); if (baseAsset) await openRequirementEditor({target: 'library', baseAsset}); }
     else if (action === 'save-as-library-requirement') { const baseAsset = state.library.find(item => item.library_asset_id === node.dataset.id); if (baseAsset) await openRequirementEditor({target: 'library', baseAsset, saveAs: true}); }
-    else if (action === 'archive-library-requirement') { if (window.confirm('Archive this Requirement? It must not be used by any Research.')) { await api(`/api/research/library/requirements/${encodeURIComponent(node.dataset.id)}`, {method: 'DELETE'}); await loadBase(); switchLibraryTab('requirements'); notify('Requirement archived.'); } }
-    else if (action === 'archive-library-definition') { if (window.confirm(`Archive "${node.dataset.name}"? It must not be used by any Research.`)) { await api(`/api/research/library/${encodeURIComponent(node.dataset.id)}/archive`, {method: 'DELETE'}); await loadBase(); notify('Library component archived.'); } }
-    else if (action === 'archive-library-universe') { if (window.confirm('Archive this Universe? It must not be used by any active Research.')) { await api(`/api/library/universes/${encodeURIComponent(node.dataset.id)}/archive`, {method: 'POST', body: '{}'}); await loadBase(); switchLibraryTab('universe'); notify('Universe archived.'); } }
+    else if (action === 'archive-library-assets') await archiveLibraryAssets(
+      node.dataset.assetType,
+      [node.dataset.id],
+      {name: node.dataset.name, usageCount: Number(node.dataset.usage || 0)},
+    );
     else if (action === 'update-shared-requirement') { const item = state.sharedEditItem; const context = state.pendingRequirementContext || {}; closeDialog(); if (item) await openRequirementEditor({target: 'research', item, ...context}); }
     else if (action === 'save-as-current-requirement') { const item = state.sharedEditItem; const context = state.pendingRequirementContext || {}; closeDialog(); if (item) await openRequirementEditor({target: 'research', item, saveAs: true, ...context}); }
     else if (action === 'open-library-draft') await openRequirementEditor({target: 'library', draft: state.libraryRequirementDrafts.find(item => item.draft_id === node.dataset.id)});
@@ -5419,7 +5532,7 @@ document.addEventListener('click', async event => {
     else if (action === 'add-requirement-instrument') { const values = new Set($('reqInstruments').value.split(/[\s,;]+/).filter(Boolean)); values.add(node.dataset.symbol); $('reqInstruments').value = [...values].join(', '); }
     else if (action === 'close-requirement-editor') closeDialog();
     else if (action === 'copy-library-requirements') { const libraryItem = state.requirementItems.find(item => item.origin === 'LIBRARY'); if (libraryItem) { const copy = await api(`/api/research/projects/${encodeURIComponent(state.projectId)}/requirements/items/${encodeURIComponent(libraryItem.ref_id)}/duplicate`, {method: 'POST', body: '{}'}); await loadResearch(state.projectId); await openRequirementEditor({target: 'research', item: copy}); } }
-    else if (action === 'add-library-requirements') addLibraryRequirementsDialog();
+    else if (action === 'add-library-requirements') { await ensureLibraryRequirements(); addLibraryRequirementsDialog(); }
     else if (action === 'publish-requirements') await publishRequirements();
     else if (action === 'check-data') await checkData();
     else if (action === 'retry-status-refresh') { state.requirementRefreshError = ''; await refreshRequirementStatus(); }
@@ -5447,7 +5560,16 @@ document.addEventListener('click', async event => {
       const assetIds = [...state.librarySelectedAssets].filter(key => key.startsWith(`${assetType}:`)).map(key => key.slice(assetType.length + 1));
       if (assetIds.length) await moveLibraryAssets(assetType, assetIds, groupId);
     }
+    else if (action === 'library-batch-archive') {
+      const assetType = node.dataset.assetType;
+      const assetIds = [...state.librarySelectedAssets].filter(key => key.startsWith(`${assetType}:`)).map(key => key.slice(assetType.length + 1));
+      if (assetIds.length) await archiveLibraryAssets(assetType, assetIds);
+    }
     else if (action === 'library-clear-selection') { state.librarySelectedAssets.clear(); await refreshCurrentLibraryTab(); }
+    else if (action === 'retry-workspace-load') {
+      $('appView').innerHTML = '<div class="empty-state compact"><h2>Loading workspace&hellip;</h2><p>Fetching the latest Research and Library metadata.</p></div>';
+      await loadBase({force: true});
+    }
   } catch (error) { notify(error.message, true); }
 });
 
@@ -5513,11 +5635,56 @@ async function moveLibraryAssets(assetType, assetIds, groupId) {
   notify(assetIds.length > 1 ? `${assetIds.length} assets moved.` : 'Asset moved.');
 }
 
-$('refreshButton').addEventListener('click', () => loadBase().then(() => notify('Data refreshed.')).catch(error => notify(error.message, true)));
+async function archiveLibraryAssets(assetType, assetIds, details = {}) {
+  const normalizedType = String(assetType || '').toUpperCase();
+  const count = assetIds.length;
+  const usageCount = Number(details.usageCount || 0);
+  const itemLabel = details.name ? `"${details.name}"` : `${count} selected item${count === 1 ? '' : 's'}`;
+  const referenceNote = usageCount
+    ? ` It is currently used by ${usageCount} Research. Those existing references and historical results will be preserved.`
+    : ' Existing historical records will be preserved.';
+  if (!window.confirm(`Remove ${itemLabel} from Library?${referenceNote} New Research will no longer be able to select it.`)) return;
+
+  const archiveOne = assetId => {
+    if (normalizedType === 'UNIVERSE') {
+      return api(`/api/library/universes/${encodeURIComponent(assetId)}/archive`, {method: 'POST', body: '{}'});
+    }
+    if (normalizedType === 'REQUIREMENTS') {
+      return api(`/api/research/library/requirements/${encodeURIComponent(assetId)}`, {method: 'DELETE'});
+    }
+    return api(`/api/research/library/${encodeURIComponent(assetId)}/archive`, {method: 'DELETE'});
+  };
+  await Promise.all(assetIds.map(archiveOne));
+
+  const removed = new Set(assetIds);
+  if (normalizedType === 'UNIVERSE') {
+    state.sharedUniverses = state.sharedUniverses.filter(item => !removed.has(item.universe_id));
+  } else {
+    state.library = state.library.filter(item => !removed.has(item.library_asset_id));
+  }
+  state.librarySelectedAssets.clear();
+  await ensureLibraryGroups(normalizedType, true);
+  await refreshCurrentLibraryTab();
+  notify(count === 1 ? 'Item removed from Library. Existing Research references were preserved.' : `${count} items removed from Library. Existing Research references were preserved.`);
+}
+
+async function deleteResearch(projectId, projectName) {
+  const label = projectName ? `"${projectName}"` : 'this Research';
+  if (!window.confirm(`Delete ${label} from the Research workspace? Immutable Runs, results, lineage, and audit history will be preserved.`)) return;
+  await api(`/api/research/projects/${encodeURIComponent(projectId)}/archive`, {method: 'POST', body: '{}'});
+  setProjectSummaries(state.projectIndex.filter(item => item.project?.project_id !== projectId));
+  renderResearchIndexCards();
+  notify('Research deleted from the workspace. Historical records were preserved.');
+}
+
+$('refreshButton').addEventListener('click', () => loadBase({force: true}).then(() => notify('Data refreshed.')).catch(error => notify(error.message, true)));
 $('closeEditorDialog').addEventListener('click', closeDialog);
 $('closeDrawer').addEventListener('click', closeDrawer);
 $('drawerScrim').addEventListener('click', closeDrawer);
 
 loadBase().then(() => {
   if (state.surface === 'research-detail') openRequestedClone();
-}).catch(error => notify(`Unable to load: ${error.message}`, true));
+}).catch(error => {
+  renderWorkspaceLoadError(error);
+  notify(`Unable to load: ${error.message}`, true);
+});

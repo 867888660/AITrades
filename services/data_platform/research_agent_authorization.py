@@ -145,10 +145,20 @@ class ResearchAgentAuthorization:
             )
         allowed_instruments = _upper_set(scope.get("allowed_instrument_ids") or [])
         requested_instruments = _upper_set(instrument_ids)
-        if allowed_instruments and not requested_instruments.issubset(allowed_instruments):
+        expanded_scope_allowed = {
+            item
+            for item in requested_instruments
+            if (
+                "EQUITY:CRSP:ALL" in allowed_instruments
+                and item.startswith("EQUITY:CRSP:")
+                and item.removeprefix("EQUITY:CRSP:").isdigit()
+            )
+        }
+        unauthorized = requested_instruments - allowed_instruments - expanded_scope_allowed
+        if allowed_instruments and unauthorized:
             raise ResearchAuthorizationError(
                 "RESEARCH_UNIVERSE_OUT_OF_SCOPE",
-                f"Requested instruments {sorted(requested_instruments - allowed_instruments)} are not allowed",
+                f"Requested instruments {sorted(unauthorized)} are not allowed",
                 context={"allowed": sorted(allowed_instruments), "requested": sorted(requested_instruments)},
             )
         allowed_definitions = {_clean(item) for item in scope.get("allowed_universe_definition_ids") or [] if _clean(item)}

@@ -50,8 +50,17 @@ class CanonicalDatasetCommitter:
         point_in_time_policy: str = "AS_OF",
         adjustment: str = "NONE",
         metadata: Mapping[str, Any] | None = None,
+        coverage_start_time: str | None = None,
+        coverage_end_time: str | None = None,
     ) -> dict[str, Any]:
-        normalized = [dict(row) for row in rows]
+        # OPTIMIZATION: Only copy if rows are not already mutable dicts.
+        # Old behavior: always created a new list of dicts even when input was already list[dict].
+        # New behavior: reuse input when safe, only copy when needed.
+        if isinstance(rows, list) and all(isinstance(r, dict) for r in rows):
+            normalized = rows  # type: ignore[assignment]
+        else:
+            normalized = [dict(row) for row in rows]
+
         if not normalized:
             raise ValueError("canonical dataset commit requires at least one row")
         for index, row in enumerate(normalized):
@@ -73,6 +82,19 @@ class CanonicalDatasetCommitter:
                 str(item.get("security_id") or item.get("instrument_id") or ""),
             )
         )
+        actual_start = str(normalized[0][event_time_field])
+        actual_end = str(normalized[-1][event_time_field])
+        declared_start = str(coverage_start_time or actual_start)
+        declared_end = str(coverage_end_time or actual_end)
+        if declared_start > actual_start:
+            raise ValueError("coverage_start_time must not be after the first event")
+        if declared_end < actual_end:
+            raise ValueError("coverage_end_time must not be before the last event")
+
+        # Infer one physical schema from the complete dataset, then apply it to
+        # every partition. Per-partition inference turns an all-null field into
+        # Arrow's null type and breaks strict multi-file readers.
+        full_schema = pa.Table.from_pylist(normalized).schema
         groups: dict[str, list[dict[str, Any]]] = {}
         for row in normalized:
             stamp = str(row[event_time_field])
@@ -80,10 +102,11 @@ class CanonicalDatasetCommitter:
 
         root = self.output_root / data_type.lower() / f"schema={schema_version}"
         partitions: list[dict[str, Any]] = []
-        for key, group in sorted(groups.items()):
+        ordered_groups = sorted(groups.items())
+        for group_index, (key, group) in enumerate(ordered_groups):
             directory = root / f"period={key}" / "objects"
             directory.mkdir(parents=True, exist_ok=True)
-            table = pa.Table.from_pylist(group)
+            table = pa.Table.from_pylist(group, schema=full_schema)
             embedded = dict(table.schema.metadata or {})
             embedded[b"datatube_schema_version"] = schema_version.encode("utf-8")
             embedded[b"datatube_source_version"] = source_version.encode("utf-8")
@@ -103,8 +126,8 @@ class CanonicalDatasetCommitter:
             partitions.append(
                 {
                     "partition_key": key,
-                    "start_time": group[0][event_time_field],
-                    "end_time": group[-1][event_time_field],
+                    "start_time": declared_start if group_index == 0 else group[0][event_time_field],
+                    "end_time": declared_end if group_index == len(ordered_groups) - 1 else group[-1][event_time_field],
                     "row_count": len(group),
                     "file_uri": uri,
                     "file_size": target.stat().st_size,
@@ -115,8 +138,8 @@ class CanonicalDatasetCommitter:
                 }
             )
 
-        start = str(normalized[0][event_time_field])
-        end = str(normalized[-1][event_time_field])
+        start = declared_start
+        end = declared_end
         last_available = max(str(row[available_time_field]) for row in normalized)
         fields = sorted({str(key).lower() for row in normalized for key in row})
         fingerprint_payload = {
@@ -124,6 +147,9 @@ class CanonicalDatasetCommitter:
             "schema_version": schema_version,
             "source_version": source_version,
             "point_in_time_policy": point_in_time_policy,
+            "coverage_start_time": declared_start,
+            "coverage_end_time": declared_end,
+            "metadata": dict(metadata or {}),
             "partitions": [
                 (item["partition_key"], item["row_count"], item["checksum"])
                 for item in partitions

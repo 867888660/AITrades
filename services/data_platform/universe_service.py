@@ -3,14 +3,22 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from datetime import datetime, timezone
+from bisect import bisect_right
+from dataclasses import replace
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
+from .equity_factor_bridge import project_factor_rows
 from .models import UniverseDefinition, UniverseSnapshot
 from .store import DataPlatformStore, json_dumps, utc_now
+from .universe_v2 import UniverseFieldRegistry
 
 
-SUPPORTED_UNIVERSE_TYPES = {"STATIC_LIST", "TOP_N_BY_TURNOVER"}
+SUPPORTED_UNIVERSE_TYPES = {
+    "STATIC_LIST",
+    "TOP_N_BY_TURNOVER",
+    "HISTORICAL_EQUITY_PIT",
+}
 
 
 def _clean(value: Any) -> str:
@@ -26,6 +34,92 @@ def _parse_time(value: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _interval_start(value: Mapping[str, Any]) -> datetime:
+    raw = _clean(value.get("eligible_from_time") or value.get("eligible_from"))
+    return _parse_time(raw)
+
+
+def _interval_end_exclusive(value: Mapping[str, Any]) -> datetime:
+    raw = _clean(value.get("eligible_to_exclusive"))
+    if raw:
+        return _parse_time(raw)
+    raw = _clean(value.get("eligible_to"))
+    parsed = _parse_time(raw)
+    return parsed + timedelta(days=1) if len(raw) == 10 else parsed + timedelta(microseconds=1)
+
+
+class UniverseMembershipIndex:
+    """Efficient PIT membership checks for immutable Universe evidence.
+
+    Legacy snapshots contain one listing interval per instrument. Dynamic-field
+    Universes add compressed membership segments. Both forms are normalized to
+    half-open time intervals so a cross-section does not scan the full market.
+    """
+
+    def __init__(self, snapshot: Any):
+        self.members = set(getattr(snapshot, "actual_instrument_ids", ()) or ())
+        selection_inputs = dict(getattr(snapshot, "selection_inputs", {}) or {})
+        self.dynamic = bool(selection_inputs.get("dynamic_membership"))
+        raw_segments = dict(selection_inputs.get("membership_segments") or {})
+        if not raw_segments:
+            raw_segments = {
+                instrument_id: [interval]
+                for instrument_id, interval in dict(
+                    selection_inputs.get("membership_intervals") or {}
+                ).items()
+            }
+        self._segments: dict[str, list[tuple[datetime, datetime]]] = {}
+        self._starts: dict[str, list[datetime]] = {}
+        events: list[tuple[datetime, int, str]] = []
+        for instrument_id, values in raw_segments.items():
+            items = values if isinstance(values, list) else [values]
+            normalized: list[tuple[datetime, datetime]] = []
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                start = _interval_start(item)
+                end = _interval_end_exclusive(item)
+                if start >= end:
+                    continue
+                normalized.append((start, end))
+                events.extend(((start, 1, str(instrument_id)), (end, 0, str(instrument_id))))
+            normalized.sort()
+            if normalized:
+                self._segments[str(instrument_id)] = normalized
+                self._starts[str(instrument_id)] = [item[0] for item in normalized]
+        self._events = sorted(events, key=lambda item: (item[0], item[1], item[2]))
+        self._event_index = 0
+        self._active: set[str] = set()
+        self._last_time: datetime | None = None
+
+    def contains(self, instrument_id: str, as_of_time: str) -> bool:
+        if not self.dynamic:
+            return not self.members or instrument_id in self.members
+        current = _parse_time(as_of_time)
+        starts = self._starts.get(str(instrument_id), [])
+        index = bisect_right(starts, current) - 1
+        if index < 0:
+            return False
+        return current < self._segments[str(instrument_id)][index][1]
+
+    def active_at(self, as_of_time: str) -> set[str]:
+        if not self.dynamic:
+            return set(self.members)
+        current = _parse_time(as_of_time)
+        if self._last_time is not None and current < self._last_time:
+            self._event_index = 0
+            self._active.clear()
+        while self._event_index < len(self._events) and self._events[self._event_index][0] <= current:
+            _, event_type, instrument_id = self._events[self._event_index]
+            if event_type:
+                self._active.add(instrument_id)
+            else:
+                self._active.discard(instrument_id)
+            self._event_index += 1
+        self._last_time = current
+        return set(self._active)
 
 
 class UniverseService:
@@ -60,7 +154,7 @@ class UniverseService:
             if not instruments:
                 raise ValueError("STATIC_LIST requires instrument_ids")
             normalized_parameters["instrument_ids"] = list(instruments)
-        else:
+        elif universe_type == "TOP_N_BY_TURNOVER":
             candidates = tuple(sorted({_clean(item) for item in normalized_parameters.get("candidate_instrument_ids", []) if _clean(item)}))
             top_n = int(normalized_parameters.get("top_n", 0))
             lookback_bars = int(normalized_parameters.get("lookback_bars", 0))
@@ -70,6 +164,43 @@ class UniverseService:
                 "candidate_instrument_ids": list(candidates),
                 "top_n": top_n,
                 "lookback_bars": lookback_bars,
+            })
+        else:
+            history_start = _clean(normalized_parameters.get("history_start"))[:10]
+            history_end = _clean(normalized_parameters.get("history_end"))[:10]
+            if not history_start or not history_end or date.fromisoformat(history_start) > date.fromisoformat(history_end):
+                raise ValueError("HISTORICAL_EQUITY_PIT requires history_start <= history_end")
+            point_in_time_filters = self._normalize_point_in_time_filters(
+                normalized_parameters.get("point_in_time_filters") or []
+            )
+            normalized_parameters.update({
+                "source_scope": "equity:CRSP:ALL",
+                "history_start": history_start,
+                "history_end": history_end,
+                "primary_exchanges": sorted({
+                    _clean(item).upper()
+                    for item in normalized_parameters.get("primary_exchanges", [])
+                    if _clean(item)
+                }),
+                "security_types": sorted({
+                    _clean(item).upper()
+                    for item in normalized_parameters.get("security_types", ["EQTY"])
+                    if _clean(item)
+                }),
+                "share_types": sorted({
+                    _clean(item).upper()
+                    for item in normalized_parameters.get("share_types", ["NS", "COM"])
+                    if _clean(item)
+                }),
+                "minimum_listing_age_days": max(
+                    0, int(normalized_parameters.get("minimum_listing_age_days") or 0)
+                ),
+                "excluded_instrument_ids": sorted({
+                    _clean(item)
+                    for item in normalized_parameters.get("excluded_instrument_ids", [])
+                    if _clean(item)
+                }),
+                "point_in_time_filters": point_in_time_filters,
             })
         material = {
             "name": name,
@@ -115,6 +246,59 @@ class UniverseService:
         if result is None:
             raise RuntimeError("failed to create universe definition")
         return result
+
+    @staticmethod
+    def _normalize_point_in_time_filters(values: Any) -> list[dict[str, Any]]:
+        if not isinstance(values, list):
+            raise ValueError("point_in_time_filters must be a list")
+        normalized: list[dict[str, Any]] = []
+        for raw in values:
+            if not isinstance(raw, Mapping):
+                raise ValueError("each point-in-time Universe filter must be an object")
+            contract = UniverseFieldRegistry.default().require(raw.get("field"))
+            field = contract.field_id
+            if not contract.filterable or contract.value_type != "NUMBER" or not contract.formal_pipeline:
+                raise ValueError(
+                    f"HISTORICAL_EQUITY_PIT field is not bound to the formal pipeline: {field}"
+                )
+            minimum = raw.get("minimum")
+            maximum = raw.get("maximum")
+            try:
+                minimum = float(minimum) if minimum is not None else None
+                maximum = float(maximum) if maximum is not None else None
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{field} bounds must be numeric") from exc
+            if minimum is None and maximum is None:
+                raise ValueError(f"{field} requires minimum or maximum")
+            if minimum is not None and not math.isfinite(minimum):
+                raise ValueError(f"{field} minimum must be finite")
+            if maximum is not None and not math.isfinite(maximum):
+                raise ValueError(f"{field} maximum must be finite")
+            if field == "market_cap_usd" and minimum is not None and minimum < 0:
+                raise ValueError("market_cap_usd minimum must be non-negative")
+            if field == "market_cap_usd" and maximum is not None and maximum < 0:
+                raise ValueError("market_cap_usd maximum must be non-negative")
+            if minimum is not None and maximum is not None and minimum > maximum:
+                raise ValueError(f"{field} minimum must not exceed maximum")
+            normalized.append({
+                "field": field,
+                "minimum": minimum,
+                "maximum": maximum,
+                "source_data_type": contract.source_data_type,
+                "source_fields": list(contract.source_fields),
+                "source_unit": contract.source_unit,
+                "unit": contract.unit,
+                "unit_scale": contract.unit_scale,
+                "calculation": contract.calculation,
+                "contract_version": contract.contract_version,
+                "requirements": [
+                    requirement.to_dict()
+                    for requirement in contract.requirement_specs()
+                ],
+                "as_of_policy": "LATEST_AVAILABLE",
+                "missing_policy": contract.missing_policy,
+            })
+        return normalized
 
     def get_definition(self, definition_id: str) -> UniverseDefinition | None:
         with self.store.connection() as conn:
@@ -176,8 +360,10 @@ class UniverseService:
                 "method": "STATIC_LIST",
                 "eligible_count": len(actual),
             }
-        else:
+        elif definition.universe_type == "TOP_N_BY_TURNOVER":
             actual, selection_inputs = self._resolve_top_turnover(definition, as_of_time, manifests)
+        else:
+            actual, selection_inputs = self._resolve_historical_equity(definition)
         if selection_inputs_override:
             selection_inputs = {
                 **selection_inputs,
@@ -213,6 +399,319 @@ class UniverseService:
         if result is None:
             raise RuntimeError("failed to create universe snapshot")
         return result
+
+    def _resolve_historical_equity(
+        self,
+        definition: UniverseDefinition,
+    ) -> tuple[tuple[str, ...], dict[str, Any]]:
+        from .equity_security_master import EquitySecurityMasterService
+
+        parameters = definition.parameters
+        master = EquitySecurityMasterService(self.store)
+        rows = master.list_overlapping(
+            start=parameters["history_start"],
+            end=parameters["history_end"],
+            primary_exchanges=parameters.get("primary_exchanges") or (),
+            security_types=parameters.get("security_types") or ("EQTY",),
+            share_types=parameters.get("share_types") or ("NS", "COM"),
+        )
+        minimum_age = int(parameters.get("minimum_listing_age_days") or 0)
+        period_start = date.fromisoformat(str(parameters["history_start"])[:10])
+        period_end = date.fromisoformat(str(parameters["history_end"])[:10])
+        intervals: dict[str, dict[str, str]] = {}
+        excluded = set(parameters.get("excluded_instrument_ids") or [])
+        for row in rows:
+            listed_text = _clean(row.get("valid_from"))
+            if minimum_age and not listed_text:
+                continue
+            listed = date.fromisoformat(listed_text[:10]) if listed_text else period_start
+            eligible_from = max(period_start, listed + timedelta(days=minimum_age))
+            valid_to_text = _clean(row.get("valid_to"))
+            eligible_to = min(
+                period_end,
+                date.fromisoformat(valid_to_text[:10]) if valid_to_text else period_end,
+            )
+            if eligible_from > eligible_to:
+                continue
+            instrument_id = master.instrument_id_for_permno(row["permno"])
+            if instrument_id in excluded:
+                continue
+            intervals[instrument_id] = {
+                "eligible_from": eligible_from.isoformat(),
+                "eligible_to": eligible_to.isoformat(),
+                "security_id": str(row["security_id"]),
+            }
+        actual = tuple(sorted(intervals))
+        if not actual:
+            raise ValueError("historical equity PIT universe has no eligible securities")
+        return actual, {
+            "method": "SECURITY_MASTER_VALIDITY_INTERVALS",
+            "dynamic_membership": True,
+            "source_scope": "equity:CRSP:ALL",
+            "history_start": parameters["history_start"],
+            "history_end": parameters["history_end"],
+            "primary_exchanges": list(parameters.get("primary_exchanges") or []),
+            "security_types": list(parameters.get("security_types") or []),
+            "share_types": list(parameters.get("share_types") or []),
+            "minimum_listing_age_days": minimum_age,
+            "excluded_instrument_ids": sorted(excluded),
+            "membership_intervals": intervals,
+            "point_in_time_filters": list(parameters.get("point_in_time_filters") or []),
+            "eligible_count": len(actual),
+            "survivorship_policy": "PIT_VALIDITY_INTERVAL",
+        }
+
+    @staticmethod
+    def data_requirements(definition: UniverseDefinition) -> list[dict[str, Any]]:
+        """Return data dependencies declared by a dynamic Universe definition."""
+        filters = list(definition.parameters.get("point_in_time_filters") or [])
+        if not filters:
+            return []
+        grouped: dict[tuple[str, str, str, str], set[str]] = {}
+        for rule in filters:
+            requirements = list(rule.get("requirements") or [])
+            if not requirements and _clean(rule.get("source_field")):
+                requirements = [{
+                    "data_type": rule.get("source_data_type"),
+                    "frequency": "1d",
+                    "fields": [rule.get("source_field")],
+                    "time_semantics": "SOURCE_AVAILABLE_TIME",
+                    "point_in_time_policy": "AS_OF",
+                }]
+            for requirement in requirements:
+                key = (
+                    _clean(requirement.get("data_type")).lower(),
+                    _clean(requirement.get("frequency")).lower(),
+                    _clean(requirement.get("time_semantics")) or "SOURCE_AVAILABLE_TIME",
+                    _clean(requirement.get("point_in_time_policy")) or "AS_OF",
+                )
+                grouped.setdefault(key, set()).update(
+                    _clean(field)
+                    for field in requirement.get("fields") or []
+                    if _clean(field)
+                )
+        result = []
+        history_start = date.fromisoformat(
+            _clean(definition.parameters.get("history_start"))[:10]
+        )
+        for index, ((data_type, frequency, time_semantics, pit_policy), fields) in enumerate(
+            sorted(grouped.items()), start=1
+        ):
+            requirement = {
+                "id": f"{definition.universe_definition_id}:pit-eligibility:{index}",
+                "name": f"PIT Universe eligibility: {data_type}",
+                "data_type": data_type,
+                "frequency": frequency,
+                "fields": sorted(fields),
+                "adjustment": "NONE",
+                "time_semantics": time_semantics,
+                "point_in_time_policy": pit_policy,
+                "quality_policy": "STRICT",
+                "dependency_path": ["UNIVERSE_DEFINITION", "point_in_time_filters"],
+            }
+            if data_type in {"fundamentals_pit", "fundamentals_derived"}:
+                # TTM fields need four discrete quarters already available at
+                # the first research decision. Eighteen calendar months covers
+                # the reporting lag without changing the evaluation period.
+                requirement["history_start"] = (
+                    datetime.combine(
+                        history_start - timedelta(days=548),
+                        datetime.min.time(),
+                        tzinfo=timezone.utc,
+                    ).isoformat()
+                )
+                requirement["warmup_policy"] = "FOUR_DISCRETE_QUARTERS_PIT"
+            result.append(requirement)
+        return result
+
+    @staticmethod
+    def materialize_dynamic_membership(
+        snapshot: UniverseSnapshot,
+        manifest_inputs: Sequence[Mapping[str, Any]],
+    ) -> UniverseSnapshot:
+        """Derive compressed PIT membership from frozen valuation/fundamental inputs.
+
+        The stored Snapshot freezes the candidate identity pool and rules. This
+        method evaluates those rules only from Manifests already pinned by the
+        Frozen Bundle, preserving availability-time semantics without mutating
+        the immutable Snapshot record.
+        """
+        selection_inputs = dict(snapshot.selection_inputs or {})
+        rules = list(selection_inputs.get("point_in_time_filters") or [])
+        if not rules:
+            return snapshot
+        required_types = {
+            _clean(requirement.get("data_type")).lower()
+            for rule in rules
+            for requirement in rule.get("requirements") or []
+            if _clean(requirement.get("data_type"))
+        }
+        if not required_types:
+            required_types = {"equity_valuation_daily"}
+        inputs_by_type: dict[str, list[Mapping[str, Any]]] = {}
+        manifest_ids: set[str] = set()
+        for item in manifest_inputs:
+            data_type = _clean(item.get("data_type")).lower()
+            if data_type not in required_types:
+                continue
+            inputs_by_type.setdefault(data_type, []).append(item)
+            if _clean(item.get("manifest_id")):
+                manifest_ids.add(_clean(item.get("manifest_id")))
+        missing_types = sorted(required_types - set(inputs_by_type))
+        if missing_types:
+            raise ValueError(
+                "dynamic Universe requires frozen Manifests for: " + ", ".join(missing_types)
+            )
+
+        rows_by_type_and_instrument: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        for data_type, inputs in inputs_by_type.items():
+            typed_rows = rows_by_type_and_instrument.setdefault(data_type, {})
+            for item in inputs:
+                for instrument_id, rows in dict(item.get("rows") or {}).items():
+                    if instrument_id not in snapshot.actual_instrument_ids:
+                        continue
+                    typed_rows.setdefault(str(instrument_id), []).extend(
+                        dict(row) for row in rows
+                    )
+        if not any(rows_by_type_and_instrument.values()):
+            raise ValueError("dynamic Universe frozen Manifests have no candidate rows")
+
+        required_logical_fields = {
+            field
+            for rule in rules
+            for field in UniverseFieldRegistry.default().require(rule.get("field")).source_fields
+        }
+        field_updates: dict[str, list[tuple[datetime, str, float]]] = {}
+        valuation_rows = rows_by_type_and_instrument.get("equity_valuation_daily", {})
+        if "market_cap_usd" in required_logical_fields:
+            for instrument_id, rows in valuation_rows.items():
+                for row in rows:
+                    available_raw = _clean(row.get("available_time") or row.get("event_time"))
+                    try:
+                        value = float(row.get("market_cap")) * 1000.0
+                    except (TypeError, ValueError):
+                        continue
+                    if available_raw and math.isfinite(value):
+                        field_updates.setdefault(instrument_id, []).append(
+                            (_parse_time(available_raw), "market_cap_usd", value)
+                        )
+
+        fundamental_fields = required_logical_fields - {"market_cap_usd"}
+        for data_type in ("fundamentals_pit", "fundamentals_derived"):
+            for instrument_id, rows in rows_by_type_and_instrument.get(data_type, {}).items():
+                for field in sorted(fundamental_fields):
+                    projected = project_factor_rows("fundamentals", field, rows)
+                    for row in projected:
+                        available_raw = _clean(row.get("available_time") or row.get("event_time"))
+                        try:
+                            value = float(row.get(field))
+                        except (TypeError, ValueError):
+                            continue
+                        if available_raw and math.isfinite(value):
+                            field_updates.setdefault(instrument_id, []).append(
+                                (_parse_time(available_raw), field, value)
+                            )
+
+        base_intervals = dict(selection_inputs.get("membership_intervals") or {})
+        segments: dict[str, list[dict[str, str]]] = {}
+        snapshot_cutoff = _parse_time(snapshot.as_of_time)
+        for instrument_id in snapshot.actual_instrument_ids:
+            base = dict(base_intervals.get(instrument_id) or {})
+            if not base:
+                continue
+            base_start = _interval_start(base)
+            base_end = _interval_end_exclusive(base)
+            updates_by_time: dict[datetime, list[tuple[datetime, str, float]]] = {}
+            for available, field, value in field_updates.get(instrument_id, []):
+                if available > snapshot_cutoff or available >= base_end:
+                    continue
+                updates_by_time.setdefault(max(base_start, available), []).append(
+                    (available, field, value)
+                )
+            latest: dict[str, float] = {}
+            events: list[tuple[datetime, bool]] = []
+            for effective_time, updates in sorted(updates_by_time.items()):
+                for _, field, value in sorted(updates, key=lambda item: (item[0], item[1])):
+                    latest[field] = value
+                eligible = True
+                for rule in rules:
+                    value = UniverseService._calculate_pit_field(
+                        _clean(rule.get("field")), latest
+                    )
+                    if value is None:
+                        eligible = False
+                        break
+                    minimum = rule.get("minimum")
+                    maximum = rule.get("maximum")
+                    if minimum is not None and value < float(minimum):
+                        eligible = False
+                    if maximum is not None and value > float(maximum):
+                        eligible = False
+                events.append((effective_time, eligible))
+            current_start: datetime | None = None
+            instrument_segments: list[dict[str, str]] = []
+            for available, eligible in events:
+                if available >= base_end:
+                    break
+                if eligible and current_start is None:
+                    current_start = available
+                elif not eligible and current_start is not None:
+                    if current_start < available:
+                        instrument_segments.append({
+                            "eligible_from_time": current_start.isoformat(),
+                            "eligible_to_exclusive": available.isoformat(),
+                        })
+                    current_start = None
+            if current_start is not None and current_start < base_end:
+                instrument_segments.append({
+                    "eligible_from_time": current_start.isoformat(),
+                    "eligible_to_exclusive": base_end.isoformat(),
+                })
+            if instrument_segments:
+                segments[instrument_id] = instrument_segments
+        if not segments:
+            raise ValueError("dynamic PIT Universe has no eligible securities")
+        effective_inputs = {
+            **selection_inputs,
+            "method": "SECURITY_MASTER_AND_PIT_FIELD_RULES",
+            "membership_segments": segments,
+            "dynamic_membership_source_manifest_ids": sorted(manifest_ids),
+            "eligible_ever_count": len(segments),
+            "survivorship_policy": "PIT_VALIDITY_AND_AVAILABLE_FIELD_RULES",
+        }
+        return replace(
+            snapshot,
+            selection_inputs=effective_inputs,
+            dataset_manifest_ids=tuple(sorted(set(snapshot.dataset_manifest_ids) | manifest_ids)),
+        )
+
+    @staticmethod
+    def _calculate_pit_field(field: str, latest: Mapping[str, float]) -> float | None:
+        def value(name: str) -> float | None:
+            raw = latest.get(name)
+            if raw is None:
+                return None
+            parsed = float(raw)
+            return parsed if math.isfinite(parsed) else None
+
+        if field == "market_cap_usd":
+            return value("market_cap_usd")
+        market_cap = value("market_cap_usd")
+        net_income = value("net_income_ttm")
+        equity = value("equity")
+        if field == "roe_ttm":
+            return net_income / equity if net_income is not None and equity is not None and equity > 0 else None
+        if field == "pe_ttm":
+            return market_cap / net_income if market_cap is not None and net_income is not None and net_income > 0 else None
+        if field == "pb_mrq":
+            return market_cap / equity if market_cap is not None and equity is not None and equity > 0 else None
+        if field == "fcf_yield_ttm":
+            operating_cash_flow = value("operating_cash_flow_ttm")
+            capex = value("capex_ttm")
+            if market_cap is None or market_cap <= 0 or operating_cash_flow is None or capex is None:
+                return None
+            return (operating_cash_flow - capex) / market_cap
+        return None
 
     @staticmethod
     def _resolve_top_turnover(

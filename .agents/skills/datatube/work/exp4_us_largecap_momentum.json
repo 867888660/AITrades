@@ -1,0 +1,26 @@
+{
+  "idempotency_key": "us-largecap-momentum-12-1-exp4",
+  "candidate": {
+    "hypothesis": {
+      "statement": "在美国大盘股（历史时点市值≥50亿美元）中，过去12个月收益剔除最近1个月（12-1动量）对未来1/5/20日收益具有正向预测能力，且该能力在1995-2025跨牛熊周期中稳定",
+      "expected_direction": "POSITIVE"
+    },
+    "intervention_set": [
+      {"component": "factor", "change": "introduce 12-1 momentum (reuse library factor momentum_12_1)"}
+    ],
+    "controlled_variables": ["universe", "research_period", "frequency"],
+    "factor": {
+      "name": "momentum_12_1",
+      "operator": "pct_change",
+      "input_field": "close",
+      "window": 252,
+      "frequency": "1d",
+      "output_direction": "HIGHER_IS_BETTER"
+    },
+    "evaluation": {
+      "run_type": "FACTOR_EVALUATION",
+      "primary_metric": "rank_ic",
+      "horizons": [1, 5, 20]
+    }
+  }
+}

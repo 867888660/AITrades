@@ -99,6 +99,7 @@ class ResearchReasonCode(_StringEnum):
     PROVIDER_CAPABILITY_UNAVAILABLE = "PROVIDER_CAPABILITY_UNAVAILABLE"
     EXECUTION_SEMANTICS_UNSUPPORTED = "EXECUTION_SEMANTICS_UNSUPPORTED"
     UNIVERSE_GROUP_EXECUTION_UNSUPPORTED = "UNIVERSE_GROUP_EXECUTION_UNSUPPORTED"
+    COLLECTION_UNIVERSE_NOT_EXPANDED = "COLLECTION_UNIVERSE_NOT_EXPANDED"
     BENCHMARK_NOT_CONFIGURED = "BENCHMARK_NOT_CONFIGURED"
     RESOURCE_LIMIT_EXCEEDED = "RESOURCE_LIMIT_EXCEEDED"
     QUEUE_UNAVAILABLE = "QUEUE_UNAVAILABLE"
@@ -489,6 +490,7 @@ class BundleInputClosure:
     resolved_instrument_weights: Mapping[str, float] = field(default_factory=dict)
     universe_resolution_metadata: Mapping[str, Any] = field(default_factory=dict)
     factor_definitions: tuple[Mapping[str, Any], ...] = ()
+    factor_pack_definitions: tuple[Mapping[str, Any], ...] = ()
     alpha_definitions: tuple[Mapping[str, Any], ...] = ()
     input_factor_artifact_ids: tuple[str, ...] = ()
     input_alpha_artifact_ids: tuple[str, ...] = ()
@@ -538,15 +540,22 @@ class BundleInputClosure:
             _json_safe(dict(self.universe_resolution_metadata or {})),
         )
         factor_definitions = _validate_definition_refs(self.factor_definitions, "factor")
+        factor_pack_definitions = tuple(
+            _json_safe(dict(item)) for item in self.factor_pack_definitions
+            if isinstance(item, Mapping) and str(item.get("pack_id") or "").strip()
+        )
         alpha_definitions = _validate_definition_refs(self.alpha_definitions, "alpha")
         object.__setattr__(self, "factor_definitions", factor_definitions)
+        object.__setattr__(self, "factor_pack_definitions", factor_pack_definitions)
         object.__setattr__(self, "alpha_definitions", alpha_definitions)
         factor_artifacts = tuple(sorted({str(item).strip() for item in self.input_factor_artifact_ids if str(item).strip()}))
         alpha_artifacts = tuple(sorted({str(item).strip() for item in self.input_alpha_artifact_ids if str(item).strip()}))
         object.__setattr__(self, "input_factor_artifact_ids", factor_artifacts)
         object.__setattr__(self, "input_alpha_artifact_ids", alpha_artifacts)
-        if mode == BundleInputMode.DEFINITIONS and not (factor_definitions or alpha_definitions):
-            raise ValueError("DEFINITIONS input mode requires a Factor or Alpha definition reference")
+        if mode == BundleInputMode.DEFINITIONS and not (
+            factor_definitions or factor_pack_definitions or alpha_definitions
+        ):
+            raise ValueError("DEFINITIONS input mode requires a Factor, Factor Pack, or Alpha definition reference")
         if mode == BundleInputMode.PRECOMPUTED_ARTIFACTS and not (factor_artifacts or alpha_artifacts):
             raise ValueError("PRECOMPUTED_ARTIFACTS input mode requires an input Factor or Alpha artifact")
 
@@ -564,6 +573,7 @@ class BundleInputClosure:
             "universe_resolution_metadata": _json_safe(self.universe_resolution_metadata),
             "requirement_set_id": self.requirement_set_id,
             "factor_definitions": _json_safe(self.factor_definitions),
+            "factor_pack_definitions": _json_safe(self.factor_pack_definitions),
             "alpha_definitions": _json_safe(self.alpha_definitions),
             "input_factor_artifact_ids": list(self.input_factor_artifact_ids),
             "input_alpha_artifact_ids": list(self.input_alpha_artifact_ids),

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +19,8 @@ ARTIFACT_TYPES = {
     "UNIVERSE_SNAPSHOT",
     "FACTOR_VALUES",
     "FACTOR_EVALUATION",
+    "FACTOR_PACK_VALUES",
+    "FACTOR_PACK_EVALUATION",
     "ALPHA_VALUES",
     "ALPHA_EVALUATION",
     "PORTFOLIO_TARGETS",
@@ -58,26 +62,104 @@ def content_hash_for_rows(
     schema_version: str,
     identity_context: Optional[dict[str, Any]] = None,
 ) -> str:
-    serialized = sorted(
-        json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
-        for row in rows
+    accumulator = _RowContentHasher()
+    try:
+        for row in rows:
+            accumulator.add(row)
+        return accumulator.finish(
+            schema_version=schema_version,
+            identity_context=identity_context,
+        )
+    finally:
+        accumulator.close()
+
+
+class _RowContentHasher:
+    """External-sort row hashes without retaining an artifact in memory."""
+
+    def __init__(self, *, chunk_size: int = 20_000):
+        self.chunk_size = max(1, int(chunk_size))
+        self.buffer: list[str] = []
+        self.chunks: list[Any] = []
+
+    def add(self, row: dict[str, Any]) -> None:
+        self.buffer.append(json.dumps(
+            row,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ))
+        if len(self.buffer) >= self.chunk_size:
+            self._spill()
+
+    def _spill(self) -> None:
+        if not self.buffer:
+            return
+        self.buffer.sort()
+        handle = tempfile.TemporaryFile(mode="w+t", encoding="utf-8", newline="\n")
+        handle.writelines(f"{item}\n" for item in self.buffer)
+        handle.seek(0)
+        self.chunks.append(handle)
+        self.buffer.clear()
+
+    def finish(
+        self,
+        *,
+        schema_version: str,
+        identity_context: Optional[dict[str, Any]],
+    ) -> str:
+        digest = hashlib.sha256()
+        digest.update(b'{"rows":[')
+        if self.chunks:
+            self._spill()
+            serialized = heapq.merge(*(
+                (line.rstrip("\n") for line in handle)
+                for handle in self.chunks
+            ))
+        else:
+            self.buffer.sort()
+            serialized = iter(self.buffer)
+        for index, item in enumerate(serialized):
+            if index:
+                digest.update(b",")
+            digest.update(item.encode("utf-8"))
+        digest.update(b'],"schema_version":')
+        digest.update(json_dumps(schema_version).encode("utf-8"))
+        if identity_context:
+            digest.update(b',"identity_context":')
+            digest.update(json_dumps(identity_context).encode("utf-8"))
+        digest.update(b"}")
+        return digest.hexdigest()
+
+    def close(self) -> None:
+        for handle in self.chunks:
+            handle.close()
+        self.chunks.clear()
+        self.buffer.clear()
+
+
+def _content_hash_for_parquet(
+    path: Path,
+    *,
+    schema_version: str,
+    identity_context: Optional[dict[str, Any]] = None,
+) -> str:
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("Artifact materialization requires pyarrow") from exc
+    parquet = pq.ParquetFile(path)
+    rows = (
+        row
+        for batch in parquet.iter_batches(batch_size=65_536)
+        for row in batch.to_pylist()
     )
-    digest = hashlib.sha256()
-    # Preserve the original v1 hash material when no identity context is
-    # supplied. New artifacts include their complete semantic identity so a
-    # code or engine change cannot accidentally reuse an old artifact.
-    digest.update(b'{"rows":[')
-    for index, item in enumerate(serialized):
-        if index:
-            digest.update(b",")
-        digest.update(item.encode("utf-8"))
-    digest.update(b'],"schema_version":')
-    digest.update(json_dumps(schema_version).encode("utf-8"))
-    if identity_context:
-        digest.update(b',"identity_context":')
-        digest.update(json_dumps(identity_context).encode("utf-8"))
-    digest.update(b"}")
-    return digest.hexdigest()
+    return content_hash_for_rows(
+        rows,
+        schema_version=schema_version,
+        identity_context=identity_context,
+    )
 
 
 class ArtifactService:
@@ -306,46 +388,89 @@ class ResearchArtifactMaterializer:
         allow_empty: bool = False,
         empty_columns: Iterable[str] = (),
     ) -> ResearchArtifact:
-        row_list = [dict(row) for row in rows]
-        if not row_list and not allow_empty:
-            raise ValueError("cannot materialize an empty artifact")
-        content_hash = content_hash_for_rows(
-            row_list,
-            schema_version=schema_version,
-            identity_context=identity_context,
-        )
         output_dir = self.root / _safe_name(output_folder) / f"{_safe_name(logical_name)}"
         output_dir.mkdir(parents=True, exist_ok=True)
-        target = output_dir / f"content-{content_hash[:20]}.parquet"
         try:
             import pyarrow as pa
             import pyarrow.parquet as pq
         except ImportError as exc:
             raise RuntimeError("Artifact materialization requires pyarrow") from exc
+
+        # Hash and write in bounded batches. The old implementation first
+        # built a complete Python list and then a complete Arrow Table, which
+        # temporarily doubled the largest Factor/Alpha artifacts in memory.
+        temp = output_dir / f".stream.{uuid.uuid4().hex}.tmp"
+        hasher = _RowContentHasher()
+        writer = None
+        arrow_schema = None
+        row_batch: list[dict[str, Any]] = []
+        row_count = 0
+
+        def flush_batch() -> None:
+            nonlocal writer, arrow_schema
+            if not row_batch:
+                return
+            table = (
+                pa.Table.from_pylist(row_batch)
+                if arrow_schema is None
+                else pa.Table.from_pylist(row_batch, schema=arrow_schema)
+            )
+            if arrow_schema is None:
+                arrow_schema = table.schema
+                writer = pq.ParquetWriter(temp, arrow_schema, compression="zstd")
+            writer.write_table(table)
+            row_batch.clear()
+
+        try:
+            for row in rows:
+                hasher.add(row)
+                row_batch.append(row)
+                row_count += 1
+                if len(row_batch) >= 20_000:
+                    flush_batch()
+            flush_batch()
+            if row_count == 0:
+                if not allow_empty:
+                    raise ValueError("cannot materialize an empty artifact")
+                table = pa.table({
+                    str(column): pa.array([], type=pa.string()) for column in empty_columns
+                })
+                if not table.schema.names:
+                    raise ValueError("empty artifacts require at least one declared column")
+                writer = pq.ParquetWriter(temp, table.schema, compression="zstd")
+                writer.write_table(table)
+            if writer is not None:
+                writer.close()
+                writer = None
+            content_hash = hasher.finish(
+                schema_version=schema_version,
+                identity_context=identity_context,
+            )
+        except Exception:
+            if writer is not None:
+                writer.close()
+            temp.unlink(missing_ok=True)
+            raise
+        finally:
+            hasher.close()
+
+        target = output_dir / f"content-{content_hash[:20]}.parquet"
         if target.exists():
-            existing_rows = pq.ParquetFile(target).read().to_pylist()
-            existing_hash = content_hash_for_rows(
-                existing_rows,
+            temp.unlink(missing_ok=True)
+            existing_hash = _content_hash_for_parquet(
+                target,
                 schema_version=schema_version,
                 identity_context=identity_context,
             )
             if existing_hash != content_hash:
                 raise ValueError(f"immutable artifact content mismatch: {target}")
         else:
-            temp = output_dir / f".{target.name}.{uuid.uuid4().hex}.tmp"
-            table = pa.Table.from_pylist(row_list) if row_list else pa.table({
-                str(column): pa.array([], type=pa.string()) for column in empty_columns
-            })
-            if not table.schema.names:
-                raise ValueError("empty artifacts require at least one declared column")
-            pq.write_table(table, temp, compression="zstd")
             try:
                 temp.rename(target)
             except FileExistsError:
                 temp.unlink(missing_ok=True)
-                existing_rows = pq.ParquetFile(target).read().to_pylist()
-                if content_hash_for_rows(
-                    existing_rows,
+                if _content_hash_for_parquet(
+                    target,
                     schema_version=schema_version,
                     identity_context=identity_context,
                 ) != content_hash:
@@ -381,7 +506,12 @@ class ResearchArtifactMaterializer:
         created_by_run_id: str = "",
     ) -> ResearchArtifact:
         dataset_manifest_ids = sorted({str(item) for item in dataset_manifest_ids})
-        rows = [row for instrument_rows in values_by_instrument.values() for row in instrument_rows]
+        row_count = sum(len(instrument_rows) for instrument_rows in values_by_instrument.values())
+        rows = (
+            row
+            for instrument_rows in values_by_instrument.values()
+            for row in instrument_rows
+        )
         spec_hash = str(getattr(spec, "spec_hash", "") or "")
         engine_version = str(getattr(spec, "engine_version", "") or "")
         code_hash = str(getattr(spec, "code_hash", "") or "")
@@ -423,7 +553,7 @@ class ResearchArtifactMaterializer:
                 "input_field": str(spec.input_field),
                 "window": int(spec.window),
                 "instrument_count": len(values_by_instrument),
-                "row_count": len(rows),
+                "row_count": row_count,
                 "universe_snapshot_id": str(universe_snapshot_id or ""),
                 "factor_spec": spec.to_dict() if hasattr(spec, "to_dict") else {},
                 "artifact_fingerprint": hashlib.sha256(json_dumps(identity_context).encode("utf-8")).hexdigest(),
@@ -446,26 +576,36 @@ class ResearchArtifactMaterializer:
         spec_hash = str(getattr(spec, "spec_hash", "") or "")
         engine_version = str(getattr(spec, "engine_version", "") or "")
         code_hash = str(getattr(spec, "code_hash", "") or "")
-        rows: list[dict[str, Any]] = []
-        for signal in signals:
-            event_time = signal.get("as_of_time")
-            scores = signal.get("scores") if isinstance(signal.get("scores"), dict) else {}
-            weights = signal.get("weights") if isinstance(signal.get("weights"), dict) else {}
-            for instrument_id, score in sorted(scores.items()):
-                rows.append({
-                    "instrument_id": str(instrument_id),
-                    "as_of_time": event_time,
-                    "available_time": signal.get("available_time") or event_time,
-                    "alpha_name": str(spec.name),
-                    "alpha_version": str(spec.version),
-                    "score": score,
-                    "rank": (signal.get("ranks") or {}).get(instrument_id),
-                    "percentile": (signal.get("percentiles") or {}).get(instrument_id),
-                    "target_weight": weights.get(instrument_id, 0.0),
-                    "coverage": signal.get("coverage"),
-                    "universe_snapshot_id": signal.get("universe_snapshot_id") or universe_snapshot_id,
-                    "quality_status": signal.get("quality_status") or "PASS",
-                })
+        artifact_metadata: dict[str, Any] = {
+            "alpha_name": str(spec.name),
+            "alpha_version": str(spec.version),
+            "row_count": 0,
+            "factor_artifact_ids": list(factor_artifact_ids),
+            "universe_snapshot_id": str(universe_snapshot_id or ""),
+            "alpha_spec": spec.to_dict() if hasattr(spec, "to_dict") else {},
+        }
+
+        def alpha_rows() -> Iterable[dict[str, Any]]:
+            for signal in signals:
+                event_time = signal.get("as_of_time")
+                scores = signal.get("scores") if isinstance(signal.get("scores"), dict) else {}
+                weights = signal.get("weights") if isinstance(signal.get("weights"), dict) else {}
+                for instrument_id, score in sorted(scores.items()):
+                    artifact_metadata["row_count"] += 1
+                    yield {
+                        "instrument_id": str(instrument_id),
+                        "as_of_time": event_time,
+                        "available_time": signal.get("available_time") or event_time,
+                        "alpha_name": str(spec.name),
+                        "alpha_version": str(spec.version),
+                        "score": score,
+                        "rank": (signal.get("ranks") or {}).get(instrument_id),
+                        "percentile": (signal.get("percentiles") or {}).get(instrument_id),
+                        "target_weight": weights.get(instrument_id, 0.0),
+                        "coverage": signal.get("coverage"),
+                        "universe_snapshot_id": signal.get("universe_snapshot_id") or universe_snapshot_id,
+                        "quality_status": signal.get("quality_status") or "PASS",
+                    }
         dependencies = [
             {"parent_id": str(artifact_id), "parent_type": "RESEARCH_ARTIFACT", "dependency_type": "INPUT_FACTOR"}
             for artifact_id in factor_artifact_ids
@@ -489,10 +629,13 @@ class ResearchArtifactMaterializer:
             "code_hash": code_hash,
             "schema_version": "alpha-output.v2",
         }
+        artifact_metadata["artifact_fingerprint"] = hashlib.sha256(
+            json_dumps(identity_context).encode("utf-8")
+        ).hexdigest()
         return self.materialize_rows(
             artifact_type="ALPHA_VALUES",
             logical_name=str(spec.name),
-            rows=rows,
+            rows=alpha_rows(),
             schema_version="alpha-output.v2",
             output_folder="alphas",
             dependencies=dependencies,
@@ -502,15 +645,7 @@ class ResearchArtifactMaterializer:
             engine_version=engine_version,
             code_hash=code_hash,
             identity_context=identity_context,
-            metadata={
-                "alpha_name": str(spec.name),
-                "alpha_version": str(spec.version),
-                "row_count": len(rows),
-                "factor_artifact_ids": list(factor_artifact_ids),
-                "universe_snapshot_id": str(universe_snapshot_id or ""),
-                "alpha_spec": spec.to_dict() if hasattr(spec, "to_dict") else {},
-                "artifact_fingerprint": hashlib.sha256(json_dumps(identity_context).encode("utf-8")).hexdigest(),
-            },
+            metadata=artifact_metadata,
         )
 
     def materialize_portfolio_targets(

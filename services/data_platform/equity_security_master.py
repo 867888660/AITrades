@@ -249,3 +249,39 @@ class EquitySecurityMasterService:
                 (cutoff, cutoff),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_overlapping(
+        self,
+        *,
+        start: str,
+        end: str,
+        primary_exchanges: Iterable[str] = (),
+        security_types: Iterable[str] = ("EQTY",),
+        share_types: Iterable[str] = ("NS", "COM"),
+    ) -> list[dict[str, Any]]:
+        start_day = _date_text(start)
+        end_day = _date_text(end)
+        if not start_day or not end_day or start_day > end_day:
+            raise ValueError("historical equity period requires start <= end")
+        exchanges = {_clean(item).upper() for item in primary_exchanges if _clean(item)}
+        securities = {_clean(item).upper() for item in security_types if _clean(item)}
+        shares = {_clean(item).upper() for item in share_types if _clean(item)}
+        with self.store.connection() as conn:
+            rows = conn.execute(
+                """SELECT * FROM equity_security_master
+                   WHERE (valid_from IS NULL OR valid_from<=?)
+                     AND (valid_to IS NULL OR valid_to>=?)
+                   ORDER BY security_id""",
+                (end_day, start_day),
+            ).fetchall()
+        result = []
+        for raw in rows:
+            row = dict(raw)
+            if exchanges and _clean(row.get("primary_exchange")).upper() not in exchanges:
+                continue
+            if securities and _clean(row.get("security_type")).upper() not in securities:
+                continue
+            if shares and _clean(row.get("share_type")).upper() not in shares:
+                continue
+            result.append(row)
+        return result

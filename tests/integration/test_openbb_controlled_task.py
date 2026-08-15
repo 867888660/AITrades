@@ -107,6 +107,20 @@ class OpenBBControlledTaskTest(unittest.TestCase):
         self.assertEqual(int(counter["consumed_runs"]), 0)
         self.assertEqual(len(adapter.calls), 1)
 
+    def test_system_maintenance_accepts_matching_bare_equity_ticker(self):
+        payload = OpenBBResearchTaskExecutor._validate_maintenance_scope({
+            "project_id": "project_system_requirement_maintenance",
+            "input": {
+                "authorization_mode": "SYSTEM_REQUIREMENT_MAINTENANCE",
+                "instrument_id": "AAPL",
+                "symbol": "AAPL",
+                "venue": "XNAS",
+                "interval": "1d",
+            },
+        })
+
+        self.assertEqual("AAPL", payload["instrument_id"])
+
     def test_scope_violation_fails_before_adapter_call(self):
         adapter = StubAdapter()
         task = self.compile(symbol="MSFT")

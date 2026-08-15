@@ -5,7 +5,8 @@ description: >
   crypto, and US-equity research/strategy workflow. Use for setup and status;
   managed history storage, archive coverage, migration, and sharing; Research
   UI/API and regression tests; Factor Evaluation, Alpha Evaluation, formal
-  Research Backtest, and legacy Hybrid Run inspection; Polymarket/Binance
+  Research Backtest, Universe v2 authoring and PIT membership evaluation, and
+  legacy Hybrid Run inspection; Polymarket/Binance
   research, controlled US-equity preparation and pre-market snapshots, and Qlib
   Alpha158-compatible factor computation; EventGraph changes; strategy drafts,
   risk checks, simulations, and human-approval handoff; historical backtests,
@@ -34,12 +35,63 @@ when needed, then work through controlled local APIs.
   risk check, and simulation result, then wait for a human.
 - Research must not automatically create a strategy unless the current user
   request explicitly asks to research and then create a strategy draft.
-- A user's research request is sufficient to start a research-only Session.
-  Do not ask the user to create or manage a Grant. The backend creates fixed,
-  bounded research capacity and the Agent may not enlarge it.
+- A user's research request is sufficient to begin Research Alignment, but it
+  is not by itself permission to START or RESUME a research Session. Before
+  START or RESUME, show the complete final research plan, give the user a clear
+  opportunity to modify any inferred or recommended value, and require explicit
+  confirmation. Do not ask the user to create or manage a Grant. The backend
+  creates fixed, bounded research capacity and the Agent may not enlarge it.
 - Ask the user only for unresolved semantic ambiguity, an ambiguous resume
   anchor, a material scope change, a limit extension, or crossing from research
-  into strategy/live execution. Routine research choices are Agent decisions.
+  into strategy/live execution. Routine research choices are Agent decisions,
+  but inferred and recommended research values remain proposals until they have
+  been shown in the final pre-start review and explicitly confirmed by the user.
+- A missing resume anchor is `RESEARCH_RESUME_ANCHOR_NOT_FOUND`, not ambiguity.
+  Do not create or answer a `NEED_HUMAN` question when there are no candidates.
+- In Research Agent mode, behave as a researcher: guide the user on asset type,
+  period, Universe eligibility/selection, controls, and evaluation meaning.
+  Never expose or operate RequirementSet, Manifest, Preview, Bundle, Provider
+  task, worker, source code, or infrastructure repair surfaces.
+- A missing Universe is material research ambiguity. Recommend a defensible
+  Universe and explain the tradeoff before START; do not silently choose one.
+- Keep the Universe v2 product surface to `STATIC`, `DYNAMIC`, and `COMPOSITE`.
+  A Dynamic Universe is exactly Base, Filter, Rank, Select, and Rebalance;
+  never invent field-specific Universe types or arbitrary filter expressions.
+- Read `universe_capabilities` before authoring a Dynamic Universe. Distinguish
+  `field_registry` (valid authoring contracts) from
+  `dynamic_point_in_time_filters` and `field_execution_status` (what the
+  current formal pipeline can actually evaluate).
+- Formal equity PIT filters currently include `market_cap_usd`, `roe_ttm`,
+  `pe_ttm`, `pb_mrq`, and `fcf_yield_ttm`. Treat ratio thresholds as decimals,
+  require frozen valuation/SEC fundamentals Manifests declared by the field
+  contract, and preserve `LATEST_AVAILABLE` plus `EXCLUDE` for missing inputs.
+- `REQUIRES_FROZEN_DATA` is not resolved membership. Never persist, bind, or
+  report a Dynamic Universe as evaluated until frozen point-in-time evidence
+  produces a Membership Timeline. Preserve
+  `DYNAMIC_UNIVERSE_REQUIRES_FROZEN_EVALUATION` instead of falling back to a
+  static or all-eligible list.
+- Universe Rebalance means membership reconstitution. Do not confuse it with a
+  Portfolio rebalance or infer same-close execution from a close-time decision.
+- Keep status semantics disjoint. `COMPLETE` can support a research decision;
+  `INVALID` rejects the Candidate; `SYSTEM_BLOCKED` means no research result;
+  Session `BLOCKED` is a recoverable container state; `NEED_HUMAN` is reserved
+  for an unresolved material user choice. Never write `NEED_HUMAN(BLOCKED)`.
+- Treat Library compatibility conservatively. Missing requested asset-class or
+  frequency metadata is `UNKNOWN`, never `COMPATIBLE` or automatically selectable.
+- Do not infer a deadlock from elapsed time, memory use, or a later status edit.
+  Require the persisted phase timeline and terminal Run evidence. Treat raw
+  archive coverage, READY Catalog coverage, warmup coverage, and evaluation
+  coverage as four different claims.
+- Researcher mode never repairs infrastructure. An explicit user request to
+  diagnose or change the backend selects an engineering/review workflow; this
+  does not turn a blocked Experiment into research evidence.
+- A public `SYSTEM_BLOCKED` issue is not proof of a global outage. In an explicit
+  engineering workflow, inspect that issue and keep maintenance scoped to the
+  affected Research/Session before drawing a system-wide conclusion.
+- In an explicit engineering workflow, a persisted `PREPARING_DATA` Experiment
+  must map to active preparation or a short post-commit readiness check. Drain
+  provider workers independently of global Requirement scans, and isolate
+  Experiment advancement so one large universe cannot block unrelated work.
 - Use Binance in v1.0 as market data and crypto context. Do not imply Binance
   live trading support.
 - Keep formal Research Run products distinct: Factor Evaluation measures a
@@ -97,11 +149,22 @@ Choose one workflow family from the user's request:
   ranking snapshots, or event-to-market analysis. Use
   [references/research.md](references/research.md).
 - **Research Agent**: start a research project from a natural-language goal or
-  resume from a Project, Run, Preview, Bundle, Factor, Alpha, or Session anchor;
-  then iterate through Project-scoped Universe, Factor, Alpha, Requirements,
-  Preview, Frozen Bundle, Factor Evaluation, Alpha Evaluation, and formal
-  Research Backtest objects. Use
-  [references/research-agent-workflow.md](references/research-agent-workflow.md).
+  iterate through falsifiable experiments. Read
+  [references/research-alignment.md](references/research-alignment.md) first.
+  After the backend Alignment is READY, follow the pre-start review and user
+  confirmation gate in that reference, then read
+  [references/RESEARCH_PROGRAM.md](references/RESEARCH_PROGRAM.md) and
+  [references/research-agent-workflow.md](references/research-agent-workflow.md),
+  then load only the routed reference:
+  [Universe](references/research-universe-experiment.md),
+  [Factor](references/research-factor-experiment.md),
+  [Alpha](references/research-alpha-experiment.md), or
+  [Portfolio Evidence](references/research-portfolio-evidence.md), then
+  [Iterate](references/research-iterate.md). Read
+  [Strategy Handoff](references/research-strategy-handoff.md) only when the user
+  explicitly asks to cross from research into a Strategy draft.
+  Once this route is selected, do not load Setup, Qlib diagnostics, Inspection,
+  Research Workspace Test, or downstream engineering references.
 - **Qlib Alpha158**: compute the current 157-factor, no-VWAP stock compatibility
   pack from READY DataTube equity daily Manifests, verify its immutable cache,
   or diagnose its optional Python runtime. Use
@@ -139,6 +202,11 @@ python scripts/datatube_client.py capabilities --section research
 python scripts/datatube_client.py dashboard --limit 50
 ```
 
+For the Research Agent route, use
+`python scripts/datatube_client.py capabilities --section researcher` as the
+only preflight. Do not load the general dashboard or inspect internal Project
+objects before research.
+
 ## Standard Preflight
 
 For research, strategy, backtest, and review:
@@ -152,6 +220,9 @@ For research, strategy, backtest, and review:
 5. Write an activity event before write workflows.
 6. Use the API paths described in the relevant reference file.
 
+For the Research Agent route, the preceding researcher-only preflight and
+facade replace this general sequence. Do not inspect Project or execution IR.
+
 ## Closeout
 
 Always tell the user:
@@ -162,6 +233,11 @@ Always tell the user:
 - draft, approval, or handoff IDs if present
 - skipped steps and why
 - any item needing human confirmation
+
+For Universe work, also report the definition schema, compile state, frozen
+evidence state, and highest truthful membership state: authored, compiled,
+frozen-evaluated, or bound. Never call an authored/compiled Dynamic Universe
+complete membership evidence.
 
 For research-only work, say that no strategy was created or submitted.
 For strategy work, say that the draft was submitted to `WAITING_HUMAN_CONFIRM`
@@ -191,14 +267,12 @@ python scripts/datatube_client.py inspection-events <trace_id> --severity warnin
 python scripts/datatube_client.py inspection-event <event_id>
 python scripts/datatube_client.py backtest-cases --limit 100
 python scripts/datatube_client.py backtest-runs --case-id 47 --limit 20
-python scripts/datatube_client.py research-projects --limit 100
-python scripts/datatube_client.py research-start --data research_brief.json
-python scripts/datatube_client.py research-resume RUN run_123
-python scripts/datatube_client.py research-session research_session_123
-python scripts/datatube_client.py research-definition-create <project_id> --data factor.json
 python scripts/backtest_optimizer.py run --spec spec.json --dry-run
 python scripts/research_workspace_test.py --mode all --repo <datatube-repo>
 ```
+
+Research Agent commands live only in the routed Research Agent references. Do
+not mix them with legacy Project, Definition, Requirement, or Run commands.
 
 Read [references/safety.md](references/safety.md) before adding or exposing any
 new write path.

@@ -1,0 +1,48 @@
+{
+  "objective": "Test DataTube Research end to end on an 80-year US-equity daily window using the Qlib Alpha158-compatible (VWAP excluded) 157-factor pack, then attempt a formal cost-aware Research Backtest and document all data, lineage, and runtime failures without synthesizing VWAP.",
+  "instrument_scope": [
+    "IBM",
+    "KO",
+    "PG",
+    "XOM",
+    "GE",
+    "JPM",
+    "CVX",
+    "CAT",
+    "MMM",
+    "DIS"
+  ],
+  "provider": "OPENBB",
+  "frequency": "1d",
+  "research_period": {
+    "start": "1946-08-11",
+    "end": "2026-08-11"
+  },
+  "evaluation_plan": {
+    "factor": [
+      "coverage",
+      "rank_ic",
+      "quantile_return"
+    ],
+    "alpha": [
+      "rank_ic",
+      "decay",
+      "membership_turnover",
+      "regime_stability"
+    ],
+    "research_backtest": [
+      "annualized_return",
+      "max_drawdown",
+      "sharpe_ratio",
+      "trade_turnover",
+      "cost_adjusted_return"
+    ]
+  },
+  "constraints": {
+    "long_only": true,
+    "leverage": false,
+    "max_turnover": null
+  },
+  "benchmark": "equal_weight_universe",
+  "idempotency_key": "alpha158-without-vwap-80y-19460811-20260811-v1"
+}

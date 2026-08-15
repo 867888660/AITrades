@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from collections.abc import Iterator
+from typing import Any, Iterable, Optional
 
 from .catalog_service import DatasetCatalogService
 from .models import DatasetManifest, DatasetPartition
@@ -22,6 +23,7 @@ class FrozenManifestData:
     def __init__(self, store: DataPlatformStore, manifest_id: str):
         self.store = store
         self.catalog = DatasetCatalogService(store)
+        self._verified_partition_stats: dict[str, tuple[int, int]] = {}
         manifest = self.catalog.get_manifest(manifest_id)
         if manifest is None:
             raise ValueError(f"dataset manifest not found: {manifest_id}")
@@ -50,6 +52,27 @@ class FrozenManifestData:
             event_time = self._parse_time(partition.min_event_time)
             if event_time <= cutoff:
                 result.append(partition)
+        return tuple(result)
+
+    def _partitions_in_range(
+        self,
+        *,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        as_of: Optional[str] = None,
+    ) -> tuple[DatasetPartition, ...]:
+        """Prune immutable partitions using their declared event-time bounds."""
+        start = self._parse_time(start_time) if start_time else None
+        end = self._parse_time(end_time) if end_time else None
+        result = []
+        for partition in self.partitions(as_of=as_of):
+            partition_start = self._parse_time(partition.min_event_time) if partition.min_event_time else None
+            partition_end = self._parse_time(partition.max_event_time) if partition.max_event_time else None
+            if start and partition_end and partition_end < start:
+                continue
+            if end and partition_start and partition_start > end:
+                continue
+            result.append(partition)
         return tuple(result)
 
     def descriptor(self) -> dict[str, object]:
@@ -88,7 +111,11 @@ class FrozenManifestData:
         path = self._partition_path(partition)
         if not path.is_file():
             raise FileNotFoundError(f"manifest partition file is missing: {path}")
-        if path.stat().st_size != partition.file_size:
+        stat = path.stat()
+        state = (stat.st_size, stat.st_mtime_ns)
+        if self._verified_partition_stats.get(partition.partition_id) == state:
+            return
+        if stat.st_size != partition.file_size:
             raise ValueError(f"manifest partition size mismatch: {path}")
         if not partition.checksum.startswith("sha256:"):
             raise ValueError(f"manifest partition checksum is not sha256: {path}")
@@ -117,25 +144,32 @@ class FrozenManifestData:
             missing = sorted(required - set(schema.names))
             if missing:
                 raise ValueError(f"bars.v1 partition is missing columns {missing}: {path}")
-            rows = parquet.read(columns=["bar_start_time", "bar_end_time", "available_time", "bar_status"]).to_pylist()
-            starts = [str(row["bar_start_time"]) for row in rows]
-            ends = [str(row["bar_end_time"]) for row in rows]
-            min_start = min(starts, key=self._parse_time) if starts else ""
-            max_start = max(starts, key=self._parse_time) if starts else ""
-            max_end = max(ends, key=self._parse_time) if ends else ""
-            if starts and partition.min_event_time and self._parse_time(min_start) != self._parse_time(partition.min_event_time):
+            min_start: datetime | None = None
+            max_start: datetime | None = None
+            max_end: datetime | None = None
+            for batch in parquet.iter_batches(
+                columns=["bar_start_time", "bar_end_time", "available_time", "bar_status"],
+                batch_size=65_536,
+            ):
+                for row in batch.to_pylist():
+                    start_value = self._parse_time(row["bar_start_time"])
+                    end_value = self._parse_time(row["bar_end_time"])
+                    available_value = self._parse_time(row["available_time"])
+                    min_start = start_value if min_start is None else min(min_start, start_value)
+                    max_start = start_value if max_start is None else max(max_start, start_value)
+                    max_end = end_value if max_end is None else max(max_end, end_value)
+                    if str(row["bar_status"] or "").upper() != "COMPLETE":
+                        raise ValueError(f"manifest contains an incomplete bar: {path}")
+                    if available_value < end_value:
+                        raise ValueError(f"bar available_time precedes bar_end_time: {path}")
+            if min_start is not None and partition.min_event_time and min_start != self._parse_time(partition.min_event_time):
                 raise ValueError(f"manifest partition minimum event time mismatch: {path}")
-            if starts and partition.max_event_time and self._parse_time(max_start) != self._parse_time(partition.max_event_time):
+            if max_start is not None and partition.max_event_time and max_start != self._parse_time(partition.max_event_time):
                 raise ValueError(f"manifest partition maximum event time mismatch: {path}")
-            if starts and partition.start_time and self._parse_time(min_start) < self._parse_time(partition.start_time):
+            if min_start is not None and partition.start_time and min_start < self._parse_time(partition.start_time):
                 raise ValueError(f"manifest partition starts before declared range: {path}")
-            if ends and partition.end_time and self._parse_time(max_end) > self._parse_time(partition.end_time):
+            if max_end is not None and partition.end_time and max_end > self._parse_time(partition.end_time):
                 raise ValueError(f"manifest partition ends after declared range: {path}")
-            for row in rows:
-                if str(row["bar_status"] or "").upper() != "COMPLETE":
-                    raise ValueError(f"manifest contains an incomplete bar: {path}")
-                if self._parse_time(row["available_time"]) < self._parse_time(row["bar_end_time"]):
-                    raise ValueError(f"bar available_time precedes bar_end_time: {path}")
         if self.manifest.schema_version == "polymarket_price.v1":
             required = {
                 "event_time",
@@ -147,37 +181,37 @@ class FrozenManifestData:
                 raise ValueError(
                     f"polymarket_price.v1 partition is missing columns {missing}: {path}"
                 )
-            rows = parquet.read(
-                columns=["event_time", "available_time"]
-            ).to_pylist()
-            events = [str(row["event_time"]) for row in rows]
-            min_event = min(events, key=self._parse_time) if events else ""
-            max_event = max(events, key=self._parse_time) if events else ""
+            min_event: datetime | None = None
+            max_event: datetime | None = None
+            for batch in parquet.iter_batches(
+                columns=["event_time", "available_time"], batch_size=65_536
+            ):
+                for row in batch.to_pylist():
+                    event_value = self._parse_time(row["event_time"])
+                    available_value = self._parse_time(row["available_time"])
+                    min_event = event_value if min_event is None else min(min_event, event_value)
+                    max_event = event_value if max_event is None else max(max_event, event_value)
+                    if available_value < event_value:
+                        raise ValueError(
+                            f"price available_time precedes event_time: {path}"
+                        )
             if (
-                events
+                min_event is not None
                 and partition.min_event_time
-                and self._parse_time(min_event)
-                != self._parse_time(partition.min_event_time)
+                and min_event != self._parse_time(partition.min_event_time)
             ):
                 raise ValueError(
                     f"manifest partition minimum event time mismatch: {path}"
                 )
             if (
-                events
+                max_event is not None
                 and partition.max_event_time
-                and self._parse_time(max_event)
-                != self._parse_time(partition.max_event_time)
+                and max_event != self._parse_time(partition.max_event_time)
             ):
                 raise ValueError(
                     f"manifest partition maximum event time mismatch: {path}"
                 )
-            for row in rows:
-                if self._parse_time(row["available_time"]) < self._parse_time(
-                    row["event_time"]
-                ):
-                    raise ValueError(
-                        f"price available_time precedes event_time: {path}"
-                    )
+        self._verified_partition_stats[partition.partition_id] = state
 
     def verify(self) -> dict[str, object]:
         if not self.manifest.partitions:
@@ -192,42 +226,123 @@ class FrozenManifestData:
             "status": "PASS",
         }
 
-    def read_rows(self, *, columns: Optional[list[str]] = None, as_of: Optional[str] = None) -> list[dict[str, Any]]:
-        """Read rows only from the pinned manifest partitions."""
+    def iter_rows(
+        self,
+        *,
+        columns: Optional[list[str]] = None,
+        as_of: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        instrument_ids: Optional[Iterable[str]] = None,
+        batch_size: int = 65_536,
+    ) -> Iterator[dict[str, Any]]:
+        """Stream filtered rows from pinned partitions without a whole-table list.
+
+        Date and instrument filters are applied to Arrow record batches. This is
+        the safe read boundary for collection Manifests such as CRSP/CIZ.
+        """
         try:
+            import pyarrow as pa
+            import pyarrow.compute as pc
             import pyarrow.parquet as pq
         except ImportError as exc:
             raise RuntimeError("Parquet reads require pyarrow; install project requirements first") from exc
+        if start_time and end_time and self._parse_time(start_time) > self._parse_time(end_time):
+            raise ValueError("start_time must not be after end_time")
+        selected_instruments = sorted({str(item).strip() for item in (instrument_ids or ()) if str(item).strip()})
         requested_columns = list(columns) if columns is not None else None
         read_columns = list(requested_columns) if requested_columns is not None else None
-        if as_of and read_columns is not None and "available_time" not in read_columns:
-            read_columns.append("available_time")
-        result: list[dict[str, Any]] = []
-        for partition in self.partitions(as_of=as_of):
+        filter_columns = []
+        if as_of:
+            filter_columns.append("available_time")
+        if start_time or end_time:
+            filter_columns.append(
+                "bar_start_time" if self.manifest.schema_version.startswith("bars") else "event_time"
+            )
+        if selected_instruments:
+            filter_columns.append("instrument_id")
+        if read_columns is not None:
+            for name in filter_columns:
+                if name not in read_columns:
+                    read_columns.append(name)
+        cutoff = self._parse_time(as_of) if as_of else None
+        start = self._parse_time(start_time) if start_time else None
+        end = self._parse_time(end_time) if end_time else None
+
+        def time_scalar(values: Any, value: datetime) -> Any:
+            if pa.types.is_string(values.type) or pa.types.is_large_string(values.type):
+                return pa.scalar(value.isoformat(), type=values.type)
+            return pa.scalar(value, type=values.type)
+
+        for partition in self._partitions_in_range(
+            start_time=start_time, end_time=end_time, as_of=as_of
+        ):
             self._verify_partition(partition)
             path = self._partition_path(partition)
             # Parquet paths use Hive-style directories such as
             # frequency=1m.  Reading a single file through read_table(path)
             # can merge the directory partition column with the same field
             # stored in the canonical schema and produce a type conflict.
-            result.extend(pq.ParquetFile(path).read(columns=read_columns).to_pylist())
-        if as_of:
-            cutoff = self._parse_time(as_of)
-            filtered = []
-            for row in result:
-                available = str(row.get("available_time") or "").strip()
-                if not available:
-                    continue
-                available_dt = self._parse_time(available)
-                if available_dt <= cutoff:
-                    filtered.append(row)
-            result = filtered
-        if requested_columns is not None:
-            result = [{column: row.get(column) for column in requested_columns} for row in result]
-        return result
+            parquet = pq.ParquetFile(path)
+            for batch in parquet.iter_batches(columns=read_columns, batch_size=max(1, int(batch_size))):
+                mask = None
+                if cutoff:
+                    values = batch.column(batch.schema.get_field_index("available_time"))
+                    item = pc.less_equal(values, time_scalar(values, cutoff))
+                    mask = item if mask is None else pc.and_(mask, item)
+                event_column = "bar_start_time" if "bar_start_time" in batch.schema.names else "event_time"
+                if start:
+                    values = batch.column(batch.schema.get_field_index(event_column))
+                    item = pc.greater_equal(values, time_scalar(values, start))
+                    mask = item if mask is None else pc.and_(mask, item)
+                if end:
+                    values = batch.column(batch.schema.get_field_index(event_column))
+                    item = pc.less_equal(values, time_scalar(values, end))
+                    mask = item if mask is None else pc.and_(mask, item)
+                if selected_instruments:
+                    values = batch.column(batch.schema.get_field_index("instrument_id"))
+                    item = pc.is_in(values, value_set=pa.array(selected_instruments, type=values.type))
+                    mask = item if mask is None else pc.and_(mask, item)
+                if mask is not None:
+                    batch = batch.filter(pc.fill_null(mask, False))
 
-    def read_bars_by_instrument(self, *, as_of: Optional[str] = None) -> dict[str, list[dict[str, Any]]]:
-        rows = self.read_rows(as_of=as_of)
+                # OPTIMIZATION: Delay to_pylist() conversion to reduce memory overhead.
+                # Only convert to dict when absolutely necessary (i.e., when yielding).
+                # This avoids creating intermediate Python objects for filtered-out rows.
+                if requested_columns is not None:
+                    # Only select needed columns at Arrow level (zero-copy)
+                    batch = batch.select(requested_columns)
+
+                for row in batch.to_pylist():
+                    yield row
+
+    def read_rows(
+        self,
+        *,
+        columns: Optional[list[str]] = None,
+        as_of: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        instrument_ids: Optional[Iterable[str]] = None,
+    ) -> list[dict[str, Any]]:
+        """Read filtered rows only from the pinned manifest partitions."""
+        return list(self.iter_rows(
+            columns=columns,
+            as_of=as_of,
+            start_time=start_time,
+            end_time=end_time,
+            instrument_ids=instrument_ids,
+        ))
+
+    def read_bars_by_instrument(
+        self,
+        *,
+        columns: Optional[list[str]] = None,
+        as_of: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        instrument_ids: Optional[Iterable[str]] = None,
+    ) -> dict[str, list[dict[str, Any]]]:
         catalog_entry = self.catalog.get_catalog(self.dataset_id)
         fallback_instrument_id = (
             catalog_entry.instrument_id
@@ -235,7 +350,13 @@ class FrozenManifestData:
             else ""
         )
         grouped: dict[str, list[dict[str, Any]]] = {}
-        for row in rows:
+        for row in self.iter_rows(
+            columns=columns,
+            as_of=as_of,
+            start_time=start_time,
+            end_time=end_time,
+            instrument_ids=instrument_ids,
+        ):
             instrument_id = str(
                 row.get("instrument_id")
                 or fallback_instrument_id

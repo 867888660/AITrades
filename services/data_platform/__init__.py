@@ -44,6 +44,14 @@ from .equity_field_resolver import FIELD_CONTRACTS, EquityFieldResolver
 from .equity_universe import HistoricalEquityUniverseService
 from .openbb_task_executor import OPENBB_EXPORT_TASK_TYPE, OpenBBResearchTaskExecutor, OpenBBResearchWorker
 from .factor_alpha import AlphaComponent, AlphaEngine, AlphaSpec, FactorEngine, FactorSpec
+from .factor_pack import (
+    ALPHA158_NO_VWAP_DISPLAY_NAME,
+    ALPHA158_NO_VWAP_FACTOR_COUNT,
+    ALPHA158_NO_VWAP_PACK_ID,
+    FactorPackDefinition,
+    FactorPackMemberSpec,
+    FactorPackRegistry,
+)
 from .factor_formula import FactorFormulaCompilation, FactorFormulaCompiler, FormulaDiagnostic
 from .factor_engine_v4 import (
     FACTOR_ENGINE_V4_CODE_HASH,
@@ -65,6 +73,18 @@ from .models import (
     Instrument,
     UniverseDefinition,
     UniverseSnapshot,
+)
+from .universe_v2 import (
+    UNIVERSE_ENGINE_VERSION,
+    UNIVERSE_MEMBERSHIP_SCHEMA_VERSION,
+    UNIVERSE_V2_COMPILED_SCHEMA_VERSION,
+    UNIVERSE_V2_SCHEMA_VERSION,
+    UniverseFieldContract,
+    UniverseFieldRequirement,
+    UniverseFieldRegistry,
+    UniverseMembershipEngine,
+    UniverseV2Compiler,
+    universe_v2_capabilities,
 )
 from .requirement_service import DataRequirementService
 from .requirement_compiler import REQUIREMENT_COMPILER_VERSION, RequirementCompiler
@@ -165,6 +185,10 @@ from .research_run_service import (
     ResearchRunService,
     ResearchRunWorker,
 )
+from .factor_pack_result_service import (
+    FACTOR_PACK_RESULT_SCHEMA_VERSION,
+    FactorPackRunResultService,
+)
 from .research_agent_authorization import (
     DEFAULT_RESEARCH_OPERATIONS,
     AuthorizationDecision,
@@ -180,6 +204,27 @@ from .research_agent_session import (
     SESSION_STATES,
     ResearchAgentSessionService,
     normalize_research_brief,
+)
+from .research_semantics import (
+    ALIGNED_RESEARCH_INTENT_SCHEMA_VERSION,
+    CANDIDATE_SPEC_SCHEMA_VERSION,
+    EVIDENCE_PROFILES,
+    RESEARCH_CONTRACT_SCHEMA_VERSION,
+    RESEARCH_RESULT_SCHEMA_VERSION,
+    RESEARCHER_AVAILABLE_STOP_AT,
+    RUN_TYPE_TO_STOP_AT,
+    STOP_AT_TO_RUN_TYPE,
+    ResearchContractService,
+    ResearchSemanticError,
+    align_research_intent,
+    build_research_contract,
+    infer_research_stop_at,
+    normalize_candidate,
+)
+from .research_experiment_service import (
+    EXPERIMENT_STATES,
+    RESEARCH_DECISIONS,
+    ResearchExperimentService,
 )
 
 __all__ = [
@@ -244,6 +289,12 @@ __all__ = [
     "FactorInputCandidateResolver",
     "FactorEngine",
     "FactorSpec",
+    "FactorPackDefinition",
+    "FactorPackMemberSpec",
+    "FactorPackRegistry",
+    "ALPHA158_NO_VWAP_DISPLAY_NAME",
+    "ALPHA158_NO_VWAP_FACTOR_COUNT",
+    "ALPHA158_NO_VWAP_PACK_ID",
     "FactorFormulaCompilation",
     "FactorFormulaCompiler",
     "FormulaDiagnostic",
@@ -303,6 +354,16 @@ __all__ = [
     "Instrument",
     "InstrumentRegistry",
     "UniverseDefinition",
+    "UNIVERSE_ENGINE_VERSION",
+    "UNIVERSE_MEMBERSHIP_SCHEMA_VERSION",
+    "UNIVERSE_V2_COMPILED_SCHEMA_VERSION",
+    "UNIVERSE_V2_SCHEMA_VERSION",
+    "UniverseFieldContract",
+    "UniverseFieldRequirement",
+    "UniverseFieldRegistry",
+    "UniverseMembershipEngine",
+    "UniverseV2Compiler",
+    "universe_v2_capabilities",
     "UniverseService",
     "SharedUniverseService",
     "UniverseConflictError",
@@ -347,6 +408,8 @@ __all__ = [
     "ResearchRunService",
     "ResearchRunWorker",
     "FormalResearchRunExecutor",
+    "FACTOR_PACK_RESULT_SCHEMA_VERSION",
+    "FactorPackRunResultService",
     "DEFAULT_RESEARCH_OPERATIONS",
     "AuthorizationDecision",
     "ResearchAgentAuthorization",
@@ -360,4 +423,21 @@ __all__ = [
     "SESSION_STATES",
     "ResearchAgentSessionService",
     "normalize_research_brief",
+    "ALIGNED_RESEARCH_INTENT_SCHEMA_VERSION",
+    "CANDIDATE_SPEC_SCHEMA_VERSION",
+    "EVIDENCE_PROFILES",
+    "RESEARCH_CONTRACT_SCHEMA_VERSION",
+    "RESEARCH_RESULT_SCHEMA_VERSION",
+    "RESEARCHER_AVAILABLE_STOP_AT",
+    "RUN_TYPE_TO_STOP_AT",
+    "STOP_AT_TO_RUN_TYPE",
+    "ResearchContractService",
+    "ResearchSemanticError",
+    "align_research_intent",
+    "build_research_contract",
+    "infer_research_stop_at",
+    "normalize_candidate",
+    "EXPERIMENT_STATES",
+    "RESEARCH_DECISIONS",
+    "ResearchExperimentService",
 ]

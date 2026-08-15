@@ -1,0 +1,44 @@
+{
+  "idempotency_key": "momentum-death-rebound-alpha-exp1-retry2",
+  "candidate": {
+    "hypothesis": {
+      "statement": "在基本面达标的美股池内，由‘下跌动能消失（最近1个月动量转平/转正）’与‘反弹确认（10日线上穿60日线金叉）’双因子合成的 Alpha 信号，对未来 1/5/20 日收益具有正向预测能力",
+      "expected_direction": "POSITIVE"
+    },
+    "intervention_set": [
+      {"component": "alpha", "change": "introduce momentum_death + rebound_confirm double-factor alpha (retry after readonly-db fix)"}
+    ],
+    "controlled_variables": ["universe", "research_period", "frequency"],
+    "factors": [
+      {
+        "name": "momentum_death",
+        "operator": "pct_change",
+        "input_field": "close",
+        "window": 21,
+        "frequency": "1d",
+        "output_direction": "HIGHER_IS_BETTER"
+      },
+      {
+        "name": "rebound_confirm",
+        "operator": "ma_crossover",
+        "input_field": "close",
+        "window": 60,
+        "parameters": {"fast_window": 10},
+        "frequency": "1d",
+        "output_direction": "HIGHER_IS_BETTER"
+      }
+    ],
+    "alpha": {
+      "name": "momentum_death_rebound_alpha",
+      "components": [
+        {"factor_name": "momentum_death", "weight": 0.5, "transform": "CS_RANK", "ascending": false},
+        {"factor_name": "rebound_confirm", "weight": 0.5, "transform": "CS_RANK", "ascending": false}
+      ]
+    },
+    "evaluation": {
+      "run_type": "ALPHA_EVALUATION",
+      "primary_metric": "rank_ic",
+      "horizons": [1, 5, 20]
+    }
+  }
+}

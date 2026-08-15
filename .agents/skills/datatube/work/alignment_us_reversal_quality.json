@@ -1,0 +1,43 @@
+{
+  "objective": "验证美股中“基本面良好但长期持续走低”的股票是否具有底部反转预测能力：在市值 >= 3 亿美元的美股池内，构造‘基本面质量 × 长期反转’条件因子，检验其是否稳定预测未来收益",
+  "aligned_research_intent": {
+    "question": "在市值>=3亿美元的美股中，同时满足良好基本面（如盈利质量/ROE）与过去36个月显著累计下跌的股票，未来1个月收益是否系统性高于可比股票？",
+    "decision_supported": "判断该‘基本面+长期反转’条件因子是否值得进入 Alpha 研究",
+    "stop_at": "FACTOR",
+    "evidence_profile": "STANDARD",
+    "out_of_scope": [
+      "Alpha construction",
+      "portfolio backtest",
+      "strategy creation"
+    ]
+  },
+  "instrument_scope": [],
+  "frequency": "1d",
+  "research_period": {
+    "start": "2000-01-01",
+    "end": "2025-12-31"
+  },
+  "universe_policy": {
+    "eligibility": {
+      "mode": "HISTORICAL_EQUITY_PIT",
+      "point_in_time_filters": [
+        {"field": "market_cap_usd", "minimum": 300000000},
+        {"field": "roe_ttm", "minimum": 0.10},
+        {"field": "pe_ttm", "minimum": 10, "maximum": 20},
+        {"field": "pb_mrq", "minimum": 0},
+        {"field": "fcf_yield_ttm", "minimum": 0}
+      ]
+    },
+    "selection": {"method": "ALL_ELIGIBLE"},
+    "exclusions": [],
+    "rebalance": "MONTHLY"
+  },
+  "evidence_profile": "STANDARD",
+  "research_contract": {
+    "evaluation": {
+      "primary_metric": "rank_ic",
+      "decision_rule": {"minimum_rank_ic": 0.02}
+    }
+  },
+  "idempotency_key": "us-reversal-quality-cond-v1"
+}

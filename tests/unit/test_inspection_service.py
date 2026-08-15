@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from services import agent_interface_service, inspection_service
+from services.data_platform import DataPlatformStore
 from services.data_platform.research_run_service import FormalResearchRunExecutor, ResearchRunWorker
 
 
@@ -154,7 +156,7 @@ class InspectionServiceTest(unittest.TestCase):
             patch.object(worker, "complete", return_value={"run_id": "run_worker_1", "status": "SUCCEEDED"}),
             patch("services.data_platform.research_run_service._emit_inspection_safely") as emit,
         ):
-            completed = worker.run_once()
+            completed = worker.run_once(isolate_execution=False)
 
         self.assertEqual(completed["status"], "SUCCEEDED")
         self.assertEqual(emit.call_count, 2)
@@ -167,6 +169,65 @@ class InspectionServiceTest(unittest.TestCase):
             {item["ref_id"] for item in finish["refs"]},
             {"factor_artifact_1", "evaluation_artifact_1"},
         )
+
+    def test_research_worker_reports_hard_timeout_code(self):
+        worker = ResearchRunWorker(
+            DataPlatformStore(Path(self.temp_dir.name) / "metadata.db"),
+            "worker-timeout-test",
+        )
+        run = {
+            "run_id": "run_timeout_1",
+            "run_type": "FACTOR_EVALUATION",
+            "project_id": "project_1",
+            "bundle_id": "bundle_1",
+            "attempt_count": 1,
+        }
+        with (
+            patch.object(worker, "claim", return_value=run),
+            patch.object(worker, "_runtime_timeout_seconds", return_value=1),
+            patch.object(worker, "_extend_lease"),
+            patch.object(
+                worker,
+                "_execute_isolated",
+                side_effect=subprocess.TimeoutExpired(["research-run-child"], 1),
+            ),
+            patch.object(worker, "fail", return_value={"status": "FAILED"}) as fail,
+            patch("services.data_platform.research_run_service._emit_inspection_safely"),
+        ):
+            result = worker.run_once()
+
+        self.assertEqual("FAILED", result["status"])
+        self.assertEqual(
+            "FORMAL_RESEARCH_EXECUTION_TIMEOUT",
+            fail.call_args.args[1]["code"],
+        )
+
+    def test_research_worker_classifies_memory_error_as_non_retryable(self):
+        worker = ResearchRunWorker(
+            DataPlatformStore(Path(self.temp_dir.name) / "memory-error.db"),
+            "worker-memory-test",
+        )
+        run = {
+            "run_id": "run_memory_1",
+            "run_type": "FACTOR_EVALUATION",
+            "project_id": "project_1",
+            "bundle_id": "bundle_missing",
+            "attempt_count": 1,
+        }
+        with (
+            patch.object(worker, "claim", return_value=run),
+            patch.object(worker, "_runtime_timeout_seconds", return_value=30),
+            patch.object(worker, "_extend_lease"),
+            patch.object(worker, "_execute_isolated", side_effect=MemoryError()),
+            patch.object(worker, "fail", return_value={"status": "FAILED"}) as fail,
+            patch("services.data_platform.research_run_service._emit_inspection_safely"),
+        ):
+            result = worker.run_once()
+
+        self.assertEqual("FAILED", result["status"])
+        error = fail.call_args.args[1]
+        self.assertEqual("FORMAL_RESEARCH_RESOURCE_LIMIT", error["code"])
+        self.assertFalse(error["retryable"])
 
     def test_best_effort_emitter_marks_trace_partial_after_event_drop(self):
         with patch.object(inspection_service, "emit_event", side_effect=sqlite3.OperationalError("busy")):

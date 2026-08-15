@@ -621,15 +621,19 @@ class RequirementWorkspaceService:
         asset = self.get_library_asset(library_asset_id)
         if asset is None:
             raise ValueError("Library Requirement not found")
-        if asset["usage_count"]:
-            raise ValueError("Remove this Requirement from every Research before archiving it")
         now = utc_now()
         with self.store.transaction(immediate=True) as conn:
             conn.execute(
                 "UPDATE library_requirement_assets SET archived_at=?, updated_at=? WHERE library_asset_id=?",
                 (now, now, asset["library_asset_id"]),
             )
-        return {**asset, "archived_at": now, "updated_at": now}
+        return {
+            **asset,
+            "archived_at": now,
+            "updated_at": now,
+            "archived_research_count": asset["usage_count"],
+            "references_preserved": True,
+        }
 
     @staticmethod
     def _assert_unique_library_name(conn: Any, name: str, *, except_asset_id: str = "") -> None:
@@ -720,14 +724,22 @@ class RequirementWorkspaceService:
             ).fetchall()
         return [self.get_library_draft(str(row[0])) for row in rows]  # type: ignore[list-item]
 
-    def list_library_assets(self, *, current_only: bool = False) -> list[dict[str, Any]]:
+    def list_library_assets(
+        self,
+        *,
+        current_only: bool = False,
+        include_data_status: bool = True,
+    ) -> list[dict[str, Any]]:
         with self.store.connection() as conn:
             rows = conn.execute(
                 """SELECT * FROM library_requirement_assets
                    WHERE archived_at IS NULL
                    ORDER BY updated_at DESC, name"""
             ).fetchall()
-        assets = [self._library_asset_from_row(row) for row in rows]
+        assets = [
+            self._library_asset_from_row(row, include_data_status=include_data_status)
+            for row in rows
+        ]
         return assets
 
     def get_library_asset(self, library_asset_id: str) -> dict[str, Any] | None:
@@ -2015,7 +2027,12 @@ class RequirementWorkspaceService:
             "supports": ["Per-Instrument Source Selection", "Historical Bars"],
         }
 
-    def _library_asset_from_row(self, row: Any) -> dict[str, Any]:
+    def _library_asset_from_row(
+        self,
+        row: Any,
+        *,
+        include_data_status: bool = True,
+    ) -> dict[str, Any]:
         spec = json.loads(row["spec_json"])
         with self.store.connection() as conn:
             usage_count = int(conn.execute(
@@ -2024,7 +2041,7 @@ class RequirementWorkspaceService:
                    WHERE r.library_asset_id=? AND p.archived_at IS NULL""",
                 (str(row["library_asset_id"]),),
             ).fetchone()[0])
-        return {
+        asset = {
             "library_asset_id": str(row["library_asset_id"]), "component_type": "REQUIREMENTS",
             "name": str(row["name"]), "version": int(row["asset_version"]),
             "spec": spec, "content": {"spec": spec}, "content_hash": str(row["content_hash"]),
@@ -2032,8 +2049,10 @@ class RequirementWorkspaceService:
             "updated_at": str(row["updated_at"] or row["published_at"]),
             "archived_at": str(row["archived_at"] or ""),
             "usage_count": usage_count,
-            "data_status": self.library_data_status(spec, str(row["library_asset_id"])),
         }
+        if include_data_status:
+            asset["data_status"] = self.library_data_status(spec, str(row["library_asset_id"]))
+        return asset
 
     def _require_project(self, project_id: str) -> dict[str, Any]:
         with self.store.connection() as conn:

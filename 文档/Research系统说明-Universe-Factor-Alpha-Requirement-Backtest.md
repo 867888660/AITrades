@@ -129,13 +129,18 @@ universe_id
        └─ Research B / REFERENCE
 ```
 
-当前支持三种产品级 Universe：
+当前持久化层支持四种兼容 Universe：
 
 | 类型 | 定义方式 | Resolution 结果 |
 | --- | --- | --- |
 | `instrument_set` | 明确的 Instrument 成员 | `instrument_ids` |
+| `benchmark_set` | 指数/基准成分与权重 | `instrument_ids` 与 `instrument_weights` |
 | `composite_set` | 对其他 Universe 做 `union`、`intersection`、`difference` | 合并后的 `instrument_ids` |
 | `multi_leg_set` | Manual、Cartesian Product、Unordered Combination 或 Permutation | `instrument_tuples` 与扁平化 `instrument_ids` |
+
+Universe v2 的新建产品面只保留 `STATIC / DYNAMIC / COMPOSITE`。
+`benchmark_set` 与 `multi_leg_set` 继续兼容读取，但不再作为扩展 Universe
+类型的方向；Benchmark 权重应迁移到 `BenchmarkSpec`，Multi-leg 应迁移到独立组合对象。
 
 Multi-leg 组合支持：
 
@@ -202,6 +207,7 @@ Shared Universe
 ```text
 STATIC_LIST
 TOP_N_BY_TURNOVER
+HISTORICAL_EQUITY_PIT
 ```
 
 但当前 Shared Universe 产品模型主要覆盖 Instrument Set、Composite Set 与 Multi-leg Set。`TOP_N_BY_TURNOVER` 仍属于底层兼容能力，并未等价地成为 Shared Universe 编辑器中的动态规则类型。
@@ -224,6 +230,41 @@ TOP_N_BY_TURNOVER
 - 多腿同步成交与组合 PnL 会计。
 
 换句话说，当前不能仅因为 Universe 中出现 Pair / Multi-leg Set，就把回测解释成真正的多腿策略回测。
+
+### 4.5 Universe v2 基础层与当前门禁
+
+Universe v2 已经增加三类产品模型：`STATIC`、由
+`Base → Filter → Rank → Select → Rebalance` 组成的 `DYNAMIC`，以及执行
+`Union / Intersection / Difference` 的 `COMPOSITE`。
+
+`UniverseFieldRegistry` 提供版本化 Field Contract，`UniverseV2Compiler`
+负责规范化、Operator/Select/Buffer 校验、Requirement/Warmup 编译、Schedule
+Profile 和 Fingerprint；`UniverseMembershipEngine` 只使用满足
+`available_time <= decision_time` 的冻结字段行执行 Filter、Rank、Select，并生成
+Membership Timeline 与压缩 Segments。
+
+Shared Universe 已能解析和 Preview `DYNAMIC`，但没有 Frozen Manifest 证据时只返回
+`REQUIRES_FROZEN_DATA`，并以
+`DYNAMIC_UNIVERSE_REQUIRES_FROZEN_EVALUATION` 阻止持久化或 Binding。
+它不会再把动态规则静默转换成 `STATIC_LIST`。
+
+当前 Capability 必须分层解释：
+
+- `field_registry`：可被 v2 编译器验证；
+- `field_execution_status`：是否已接入 Formal Pipeline；
+- `dynamic_point_in_time_filters`：当前 Formal Pipeline 真正可物化的 PIT 字段；
+- `selection_methods`：当前 Formal Researcher 可执行方法；
+- `authoring_selection_methods`：只完成定义/编译支持的方法。
+
+当前正式选择仍是 `ALL_ELIGIBLE`，正式动态字段是 `market_cap_usd`、
+`roe_ttm`、`pe_ttm`、`pb_mrq`、`fcf_yield_ttm`。基本面比例由冻结的
+`fundamentals_pit` 与需要时的 `equity_valuation_daily` 按 `available_time` 计算；
+任一必要输入缺失即排除，不回填未来披露。
+`TOP_N / BOTTOM_N / PERCENTILE / Buffer` 已完成 v2 编译与纯执行器测试，但在
+`UNIVERSE_EVALUATION` 接通前不能宣称 Formal Research 已支持。
+
+完整合同、状态矩阵和迁移顺序见
+[`03-features/universe-v2-design.md`](03-features/universe-v2-design.md)。
 
 ## 5. Factor：当前项目中成熟度最高的研究定义
 
@@ -1187,9 +1228,17 @@ Agent 权限不是依赖提示词约束，而是 Capability、Grant、Scope、Bu
 
 ## 18. 当前实现的主要结构性缺口
 
-### 18.1 Universe 产品模型领先于执行模型
+### 18.1 Universe v2 Authoring 领先于 Formal Evaluation
 
-Shared Universe 已支持 Composite 和 Multi-leg，但 Formal Alpha / Portfolio / Backtest 仍主要消费扁平成员列表。下一步如果要支持配对、篮子或跨源组合，应把 `instrument_tuples` 提升为 Factor、Alpha、Portfolio 和 Accounting 的一级输入。
+Universe v2 已完成三类型 Schema、Field Registry、Compiler、PIT Membership
+Engine、Capability 和 Shared Dynamic Preview，但正式
+`UNIVERSE_EVALUATION`、Frozen Bundle 持久化、动态 Binding 与 Composite Timeline
+仍未接通。定义合法或编译成功不等于动态成员已经解析。
+
+同时，旧 Shared Universe 已支持 Composite 和 Multi-leg，但 Formal Alpha /
+Portfolio / Backtest 仍主要消费扁平成员列表。下一步一方面要让 Formal Run 直接消费
+Membership Timeline；另一方面若支持配对、篮子或跨源组合，还应把
+`instrument_tuples` 提升为 Factor、Alpha、Portfolio 和 Accounting 的一级输入。
 
 ### 18.2 Factor Authoring 领先于 Alpha Authoring
 

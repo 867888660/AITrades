@@ -57,6 +57,17 @@ def build_research_backtest_contract(
         artifact_dependencies=artifact_dependencies,
     )
     benchmark_spec = _dict(execution_specs.get("benchmark_spec"))
+    benchmark_rows = []
+    for result in _list(contract.get("results")):
+        performance = _dict(result.get("performance"))
+        if performance.get("benchmark_manifest_id") and performance.get("benchmark_total_return") is not None:
+            benchmark_rows.append({
+                "alpha_definition_id": result.get("alpha_definition_id"),
+                "benchmark_manifest_id": performance.get("benchmark_manifest_id"),
+                "benchmark_total_return": performance.get("benchmark_total_return"),
+                "excess_total_return": performance.get("excess_total_return"),
+            })
+    benchmark_materialized = bool(benchmark_rows)
     contract.update({
         "schema_version": RESEARCH_BACKTEST_RESULT_SCHEMA_VERSION,
         "product_run_type": "RESEARCH_BACKTEST",
@@ -75,8 +86,10 @@ def build_research_backtest_contract(
         "benchmark_spec": benchmark_spec,
         "benchmark_status": {
             "configured": bool(benchmark_spec),
-            "materialized": False,
+            "materialized": benchmark_materialized,
+            "comparisons": benchmark_rows,
             "warning": (
+                "" if benchmark_materialized else
                 "Benchmark comparison is not materialized for this Run; excess return and "
                 "information ratio must not be inferred."
             ),

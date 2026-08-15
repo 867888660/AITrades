@@ -29,10 +29,31 @@ class ResearchWorkspaceApiTests(unittest.TestCase):
         self.client = app_module.app.test_client()
         self.store_patch = patch("app.get_default_store", return_value=self.store)
         self.store_patch.start()
+        self.storage_patch = patch(
+            "services.data_platform.resolved_plan.get_data_platform_storage_root",
+            return_value=Path(self.temp.name) / "storage",
+        )
+        self.storage_patch.start()
 
     def tearDown(self):
+        self.storage_patch.stop()
         self.store_patch.stop()
         self.temp.cleanup()
+
+    def test_artifact_path_allows_managed_root_and_rejects_siblings(self):
+        trusted_root = Path(self.temp.name).resolve() / "managed"
+        trusted_root.mkdir()
+        artifact = trusted_root / "research_artifacts" / "result.parquet"
+        resolved = app_module._resolve_artifact_content_path(
+            str(artifact), allowed_roots=(trusted_root,)
+        )
+        self.assertEqual(artifact.resolve(), resolved)
+
+        with self.assertRaisesRegex(ValueError, "trusted DataTube storage roots"):
+            app_module._resolve_artifact_content_path(
+                str(trusted_root.parent / "outside.parquet"),
+                allowed_roots=(trusted_root,),
+            )
 
     def test_local_ui_can_create_compile_and_resolve_without_approval(self):
         project_response = self.client.post(
@@ -94,6 +115,72 @@ class ResearchWorkspaceApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 403)
         self.assertEqual([], self.client.get("/api/research/projects").get_json()["data"])
+
+    def test_project_summary_route_returns_all_cards_in_one_response(self):
+        created = self.client.post(
+            "/api/research/projects",
+            json={"title": "Bulk summary", "objective": "Render one card."},
+        ).get_json()["data"]
+
+        response = self.client.get("/api/research/project-summaries?limit=500")
+
+        self.assertEqual(200, response.status_code, response.get_json())
+        summaries = response.get_json()["data"]
+        self.assertEqual(1, len(summaries))
+        self.assertEqual(created["project_id"], summaries[0]["project"]["project_id"])
+        self.assertFalse(summaries[0]["dataConfigured"])
+        self.assertIsNone(summaries[0]["dataStatus"])
+        self.assertIsNone(summaries[0]["coverage"])
+
+        page = self.client.get("/research")
+        self.assertEqual(200, page.status_code)
+        html = page.get_data(as_text=True)
+        self.assertIn("Bulk summary", html)
+        self.assertIn('id="researchBootstrap"', html)
+        self.assertNotIn("Loading workspace", html)
+
+    def test_project_archive_hides_card_and_preserves_project_record(self):
+        created = self.client.post(
+            "/api/research/projects",
+            json={"title": "Remove this card", "objective": "Preserve its history."},
+        ).get_json()["data"]
+
+        response = self.client.post(
+            f"/api/research/projects/{created['project_id']}/archive", json={}
+        )
+
+        self.assertEqual(200, response.status_code, response.get_json())
+        archived = response.get_json()["data"]
+        self.assertEqual("ARCHIVED", archived["summary_state"])
+        self.assertTrue(archived["archived_at"])
+        self.assertEqual([], self.client.get("/api/research/project-summaries").get_json()["data"])
+        preserved = self.client.get(
+            "/api/research/project-summaries?include_archived=true"
+        ).get_json()["data"]
+        self.assertEqual(created["project_id"], preserved[0]["project"]["project_id"])
+
+    def test_in_use_requirement_archive_route_preserves_research_reference(self):
+        project = self.client.post(
+            "/api/research/projects",
+            json={"title": "Pinned requirement", "objective": "Keep its historical reference."},
+        ).get_json()["data"]
+        created = self.client.post(
+            f"/api/research/projects/{project['project_id']}/requirements/items",
+            json={"spec": default_requirement_spec("Archive from Library")},
+        ).get_json()["data"]
+
+        response = self.client.delete(
+            f"/api/research/library/requirements/{created['library_asset_id']}"
+        )
+
+        self.assertEqual(200, response.status_code, response.get_json())
+        archived = response.get_json()["data"]
+        self.assertEqual(1, archived["archived_research_count"])
+        self.assertTrue(archived["references_preserved"])
+        items = self.client.get(
+            f"/api/research/projects/{project['project_id']}/requirements/items"
+        ).get_json()["data"]
+        self.assertEqual(created["library_asset_id"], items[0]["library_asset_id"])
 
     def test_equity_grant_and_openbb_export_task_use_equity_scope(self):
         project = self.client.post(

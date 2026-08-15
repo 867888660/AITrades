@@ -1,0 +1,78 @@
+{
+  "session_id": "research_session_8c6252f86d454a09a517f583fdba769a",
+  "providers": ["OPENBB"],
+  "universe_snapshot_id": "universe_snapshot_6c2935564ee0942346c818c3",
+  "context": {
+    "universe_snapshot_id": "universe_snapshot_6c2935564ee0942346c818c3",
+    "instrument_ids": [
+      "equity:XNYS:CAT",
+      "equity:XNYS:CVX",
+      "equity:XNYS:DIS",
+      "equity:XNYS:GE",
+      "equity:XNYS:IBM",
+      "equity:XNYS:JPM",
+      "equity:XNYS:KO",
+      "equity:XNYS:MMM",
+      "equity:XNYS:PG",
+      "equity:XNYS:XOM"
+    ],
+    "data_type": "bars",
+    "frequency": "1d",
+    "history_start": "1946-08-11T00:00:00+00:00",
+    "history_end": "2026-08-11T00:00:00+00:00",
+    "adjustment": "SPLITS_ONLY",
+    "point_in_time_policy": "AS_OF",
+    "time_semantics": "BAR_END_AVAILABLE_TIME",
+    "quality_policy": "STRICT",
+    "source_selection_policy": {
+      "mode": "AUTO",
+      "preferred_sources": ["OPENBB/YFINANCE"]
+    }
+  },
+  "manual_requirements": [
+    {
+      "id": "qlib_alpha158_without_vwap_ohlcv_inputs",
+      "version": "1.0.0",
+      "data_type": "bars",
+      "frequency": "1d",
+      "fields": ["open", "high", "low", "close", "volume"],
+      "history_start": "1946-08-11T00:00:00+00:00",
+      "history_end": "2026-08-11T00:00:00+00:00",
+      "adjustment": "SPLITS_ONLY",
+      "point_in_time_policy": "AS_OF",
+      "time_semantics": "BAR_END_AVAILABLE_TIME",
+      "quality_policy": "STRICT",
+      "auto_backfill": true,
+      "usage_level": "RESEARCH",
+      "priority": 100,
+      "dependency_path": [
+        "Qlib Alpha158-compatible (VWAP excluded)",
+        "required_fields=open,high,low,close,volume"
+      ]
+    }
+  ],
+  "evaluation_requirements": [
+    {
+      "id": "alpha158_forward_returns",
+      "version": "1.0.0",
+      "data_type": "bars",
+      "frequency": "1d",
+      "fields": ["close"],
+      "history_start": "1946-08-11T00:00:00+00:00",
+      "history_end": "2026-08-11T00:00:00+00:00",
+      "adjustment": "SPLITS_ONLY"
+    }
+  ],
+  "backtest_requirements": [
+    {
+      "id": "alpha158_next_bar_open_execution",
+      "version": "1.0.0",
+      "data_type": "bars",
+      "frequency": "1d",
+      "fields": ["open", "close"],
+      "history_start": "1946-08-11T00:00:00+00:00",
+      "history_end": "2026-08-11T00:00:00+00:00",
+      "adjustment": "SPLITS_ONLY"
+    }
+  ]
+}

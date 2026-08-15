@@ -109,6 +109,113 @@ class ResearchControlPlane:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_project_summaries(
+        self,
+        *,
+        summary_state: str = "",
+        limit: int = 100,
+        include_archived: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return card-sized Research summaries without resolving data coverage."""
+        projects = self.list_projects(
+            summary_state=summary_state,
+            limit=limit,
+            include_archived=include_archived,
+        )
+        if not projects:
+            return []
+        project_ids = [str(project["project_id"]) for project in projects]
+        placeholders = ",".join("?" for _ in project_ids)
+        with self.store.connection() as conn:
+            definition_rows = conn.execute(
+                f"""
+                SELECT r.project_id, r.slot_key, r.definition_type,
+                       r.definition_id, r.definition_version, r.library_asset_id,
+                       d.name, d.state
+                FROM project_definition_refs r
+                JOIN research_definitions d
+                  ON d.definition_id=r.definition_id
+                 AND d.version=r.definition_version
+                WHERE r.project_id IN ({placeholders})
+                ORDER BY r.project_id, r.definition_type, r.slot_key
+                """,
+                project_ids,
+            ).fetchall()
+            universe_rows = conn.execute(
+                f"""
+                SELECT r.project_id, r.universe_snapshot_id, r.library_asset_id,
+                       s.universe_definition_id, d.name, d.version, d.status
+                FROM research_universe_refs r
+                JOIN universe_snapshots s
+                  ON s.universe_snapshot_id=r.universe_snapshot_id
+                JOIN universe_definitions d
+                  ON d.universe_definition_id=s.universe_definition_id
+                WHERE r.project_id IN ({placeholders})
+                """,
+                project_ids,
+            ).fetchall()
+            requirement_rows = conn.execute(
+                f"""
+                SELECT project_id, requirement_set_id
+                FROM research_requirement_refs
+                WHERE project_id IN ({placeholders})
+                """,
+                project_ids,
+            ).fetchall()
+
+        refs_by_project: dict[str, dict[str, dict[str, Any]]] = {
+            project_id: {} for project_id in project_ids
+        }
+        for row in definition_rows:
+            project_id = str(row["project_id"])
+            refs_by_project[project_id][str(row["slot_key"])] = {
+                "slot_key": str(row["slot_key"]),
+                "definition_type": str(row["definition_type"]),
+                "definition_id": str(row["definition_id"]),
+                "definition_version": str(row["definition_version"]),
+                "name": str(row["name"]),
+                "state": str(row["state"]),
+                "library_asset_id": str(row["library_asset_id"] or ""),
+            }
+        universe_by_project = {
+            str(row["project_id"]): {
+                "project_id": str(row["project_id"]),
+                "universe_snapshot_id": str(row["universe_snapshot_id"]),
+                "universe_definition_id": str(row["universe_definition_id"]),
+                "library_asset_id": str(row["library_asset_id"] or ""),
+                "name": str(row["name"]),
+                "version": str(row["version"]),
+                "status": str(row["status"]),
+            }
+            for row in universe_rows
+        }
+        requirement_by_project = {
+            str(row["project_id"]): str(row["requirement_set_id"])
+            for row in requirement_rows
+        }
+        summaries: list[dict[str, Any]] = []
+        for project in projects:
+            project_id = str(project["project_id"])
+            refs = refs_by_project[project_id]
+            values = list(refs.values())
+            requirement_set_id = requirement_by_project.get(project_id, "")
+            summaries.append({
+                "project": project,
+                "refs": refs,
+                "universeRef": universe_by_project.get(project_id),
+                "factors": [item for item in values if item["definition_type"] == "FACTOR"],
+                "alphas": [item for item in values if item["definition_type"] == "ALPHA"],
+                "dataConfigured": bool(requirement_set_id),
+                "requirementRef": (
+                    {"requirement_set_id": requirement_set_id}
+                    if requirement_set_id else None
+                ),
+                "requirements": [],
+                "dataStatus": None,
+                "coverage": None,
+            })
+        return summaries
+
     def create_plan(
         self,
         *,

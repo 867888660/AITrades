@@ -71,6 +71,35 @@ class ResearchBacktestResultContractTest(unittest.TestCase):
         self.assertEqual(0.08, performance["items"][0]["performance"]["total_return"])
         self.assertEqual(1.25, performance["items"][0]["performance"]["sharpe"])
 
+    def test_materialized_benchmark_is_reported_from_performance_lineage(self) -> None:
+        artifacts = [{
+            "artifact_id": "performance-2",
+            "artifact_type": "BACKTEST_RESULT",
+            "logical_name": "Alpha-run-2",
+            "status": "READY",
+            "row_count": 1,
+            "metadata": {"metrics": {
+                "total_return": 0.2,
+                "benchmark_manifest_id": "manifest-benchmark",
+                "benchmark_total_return": 0.1,
+                "excess_total_return": 0.1,
+            }},
+        }]
+        contract = build_research_backtest_contract(
+            run={"run_id": "run-2", "project_id": "project-1", "run_type": "RESEARCH_BACKTEST", "status": "SUCCEEDED"},
+            alpha_definitions=[{"definition_id": "alpha-2", "name": "Alpha", "version": "1.0.0", "spec": {"components": []}}],
+            factor_definitions=[],
+            universe={"universe_snapshot_id": "snapshot-1", "actual_instrument_ids": ["A"]},
+            data_inputs=[],
+            execution_specs={"benchmark_spec": {"type": "EQUAL_WEIGHT_UNIVERSE"}},
+            artifacts=artifacts,
+            artifact_dependencies={},
+        )
+
+        self.assertTrue(contract["benchmark_status"]["materialized"])
+        self.assertEqual("manifest-benchmark", contract["benchmark_status"]["comparisons"][0]["benchmark_manifest_id"])
+        self.assertEqual("", contract["benchmark_status"]["warning"])
+
 
 if __name__ == "__main__":
     unittest.main()

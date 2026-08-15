@@ -87,9 +87,16 @@ class OpenBBResearchTaskExecutor:
         symbol = str(payload.get("symbol") or "").strip().upper()
         venue = str(payload.get("venue") or "").strip().upper()
         interval = str(payload.get("interval") or "").strip().lower()
-        if len(parts) != 3 or parts[0].lower() != "equity":
-            raise ValueError("OpenBB maintenance requires an equity instrument")
-        if parts[1].upper() != venue or parts[2].upper() != symbol or interval != "1d":
+        qualified_equity = (
+            len(parts) == 3
+            and parts[0].lower() == "equity"
+            and parts[1].upper() == venue
+            and parts[2].upper() == symbol
+        )
+        bare_equity = len(parts) == 1 and parts[0].upper() == symbol
+        if not qualified_equity and not bare_equity:
+            raise ValueError("OpenBB maintenance requires a matching equity instrument")
+        if interval != "1d":
             raise PermissionError("maintenance task does not match its equity instrument")
         return payload
 

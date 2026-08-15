@@ -6,6 +6,7 @@ import json
 import keyword
 import math
 import statistics
+from datetime import timedelta
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -29,6 +30,7 @@ _RESERVED_FORMULA_NAMES = {
     "time",
     "universe",
     "align",
+    "financial",
 }
 _MAX_FORMULA_STATEMENTS = 32
 _MAX_FORMULA_AST_NODES = 512
@@ -83,6 +85,12 @@ _FUNCTIONS = {
     "universe.demean": {"parameters": 0, "unit": "SOURCE", "dimension": "HYBRID"},
     "align.asof": {"series_arguments": 2, "parameters": 0, "unit": "SOURCE", "alignment": True},
     "align.forward_fill": {"series_arguments": 2, "parameters": 0, "unit": "SOURCE", "alignment": True},
+    "financial.trailing_365d_sum": {
+        "series_arguments": 2,
+        "parameters": 0,
+        "unit": "SOURCE",
+        "calendar_alignment": True,
+    },
     "greater": {"series_arguments": 2, "parameters": 0, "unit": "BOOLEAN", "comparison": True},
     "less": {"series_arguments": 2, "parameters": 0, "unit": "BOOLEAN", "comparison": True},
     "equal": {"series_arguments": 2, "parameters": 0, "unit": "BOOLEAN", "comparison": True},
@@ -100,6 +108,11 @@ _FUNCTIONS = {
 
 def _clean(value: Any) -> str:
     return str(value or "").strip()
+
+
+def _dataset_display_name(value: Any) -> str:
+    dataset = _clean(value or "bars")
+    return "Bars" if dataset.lower() == "bars" else dataset
 
 
 def _bars_label(value: int) -> str:
@@ -339,7 +352,12 @@ class FactorGraphCompiler:
             else:
                 input_by_name[name] = input_spec
             dataset = _clean(input_spec.get("dataset") or "bars").lower()
-            if dataset not in {"bars", "price_history"}:
+            supported_datasets = {
+                _clean(item.get("dataset") or "bars").lower()
+                for item in capabilities.get("features") or []
+                if isinstance(item, Mapping)
+            }
+            if dataset not in supported_datasets:
                 add(
                     "ERROR",
                     "INPUT_DATASET_UNSUPPORTED",
@@ -841,7 +859,7 @@ class FactorGraphCompiler:
                     expression={
                         "kind": "input",
                         "name": node.id,
-                        "dataset": "bars",
+                        "dataset": _clean(item.get("dataset") or "bars").lower(),
                         "field": field_name,
                         "frequency": frequency,
                     },
@@ -851,7 +869,7 @@ class FactorGraphCompiler:
                     required_history={node.id: 1},
                     native_frequencies={node.id: frequency},
                     frequencies={frequency},
-                    resolved=f"Bars.{field_name} @ {frequency}",
+                    resolved=f"{_dataset_display_name(item.get('dataset'))}.{field_name} @ {frequency}",
                 )
             if node.id in parameters:
                 item = parameters[node.id]
@@ -1012,6 +1030,39 @@ class FactorGraphCompiler:
                     f"{canonical} requires a numeric series.",
                 )
                 return None
+            if schema.get("calendar_alignment"):
+                source_argument, reference_argument = arguments
+                if len(reference_argument.frequencies) != 1:
+                    add(
+                        "ERROR",
+                        "FACTOR_V4_ALIGNMENT_REFERENCE_REQUIRED",
+                        "formula.source",
+                        f"{canonical} requires a single-frequency reference series.",
+                    )
+                    return None
+                steps = [step for item in arguments for step in item.steps]
+                steps.append(cls._meaning(canonical, arguments))
+                return _TypedNode(
+                    expression={
+                        "kind": "call",
+                        "function": canonical,
+                        "arguments": [item.expression for item in arguments],
+                    },
+                    value_type="SERIES",
+                    dimension="HYBRID",
+                    unit=source_argument.unit,
+                    required_history=cls._merge_history(
+                        source_argument.required_history,
+                        reference_argument.required_history,
+                    ),
+                    native_frequencies={
+                        **source_argument.native_frequencies,
+                        **reference_argument.native_frequencies,
+                    },
+                    frequencies=set(reference_argument.frequencies),
+                    resolved=f"{canonical}({source_argument.resolved}, {reference_argument.resolved})",
+                    steps=steps,
+                )
             if schema.get("alignment"):
                 source_argument, reference_argument = arguments
                 if len(reference_argument.frequencies) != 1:
@@ -1253,6 +1304,10 @@ class FactorGraphCompiler:
             "universe.demean": "Subtract the current Universe mean at each evaluation time.",
             "align.asof": "Use the latest source value that was available at each reference-series evaluation time.",
             "align.forward_fill": "Forward-fill the latest available source value onto the reference-series evaluation times.",
+            "financial.trailing_365d_sum": (
+                "Sum point-in-time events available during the trailing 365 calendar days "
+                "on the reference-series evaluation times."
+            ),
             "greater": "Return true where the first series is greater than the second series.",
             "less": "Return true where the first series is less than the second series.",
             "equal": "Return true where the two series are equal.",
@@ -1335,7 +1390,6 @@ class FactorEngineV4:
     ) -> dict[str, list[dict[str, Any]]]:
         rows_by_input = self._normalize_input_rows(spec, bars)
         frames: dict[str, _SeriesFrame] = {}
-        expected_instruments: set[str] | None = None
         for input_spec in spec.inputs:
             variable_name = str(input_spec.get("variable_name") or "")
             frequency = str(input_spec.get("frequency") or "")
@@ -1350,13 +1404,6 @@ class FactorEngineV4:
                 )
                 for instrument_id, raw_rows in raw_by_instrument.items()
             }
-            instruments = set(rows_by_instrument)
-            if expected_instruments is None:
-                expected_instruments = instruments
-            elif instruments != expected_instruments:
-                raise ValueError(
-                    f"Factor Engine v4 requires every Input to cover the same Universe: {variable_name}"
-                )
             frames[variable_name] = _SeriesFrame(
                 values={
                     instrument_id: [
@@ -1371,7 +1418,7 @@ class FactorEngineV4:
         evaluated = self._evaluate(spec.expression, frames)
         if not isinstance(evaluated, _SeriesFrame):
             raise ValueError("compiled Factor graph does not produce a series")
-        self._validate_universe_axis(evaluated)
+        self._validate_universe_axis(evaluated, require_aligned=False)
         if evaluated.frequency != spec.frequency:
             raise ValueError(
                 f"compiled Factor output frequency {evaluated.frequency} does not match {spec.frequency}"
@@ -1513,6 +1560,11 @@ class FactorEngineV4:
                 if not isinstance(source, _SeriesFrame) or not isinstance(reference, _SeriesFrame):
                     raise ValueError(f"compiled {function_name} arguments are invalid")
                 return self._align_asof(source, reference)
+            if function_name == "financial.trailing_365d_sum":
+                source, reference = arguments
+                if not isinstance(source, _SeriesFrame) or not isinstance(reference, _SeriesFrame):
+                    raise ValueError(f"compiled {function_name} arguments are invalid")
+                return self._calendar_trailing_sum(source, reference, days=365)
             if function_name == "safe_divide":
                 left, right = arguments
                 if not isinstance(left, _SeriesFrame) or not isinstance(right, _SeriesFrame):
@@ -1598,12 +1650,10 @@ class FactorEngineV4:
         source: _SeriesFrame,
         reference: _SeriesFrame,
     ) -> _SeriesFrame:
-        if set(source.rows) != set(reference.rows):
-            raise ValueError("Alignment source and reference must cover the same Universe")
         output: dict[str, list[float | bool | None]] = {}
         for instrument_id, reference_rows in reference.rows.items():
-            source_rows = source.rows[instrument_id]
-            source_values = source.values[instrument_id]
+            source_rows = source.rows.get(instrument_id, [])
+            source_values = source.values.get(instrument_id, [])
             source_available = [_parse_time(_available_time(row)) for row in source_rows]
             cursor = -1
             aligned: list[float | bool | None] = []
@@ -1618,6 +1668,40 @@ class FactorEngineV4:
             rows=reference.rows,
             frequency=reference.frequency,
         )
+
+    @staticmethod
+    def _calendar_trailing_sum(
+        source: _SeriesFrame,
+        reference: _SeriesFrame,
+        *,
+        days: int,
+    ) -> _SeriesFrame:
+        output: dict[str, list[float | None]] = {}
+        for instrument_id, reference_rows in reference.rows.items():
+            source_rows = source.rows.get(instrument_id, [])
+            source_values = source.values.get(instrument_id, [])
+            events = sorted(
+                (
+                    (_parse_time(_available_time(row)), _finite_float(value))
+                    for row, value in zip(source_rows, source_values)
+                ),
+                key=lambda item: item[0],
+            )
+            cursor = 0
+            active: list[tuple[Any, float]] = []
+            aligned: list[float | None] = []
+            for reference_row in reference_rows:
+                cutoff = _parse_time(_available_time(reference_row))
+                while cursor < len(events) and events[cursor][0] <= cutoff:
+                    event_time, value = events[cursor]
+                    if value is not None:
+                        active.append((event_time, float(value)))
+                    cursor += 1
+                lower = cutoff - timedelta(days=days)
+                active = [item for item in active if item[0] > lower]
+                aligned.append(sum(value for _, value in active))
+            output[instrument_id] = aligned
+        return _SeriesFrame(values=output, rows=reference.rows, frequency=reference.frequency)
 
     @staticmethod
     def _time_function(
@@ -1825,7 +1909,13 @@ class FactorEngineV4:
         return _SeriesFrame(values=output, rows=base.rows, frequency=base.frequency)
 
     @staticmethod
-    def _validate_universe_axis(series: _SeriesFrame) -> None:
+    def _validate_universe_axis(
+        series: _SeriesFrame,
+        *,
+        require_aligned: bool = True,
+    ) -> None:
+        if not require_aligned:
+            return
         lengths = {len(rows) for rows in series.rows.values()}
         if len(lengths) > 1:
             raise ValueError("Factor Engine v4 requires aligned bar counts across the Universe")

@@ -1,0 +1,23 @@
+{
+  "session_id": "research_session_8c6252f86d454a09a517f583fdba769a",
+  "definition_type": "FACTOR",
+  "spec": {
+    "name": "qlib_alpha158_input_bridge_close",
+    "version": "1.0.0",
+    "formula": {
+      "operator": "rolling_mean",
+      "input": "close",
+      "window": 60,
+      "parameters": {}
+    },
+    "frequency": "1d",
+    "minimum_observations": 60,
+    "missing_policy": "STRICT",
+    "available_after": "BAR_CLOSE",
+    "allow_incomplete_bar": false,
+    "time_alignment_policy": "BAR_END_AVAILABLE_TIME",
+    "output_unit": "PRICE",
+    "output_direction": "NO_PREDEFINED_DIRECTION",
+    "dimension": "TIME_SERIES"
+  }
+}

@@ -20,6 +20,7 @@ from .factor_engine_v4 import (
     FACTOR_GRAPH_CONTRACT_VERSION,
     FactorGraphSpec,
 )
+from .equity_factor_bridge import EQUITY_FACTOR_DATASETS
 from .store import DataPlatformStore, json_dumps, utc_now
 
 
@@ -358,6 +359,22 @@ class DefinitionRegistry:
                 ("abs", "Absolute Value", "Math", "abs(series)", "Use the absolute value of a series.", False, 1, "NUMBER", "SOURCE", "input warmup"),
             ]
         ])
+        graph_function_schema.append({
+            "id": "financial.trailing_365d_sum",
+            "label": "Trailing 365-Day Sum",
+            "category": "Financial",
+            "signature": "financial.trailing_365d_sum(events, reference)",
+            "description": (
+                "Sum sparse point-in-time events over the trailing 365 calendar days "
+                "and align the result to a reference series."
+            ),
+            "parameters": [],
+            "series_arguments": 2,
+            "output_type": "NUMBER",
+            "output_unit": "SOURCE",
+            "warmup": "365 calendar days",
+            "pit_safe": True,
+        })
         features = [
             {
                 "id": field,
@@ -385,6 +402,19 @@ class DefinitionRegistry:
             "available_after": "EVENT_AVAILABLE",
             "pit_safe": True,
         })
+        for dataset, contract in EQUITY_FACTOR_DATASETS.items():
+            for field, label in dict(contract.get("fields") or {}).items():
+                features.append({
+                    "id": field,
+                    "label": label,
+                    "data_type": "NUMBER",
+                    "dataset": dataset,
+                    "available_after": "SOURCE_AVAILABLE",
+                    "pit_safe": True,
+                    "point_in_time_policy": contract.get("point_in_time_policy"),
+                    "time_semantics": contract.get("time_semantics"),
+                    "sparse": bool(contract.get("sparse")),
+                })
         return {
             "factor": {
                 "engine_version": FACTOR_ENGINE_V4_VERSION,
@@ -398,11 +428,9 @@ class DefinitionRegistry:
                     "Across Universe",
                     "Conditional",
                     "Alignment",
-                ],
-                "planned_function_categories": [
-                    "Within Group",
                     "Financial",
                 ],
+                "planned_function_categories": ["Within Group"],
                 "binary_operators": ["+", "-", "*", "/"],
                 "operator_parameters": {
                     "ma_crossover": {
@@ -446,7 +474,7 @@ class DefinitionRegistry:
                 "available_after": ["BAR_CLOSE", "EVENT_AVAILABLE"],
                 "missing_policies": ["STRICT", "SKIP"],
                 "features": features,
-                "frequencies": ["1m", "5m", "15m", "1h", "4h", "1d"],
+                "frequencies": ["event", "1m", "5m", "15m", "1h", "4h", "1d"],
                 "output_directions": [
                     "NO_PREDEFINED_DIRECTION",
                     "HIGHER_IS_BETTER",
@@ -456,7 +484,7 @@ class DefinitionRegistry:
                 "time_alignment_policy": "BAR_END_AVAILABLE_TIME",
                 "allow_incomplete_bar_default": False,
                 "requirement_contract": {
-                    "data_type": "bars",
+                    "data_type": "all_referenced_input_datasets",
                     "fields": "all_referenced_input_fields",
                     "warmup": "compiled graph required_history",
                     "adjustment": "NONE",
@@ -649,15 +677,36 @@ class DefinitionRegistry:
                 "SELECT 1 FROM research_projects WHERE project_id=?", (owner_project_id,)
             ).fetchone() is None:
                 raise ValueError("research project not found")
-            existing = conn.execute(
-                "SELECT definition_id FROM research_definitions WHERE definition_type=? AND name=? AND version=?",
-                (definition_type, name, version),
-            ).fetchone()
+            if library_scope == "PROJECT":
+                existing = conn.execute(
+                    """SELECT definition_id FROM research_definitions
+                       WHERE definition_type=? AND name=? AND version=?
+                         AND library_scope='PROJECT' AND owner_project_id=?""",
+                    (definition_type, name, version, owner_project_id),
+                ).fetchone()
+            else:
+                existing = conn.execute(
+                    """SELECT definition_id FROM research_definitions
+                       WHERE definition_type=? AND name=? AND version=?
+                         AND library_scope='GLOBAL'""",
+                    (definition_type, name, version),
+                ).fetchone()
             if existing:
                 found = self.get(str(existing[0]))
                 if found and found.spec_hash == spec_hash:
                     return found
                 raise ValueError(f"immutable definition version already exists: {definition_type} {name}@{version}")
+            if library_scope == "PROJECT":
+                global_row = conn.execute(
+                    """SELECT definition_id FROM research_definitions
+                       WHERE definition_type=? AND name=? AND version=?
+                         AND library_scope='GLOBAL'""",
+                    (definition_type, name, version),
+                ).fetchone()
+                if global_row:
+                    global_definition = self.get(str(global_row[0]))
+                    if global_definition and global_definition.spec_hash == spec_hash:
+                        return global_definition
             conn.execute(
                 """
                 INSERT INTO research_definitions(

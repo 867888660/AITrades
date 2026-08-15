@@ -11,6 +11,7 @@ from typing import Any, Mapping, Sequence
 
 from .alpha_factor_candidates import AlphaFactorCandidateResolver
 from .data_client import FrozenManifestData
+from .coverage_semantics import range_end_covers_requirement
 from .definition_registry import DefinitionRegistry, ResearchDefinition
 from .factor_alpha import AlphaComponent, AlphaEngine, AlphaSpec
 from .factor_definition_executor import FactorDefinitionExecutor
@@ -888,8 +889,15 @@ class AlphaPreviewService:
                             item for item in candidates
                             if _parse_time(item["partition_start"])
                             <= required_start + event_tolerance
-                            and _parse_time(item["partition_end"])
-                            >= end - event_tolerance
+                            and range_end_covers_requirement(
+                                actual_end=item["partition_end"],
+                                required_end=end - event_tolerance,
+                                data_type=item["data_type"],
+                                frequency=frequency,
+                                source=item["source"],
+                                schema_version=item["manifest_schema_version"],
+                                time_semantics=item["time_semantics"],
+                            )
                         ),
                         None,
                     )

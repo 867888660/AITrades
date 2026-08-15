@@ -15,6 +15,7 @@ class ResearchDataCapabilityServiceTest(unittest.TestCase):
         ):
             service = ResearchDataCapabilityService({
                 "active_finnhub_api_key": "configured",
+                "sec_edgar_user_agent": "DataTube Research data@example.com",
                 "openbb_settings": {
                     "enabled": True, "base_url": "http://127.0.0.1:6901",
                     "allowed_providers": ["yfinance", "fred"],
@@ -26,9 +27,11 @@ class ResearchDataCapabilityServiceTest(unittest.TestCase):
         self.assertIn("YFINANCE", providers)
         self.assertIn("FRED", providers)
         self.assertIn("FINNHUB", providers)
+        self.assertIn("SEC", providers)
         self.assertIn("COINGECKO", providers)
         self.assertIn("POLYMARKET", providers)
         self.assertFalse(providers["FINNHUB"]["historical"])
+        self.assertFalse(providers["SEC"]["historical"])
         self.assertFalse(providers["YFINANCE"]["online"])
         self.assertTrue(providers["POLYMARKET"]["historical"])
         self.assertTrue(providers["POLYMARKET"]["markets"][0]["prepare_supported"])
@@ -57,7 +60,9 @@ class ResearchDataCapabilityServiceTest(unittest.TestCase):
                 self.assertTrue(session["raw_query_supported"])
                 self.assertFalse(session["canonical_prepare_supported"])
                 self.assertTrue(service.can_prepare("equity:XNAS:AAPL", "bars", "1d"))
+                self.assertTrue(service.can_prepare("AAPL", "bars", "1d"))
                 self.assertFalse(service.can_prepare("equity:XNAS:AAPL", "bars", "5m"))
+                self.assertFalse(service.can_prepare("AAPL", "bars", "5m"))
 
 
 if __name__ == "__main__":

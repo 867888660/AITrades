@@ -68,6 +68,21 @@ class EvaluationTest(unittest.TestCase):
         self.assertEqual("2026-01-01T01:00:00+00:00", result["return_start_time"])
         self.assertAlmostEqual(0.001, result["future_return"], places=12)
 
+    def test_future_return_skips_non_tradable_archive_rows(self) -> None:
+        bars, _, _ = evaluation_fixture()
+        bars["A0"].insert(1, {
+            "bar_start_time": "2026-01-01T00:30:00+00:00",
+            "bar_end_time": "2026-01-01T00:59:00+00:00",
+            "available_time": "2026-01-01T00:59:00+00:00",
+            "open": None,
+            "close": None,
+        })
+        result = FutureReturnBuilder(bars).build(
+            "A0", "2026-01-01T00:29:59+00:00", 1
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual("2026-01-01T01:00:00+00:00", result["return_start_time"])
+
     def test_factor_rank_ic_and_quantile_spread_are_positive(self) -> None:
         bars, factors, _ = evaluation_fixture()
         result = FactorEvaluator().evaluate(
@@ -84,6 +99,22 @@ class EvaluationTest(unittest.TestCase):
         self.assertGreater(result.summary["quantile_returns"]["1"]["high_minus_low"], 0)
         self.assertIn("cross_section_mean_lag1_correlation", result.summary["time_stability"])
         self.assertTrue(all(item["return_start_time"] > item["available_time"] for item in result.observations))
+
+    def test_factor_evaluation_can_omit_row_level_observations(self) -> None:
+        bars, factors, _ = evaluation_fixture()
+        result = FactorEvaluator().evaluate(
+            spec=EvaluationSpec(
+                horizons=(1,),
+                quantile_count=4,
+                minimum_cross_section_size=4,
+                retain_observations=False,
+            ),
+            factor_values_by_instrument=factors,
+            bars_by_instrument=bars,
+        )
+        self.assertEqual(1.0, result.summary["rank_ic"]["1"]["mean"])
+        self.assertEqual((), result.observations)
+        self.assertGreater(len(result.ic_series), 0)
 
     def test_alpha_evaluation_reports_decay_stability_turnover_and_cost(self) -> None:
         bars, _, signals = evaluation_fixture()
@@ -110,6 +141,41 @@ class EvaluationTest(unittest.TestCase):
             result.summary["holding_period_decay"]["1"]["top_mean_return_after_cost"],
             result.summary["holding_period_decay"]["1"]["top_mean_return"],
         )
+
+    def test_alpha_evaluation_can_omit_row_level_observations(self) -> None:
+        bars, _, signals = evaluation_fixture()
+        retained = AlphaEvaluator().evaluate(
+            spec=EvaluationSpec(
+                horizons=(1, 2),
+                minimum_cross_section_size=4,
+                top_n=1,
+                retain_observations=True,
+            ),
+            alpha_signals=signals,
+            bars_by_instrument=bars,
+        )
+        compact = AlphaEvaluator().evaluate(
+            spec=EvaluationSpec(
+                horizons=(1, 2),
+                minimum_cross_section_size=4,
+                top_n=1,
+                retain_observations=False,
+            ),
+            alpha_signals=signals,
+            bars_by_instrument=bars,
+        )
+
+        self.assertGreater(len(retained.observations), 0)
+        self.assertEqual((), compact.observations)
+        retained_summary = dict(retained.summary)
+        compact_summary = dict(compact.summary)
+        retained_summary.pop("evaluation_spec", None)
+        retained_summary.pop("evaluation_spec_hash", None)
+        compact_summary.pop("evaluation_spec", None)
+        compact_summary.pop("evaluation_spec_hash", None)
+        self.assertEqual(retained_summary, compact_summary)
+        self.assertEqual(retained.ic_series, compact.ic_series)
+        self.assertEqual(retained.group_return_series, compact.group_return_series)
 
     def test_evaluation_artifact_records_lineage(self) -> None:
         bars, factors, _ = evaluation_fixture()

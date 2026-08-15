@@ -7,9 +7,12 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
+from integrations.qlib import Alpha158ImportService
 from services.data_platform.catalog_service import DatasetCatalogService
 from services.data_platform.crsp_bulk_import import CrspBulkImportService, SOURCE_COLUMNS
 from services.data_platform.data_client import FrozenManifestData
+from services.data_platform.manifest_resolver import DeterministicManifestResolver
+from services.data_platform.requirement_compiler import RequirementCompiler
 from services.data_platform.store import DataPlatformStore
 
 
@@ -76,6 +79,56 @@ class CrspBulkImportTest(unittest.TestCase):
             self.assertEqual(
                 "PASS",
                 FrozenManifestData(self.store, entry.latest_manifest_id).verify()["status"],
+            )
+        bars_entry = next(item for item in catalog if item.data_type == "bars")
+        selected = FrozenManifestData(
+            self.store, bars_entry.latest_manifest_id
+        ).read_bars_by_instrument(
+            start_time="2024-01-03T00:00:00+00:00",
+            end_time="2024-01-03T23:59:59+00:00",
+            instrument_ids=["equity:CRSP:10001"],
+        )
+        self.assertEqual(["equity:CRSP:10001"], list(selected))
+        self.assertEqual(1, len(selected["equity:CRSP:10001"]))
+        requirement_set = RequirementCompiler(self.store).compile(
+            project_id="crsp_daily_boundary",
+            manual_requirements=[{"id": "crsp_close", "fields": ["close"]}],
+            context={
+                "instrument_ids": ["equity:CRSP:10001", "equity:CRSP:10002"],
+                "data_type": "bars",
+                "frequency": "1d",
+                "history_start": "2024-01-02T00:00:00+00:00",
+                "history_end": "2024-01-03T23:59:59+00:00",
+                "adjustment": "CRSP_FIELDS",
+                "time_semantics": "SOURCE_AVAILABLE_TIME",
+                "point_in_time_policy": "AS_OF",
+            },
+        )
+        self.assertEqual(
+            "SATISFIED",
+            RequirementCompiler(self.store).coverage(requirement_set.requirement_set_id)["status"],
+        )
+        with mock.patch.object(
+            FrozenManifestData,
+            "verify",
+            return_value={"status": "PASS"},
+        ) as verify:
+            resolution = DeterministicManifestResolver(self.store).resolve(
+                requirement_set.requirement_set_id,
+                verify_physical=True,
+            )
+        self.assertTrue(resolution.ready, resolution.to_dict())
+        self.assertEqual(2, len(resolution.bindings))
+        # The resumed import leaves two eligible READY bars Manifests.  Each
+        # must be checked once, not once per requested instrument (four calls).
+        self.assertEqual(2, verify.call_count)
+        importer = Alpha158ImportService(self.store, output_root=self.root / "factor-cache")
+        with self.assertRaisesRegex(ValueError, "explicit row-level instrument_ids"):
+            importer._load_inputs([bars_entry.latest_manifest_id])
+        with self.assertRaisesRegex(ValueError, "has 2 daily bars"):
+            importer._load_inputs(
+                [bars_entry.latest_manifest_id],
+                instrument_ids=["equity:CRSP:10001"],
             )
 
 

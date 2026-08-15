@@ -1,0 +1,28 @@
+{
+  "objective": "验证美股小市值股票中短期反转因子是否具有稳定预测能力",
+  "aligned_research_intent": {
+    "question": "在市值1亿至50亿美元的美国普通股中，过去1个月（约21个交易日）收益是否对后续收益具有负向预测能力（短期反转）？",
+    "decision_supported": "判断短期反转因子是否值得进入 Alpha 研究",
+    "stop_at": "FACTOR",
+    "evidence_profile": "STANDARD",
+    "out_of_scope": ["Alpha construction", "portfolio backtest", "strategy creation"]
+  },
+  "frequency": "1d",
+  "research_period": {"start": "2015-01-01", "end": "2025-12-31"},
+  "universe_policy": {
+    "eligibility": {
+      "mode": "HISTORICAL_EQUITY_PIT",
+      "security_types": ["COMMON_STOCK"],
+      "point_in_time_filters": [
+        {"field": "market_cap_usd", "minimum": 100000000, "maximum": 5000000000}
+      ]
+    },
+    "selection": {"method": "ALL_ELIGIBLE"},
+    "exclusions": []
+  },
+  "evidence_profile": "STANDARD",
+  "research_contract": {
+    "evaluation": {"primary_metric": "rank_ic", "decision_rule": {"minimum_rank_ic": 0.02}}
+  },
+  "idempotency_key": "us-smallcap-short-term-reversal-align-v1"
+}

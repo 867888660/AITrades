@@ -14,7 +14,11 @@ FIELD_CONTRACTS: dict[str, tuple[str, ...]] = {
     "cash_dividend": ("corporate_actions",), "price_factor": ("corporate_actions",),
     "share_factor": ("corporate_actions",),
     "revenue": ("fundamentals_derived", "fundamentals_pit"),
+    "revenue_ttm": ("fundamentals_derived", "fundamentals_pit"),
     "net_income": ("fundamentals_derived", "fundamentals_pit"),
+    "net_income_ttm": ("fundamentals_derived", "fundamentals_pit"),
+    "operating_cash_flow": ("fundamentals_derived", "fundamentals_pit"),
+    "operating_cash_flow_ttm": ("fundamentals_derived", "fundamentals_pit"),
     "assets": ("fundamentals_derived", "fundamentals_pit"),
     "liabilities": ("fundamentals_derived", "fundamentals_pit"),
     "equity": ("fundamentals_derived", "fundamentals_pit"),
@@ -36,11 +40,21 @@ class EquityFieldResolver:
             types = FIELD_CONTRACTS.get(field, ())
             candidates = [
                 entry for entry in entries
-                if entry.data_type in types and field in set(entry.fields)
+                if entry.data_type in types and (
+                    field in set(entry.fields)
+                    or (
+                        entry.data_type == "fundamentals_pit"
+                        and {"concept", "value", "available_time"}.issubset(set(entry.fields))
+                    )
+                )
                 and entry.latest_manifest_id and entry.quality_status == "PASS"
                 and entry.point_in_time_policy not in {"", "NONE"}
             ]
+            # Preserve the contract preference (for example, materialized derived
+            # fundamentals before the raw PIT fallback), then use freshness only
+            # to choose between manifests of the same physical type.
             candidates.sort(key=lambda entry: (entry.updated_at or "", entry.dataset_id), reverse=True)
+            candidates.sort(key=lambda entry: types.index(entry.data_type))
             if not candidates:
                 blocked.append(
                     {"field": field, "code": "NO_PIT_MANIFEST", "accepted_data_types": list(types)}

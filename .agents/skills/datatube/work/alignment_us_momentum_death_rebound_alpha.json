@@ -1,0 +1,42 @@
+{
+  "objective": "验证在满足基本面资格的美股池内，由‘下跌动能消失’与‘反弹确认’双因子合成的 Alpha 信号是否稳定预测未来收益，为后续组合证据阶段提供依据",
+  "aligned_research_intent": {
+    "question": "在市值>=3亿美元、ROE>10%、10<=PE<=20、PB>0、FCF>0 的美股中，由‘下跌动能消失（近期动量转平/转正）’与‘反弹确认（短期均线金叉）’双因子合成的 Alpha 信号，是否稳定预测未来 1/5/20 日收益？",
+    "decision_supported": "判断该‘动能消失+反弹’Alpha 是否值得进入组合证据（Portfolio Evidence）阶段",
+    "stop_at": "ALPHA",
+    "evidence_profile": "STANDARD",
+    "out_of_scope": [
+      "portfolio backtest",
+      "strategy creation"
+    ]
+  },
+  "instrument_scope": [],
+  "frequency": "1d",
+  "research_period": {
+    "start": "2000-01-01",
+    "end": "2025-12-31"
+  },
+  "universe_policy": {
+    "eligibility": {
+      "mode": "HISTORICAL_EQUITY_PIT",
+      "point_in_time_filters": [
+        {"field": "market_cap_usd", "minimum": 300000000},
+        {"field": "roe_ttm", "minimum": 0.10},
+        {"field": "pe_ttm", "minimum": 10, "maximum": 20},
+        {"field": "pb_mrq", "minimum": 0},
+        {"field": "fcf_yield_ttm", "minimum": 0}
+      ]
+    },
+    "selection": {"method": "ALL_ELIGIBLE"},
+    "exclusions": [],
+    "rebalance": "MONTHLY"
+  },
+  "evidence_profile": "STANDARD",
+  "research_contract": {
+    "evaluation": {
+      "primary_metric": "rank_ic",
+      "decision_rule": {"minimum_rank_ic": 0.02}
+    }
+  },
+  "idempotency_key": "us-momentum-death-rebound-alpha-v1"
+}
